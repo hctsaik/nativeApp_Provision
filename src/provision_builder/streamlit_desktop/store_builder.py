@@ -1,0 +1,1238 @@
+"""Build into the store layout (spec §4/§9.3): immutable versions + shared
+runtimes + the bootstrap, all under one deployable <ROOT>.
+
+Build-machine side — may reach PyPI. The runtime is built once per dependency
+fingerprint; a rebuild whose lock has not changed costs ~17MB, not ~457MB.
+
+Two exports come out of this module, and they are NOT the same thing:
+
+  * export_full_tree()  — 完整交付:the whole <ROOT> (bootstrap, start bat,
+    tools, state, versions, deps). A machine that has never seen this app can
+    run it by double-clicking. This is what "交付" means.
+  * export_update()     — 自動更新來源:release.json + the version (+ deps when
+    the runtime changed). Consumed by device/provider.py polling, or copied to
+    the machine and applied with `bootstrap.py --install <payload>`.
+    It is NOT runnable by itself and never was.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import shutil
+import subprocess
+import time
+import uuid
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from . import imports as imports_mod
+from . import requirements as requirements_mod
+from . import runtime as runtime_mod
+from .builder import _rename_with_retry, scan_project
+from .device import integrity
+from .device.identifiers import validate_identifier
+from .device.paths import MANIFEST_NAME, MANIFEST_SCHEMA, AppPaths, list_app_ids
+from .device.runtime_store import (
+    BUILDER_FORMAT_VERSION,
+    RUNTIME_META,
+    LockfileError,
+    RuntimeStore,
+    ShellStore,
+    compute_fingerprint,
+    normalize_lock,
+)
+from .device.state import StateStore, set_pending
+from .models import EXCLUDED_DIRS, EXCLUDED_FILES, BuildRequest, slugify
+
+TEMPLATES = Path(__file__).resolve().parent / "templates"
+DEVICE_DIR = Path(__file__).resolve().parent / "device"
+Progress = Callable[[str], None]
+
+README_NAME = "讀我-使用說明.txt"
+WEBVIEW2_BAT_NAME = "安裝WebView2.bat"
+WEBVIEW2_INSTALLER = "prereq/MicrosoftEdgeWebview2Setup.exe"
+WEBVIEW2_DOWNLOAD = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
+# The Evergreen WebView2 runtime registers itself under this client GUID. No
+# WebView2 = the Tauri window opens blank, after a 60s startup the user waits
+# through. Check it BEFORE starting anything.
+WEBVIEW2_CLIENT = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+
+
+def _noop(_msg: str) -> None:
+    pass
+
+
+@dataclass
+class StoreBuildResult:
+    ok: bool
+    root: Path | None = None
+    app_id: str | None = None
+    version: str | None = None
+    fingerprint: str | None = None
+    runtime_reused: bool = False
+    # What the operator must be told, because it is not what they assumed:
+    pending_set: bool = False          # False on a first build (it becomes current)
+    is_first_app: bool = True          # False when the tree already had another app
+    entry_bats: list[str] = field(default_factory=list)
+    removed_start_bat: bool = False    # a second app deletes the generic start.bat
+    version_mb: float = 0.0
+    added_mb: float = 0.0              # what this build actually cost on disk
+    duration_seconds: float = 0.0
+    cancelled: bool = False            # operator pressed cancel; no debris left behind
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    def summary(self) -> str:
+        if self.ok:
+            reuse = "runtime 重用" if self.runtime_reused else "runtime 新建"
+            return (f"OK — {self.root} @ {self.version}"
+                    f"(本次新增 {self.added_mb:.0f} MB,{reuse}:{self.fingerprint})")
+        if self.cancelled:
+            return "已取消 — 沒有留下半成品版本"
+        return "FAILED — " + "; ".join(self.errors)
+
+
+@dataclass
+class ExportResult:
+    """What was written and what it is good for.
+
+    `out_dir` is the folder the operator copies. export_update() used to return a
+    bare Path, and its callers spell things like `out / "release.json"`, so this
+    keeps working as a path-ish object rather than breaking every caller.
+    """
+    out_dir: Path
+    total_mb: float = 0.0
+    apps: list[str] = field(default_factory=list)
+    versions: list[str] = field(default_factory=list)
+    includes_runtime: bool = False
+    kind: str = "full"                 # "full" = 完整交付 / "update" = 自動更新來源
+
+    def __truediv__(self, other) -> Path:
+        return self.out_dir / other
+
+    def __fspath__(self) -> str:
+        return str(self.out_dir)
+
+    def summary(self) -> str:
+        what = ("完整交付(可直接雙擊 start bat 執行)" if self.kind == "full"
+                else "自動更新來源(給已經有這棵樹的機器)")
+        deps = ",含共用 runtime 與 Tauri 殼" if self.includes_runtime else ",不含 runtime"
+        return (f"{what}:{self.out_dir}({self.total_mb:.0f} MB{deps})\n"
+                f"  應用:{'、'.join(self.apps) or '(無)'}\n"
+                f"  版本:{'、'.join(self.versions) or '(無)'}")
+
+
+class StoreBuildError(Exception):
+    pass
+
+
+class _Cancelled(Exception):
+    """Internal: the operator pressed cancel at a stage boundary."""
+
+
+def _check_cancel(should_cancel: Callable[[], bool] | None) -> None:
+    if should_cancel is not None and should_cancel():
+        raise _Cancelled()
+
+
+# ── runtime ──────────────────────────────────────────────────────────────────
+
+def _python_version_of(python: Path) -> str:
+    proc = subprocess.run([str(python), "-c", "import platform;print(platform.python_version())"],
+                          capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        raise StoreBuildError(f"無法查詢 runtime 範本的 Python 版本:{proc.stderr.strip()}")
+    return proc.stdout.strip()
+
+
+def _freeze(python: Path) -> list[str]:
+    proc = subprocess.run([str(python), "-m", "pip", "freeze", "--all"],
+                          capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        raise StoreBuildError(f"pip freeze 失敗:{proc.stderr.strip()[:400]}")
+    return proc.stdout.splitlines()
+
+
+def _reconcile_lock_with_freeze(pins: list[str], freeze_lines: list[str]) -> list[str]:
+    """Spec §7.1: the lock must be reconcilable with what pip actually installed."""
+    installed = {}
+    for line in freeze_lines:
+        if "==" in line and not line.startswith("-"):
+            name, _, ver = line.partition("==")
+            installed[name.strip().lower().replace("_", "-")] = ver.strip()
+    problems = []
+    for pin in pins:
+        name, _, ver = pin.partition("==")
+        base = name.split("[", 1)[0]
+        actual = installed.get(base)
+        if actual is None:
+            problems.append(f"{base} 宣告了卻沒被安裝")
+        elif actual != ver:
+            problems.append(f"{base} 宣告 {ver} 實裝 {actual}")
+    return problems
+
+
+def _strip_pip(runtime_dir: Path) -> None:
+    """The store runtime is immutable; shipping pip is an invitation to mutate
+    it in the field. setuptools stays (pkg_resources is imported at runtime)."""
+    site = runtime_dir / "Lib" / "site-packages"
+    for entry in list(site.glob("pip")) + list(site.glob("pip-*.dist-info")):
+        shutil.rmtree(entry, ignore_errors=True)
+    for exe in (runtime_dir / "Scripts").glob("pip*.exe"):
+        try:
+            exe.unlink()
+        except OSError:
+            pass
+
+
+def ensure_runtime(root: Path, request: BuildRequest, pins: list[str],
+                   progress: Progress = _noop) -> tuple[str, bool]:
+    """Return (fingerprint, reused). Builds under .staging-* then renames."""
+    template_python = request.runtime_template / "python.exe"
+    python_version = _python_version_of(template_python)
+    abi = f"cp{python_version.split('.')[0]}{python_version.split('.')[1]}"
+    fingerprint = compute_fingerprint(python_version=python_version,
+                                      platform="win_amd64", abi=abi, pins=pins)
+    store = RuntimeStore(root / "deps")
+    if store.is_complete(fingerprint):
+        progress(f"runtime {fingerprint} 已存在,跳過 457MB 安裝")
+        return fingerprint, True
+
+    store.runtimes.mkdir(parents=True, exist_ok=True)
+    staging = store.runtimes / f".staging-{uuid.uuid4().hex[:8]}"
+    build_log = staging / "build.log"
+    try:
+        progress(f"建立 runtime {fingerprint}(複製可攜 Python + pip install)…")
+        python = runtime_mod.copy_runtime(request.runtime_template, staging)
+        lock_file = staging / "lock.txt"
+        lock_file.write_text("\n".join(pins) + "\n", encoding="utf-8")
+        runtime_mod.install_requirements(python, lock_file, build_log, progress=progress)
+        runtime_mod.verify_imports(python, build_log)
+
+        progress("檢查 App 的每一個 import 都裝得到…")
+        missing = imports_mod.missing_dependencies(request.project_dir, request.entrypoint, python)
+        if missing:
+            raise StoreBuildError(
+                "這個 App 會 import 一些「lock 檔裡沒有」的套件,交付出去一啟動就會出現紅色錯誤:\n"
+                + "".join(f"  · {name}\n" for name in missing)
+                + "  請把它們加進 lock 檔後重新建置。")
+
+        problems = _reconcile_lock_with_freeze(pins, _freeze(python))
+        if problems:
+            raise StoreBuildError("lock 與 pip freeze 對帳失敗:" + "; ".join(problems[:5]))
+
+        _strip_pip(staging)
+        # Some wheels ship .pyc inside them regardless of --no-compile. Any that
+        # survive get hashed into files.json and then dropped by the exporter →
+        # integrity failure on the target machine, with no way for the operator
+        # to fix it. Nothing compiled may enter a shared runtime.
+        stripped = runtime_mod.strip_bytecode(staging)
+        if stripped:
+            progress(f"清掉 runtime 裡的 {stripped} 個 .pyc(共用 runtime 不含編譯快取)")
+        for extra in (lock_file, build_log):
+            extra.unlink(missing_ok=True)
+
+        (staging / RUNTIME_META).write_text(json.dumps({
+            "schema": 1, "fingerprint": fingerprint, "python_version": python_version,
+            "platform": "win_amd64", "abi": abi, "pins": pins,
+            "builder_format": BUILDER_FORMAT_VERSION,
+        }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+        progress("計算 runtime files.json(逐檔 sha256)…")
+        integrity.write_files_json(staging, integrity.build_files_json(
+            staging, extra_excluded={RUNTIME_META}))
+
+        target = store.runtimes / fingerprint
+        _rename_with_retry(staging, target)  # Defender may briefly pin the fresh tree
+        integrity.write_complete(target)     # build machine counts as verified
+        return fingerprint, False
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
+# ── version + tree ───────────────────────────────────────────────────────────
+
+def ensure_shell(root: Path, shell_exe: Path, progress: Progress = _noop) -> str:
+    """Put the shell in the shared store, keyed by its content hash."""
+    digest = hashlib.sha256(shell_exe.read_bytes()).hexdigest()[:12]
+    fingerprint = f"shell-{digest}"
+    store = ShellStore(root / "deps")
+    target = store.path_for(fingerprint)
+    if store.is_complete(fingerprint) and store.exe_for(fingerprint, shell_exe.name).is_file():
+        progress(f"Tauri 殼 {fingerprint} 已存在,共用")
+        return fingerprint
+
+    store.shells.mkdir(parents=True, exist_ok=True)
+    staging = store.shells / f".staging-{uuid.uuid4().hex[:8]}"
+    try:
+        staging.mkdir()
+        shutil.copy2(shell_exe, staging / shell_exe.name)
+        integrity.write_files_json(staging)
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
+        _rename_with_retry(staging, target)
+        integrity.write_complete(target)
+        progress(f"Tauri 殼進 store:{fingerprint}(所有版本共用)")
+        return fingerprint
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
+def build_version_manifest(request: BuildRequest, version: str, fingerprint: str,
+                           shell_fingerprint: str) -> dict:
+    return {
+        "schema_version": MANIFEST_SCHEMA,
+        "app_id": request.app_id,
+        "display_name": request.display_name,
+        "version": version,
+        "entrypoint": f"application/{request.entrypoint.relative_to(request.project_dir).as_posix()}",
+        "runtime_fingerprint": fingerprint,
+        "engine_shim": "launcher/engine_shim.py",
+        # The shell lives in deps/shells/<fp>/ — shared, not copied per version.
+        "shell_fingerprint": shell_fingerprint,
+        "shell_name": request.shell_exe.name,
+        "host": "127.0.0.1",
+        "preferred_port": request.preferred_port,
+        "startup_timeout_seconds": request.startup_timeout_seconds,
+        "health_path": "/_stcore/health",
+        "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+
+def version_revision(paths: AppPaths, version: str) -> str:
+    """A content id for this exact build of this version — the same value
+    export_update() puts in release.json, so the device can tell a re-cut of a
+    failed version from a retry of the identical bytes."""
+    files_json = (paths.version_dir(version) / integrity.FILES_NAME).read_bytes()
+    return hashlib.sha256(files_json).hexdigest()[:12]
+
+
+def _next_version(version: str) -> str:
+    """A concrete suggestion beats telling someone to 'pick another version'."""
+    match = re.match(r"^(.*?)(\d+)([^\d]*)$", version)
+    if not match:
+        return version + ".1"
+    prefix, number, suffix = match.groups()
+    return f"{prefix}{int(number) + 1}{suffix}"
+
+
+def _build_version_dir(paths: AppPaths, request: BuildRequest, version: str,
+                       fingerprint: str, shell_fingerprint: str,
+                       progress: Progress) -> Path:
+    target = paths.version_dir(version)
+    if integrity.is_complete(target):
+        raise StoreBuildError(
+            f"版本 {version} 已經在這棵 Store 樹裡建過了,而且是完整的。\n"
+            "  版本目錄一旦完成就不可變(已經發出去的版本不能被偷偷改掉)。\n"
+            f"  · 要發新版 → 把版本號改成 {_next_version(version)}\n"
+            "  · 要重來一次 → 換一個乾淨的輸出根目錄,或先手動刪掉\n"
+            f"    {target}")
+    if target.exists():  # leftover of a failed build
+        shutil.rmtree(target)
+    paths.versions_dir.mkdir(parents=True, exist_ok=True)
+    staging = paths.versions_dir / f".staging-{uuid.uuid4().hex[:8]}"
+    try:
+        progress(f"組裝版本 {version} …")
+        # Same exclusions as the fat builder: a version slot must stay small —
+        # it is the thing that travels on every update.
+        shutil.copytree(request.project_dir, staging / "application",
+                        ignore=shutil.ignore_patterns(*EXCLUDED_DIRS, *EXCLUDED_FILES))
+        (staging / "launcher").mkdir()
+        for name in ("launch.py", "engine_shim.py"):
+            shutil.copy2(TEMPLATES / name, staging / "launcher" / name)
+        # No shell/ here: it is shared via deps/shells/<fp>/.
+        manifest = build_version_manifest(request, version, fingerprint, shell_fingerprint)
+        (staging / MANIFEST_NAME).write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        integrity.write_files_json(staging)
+        _rename_with_retry(staging, target)
+        integrity.write_complete(target)
+        return target
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
+# ── .bat templates ───────────────────────────────────────────────────────────
+#
+# All of them are written UTF-8 with `chcp 65001` on line 3 — a display name with
+# Chinese characters used to raise UnicodeEncodeError while writing an ascii .bat,
+# and UnicodeEncodeError is not an OSError, so it escaped every guard in sight.
+# All of them use `pushd` rather than `cd /d`: `cd /d` silently fails on a UNC
+# path and leaves you in C:\Windows, where every later diagnostic is a lie.
+
+_START_BAT = r"""@echo off
+setlocal
+chcp 65001 >nul 2>&1
+title {display_name} - 啟動中,請不要關閉這個視窗
+pushd "%~dp0" || (
+  echo [start][ERROR] 無法進入程式資料夾。若是從網路磁碟機執行,請先複製到本機磁碟再試一次。
+  pause
+  exit /b 1
+)
+rem 視窗是用 Microsoft Edge WebView2 Runtime 畫出來的。缺了它,Streamlit 會起來、
+rem 視窗卻是一片空白 —— 先檢查再啟動,不要讓人等 60 秒才看到空白視窗。
+set "WV2="
+reg query "HKLM\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{webview2_client}" /v pv >nul 2>&1 && set "WV2=1"
+reg query "HKCU\SOFTWARE\Microsoft\EdgeUpdate\Clients\{webview2_client}" /v pv >nul 2>&1 && set "WV2=1"
+reg query "HKLM\SOFTWARE\Microsoft\EdgeUpdate\Clients\{webview2_client}" /v pv >nul 2>&1 && set "WV2=1"
+if not defined WV2 (
+  echo.
+  echo [start][ERROR] 這台電腦沒有 Microsoft Edge WebView2 Runtime,視窗會開不起來。
+  echo                請先雙擊 tools\{webview2_bat},裝好之後再執行這個檔案。
+  echo                它可以用一般使用者權限安裝,不需要系統管理員。
+  popd
+  pause
+  exit /b 1
+)
+rem Bootstrap chicken-and-egg (spec 4.1): ANY runtime can run bootstrap.py
+rem (stdlib-only); bootstrap then launches the app under its DECLARED runtime.
+rem Runtimes are shared and immutable - no .pyc may ever be written into them.
+set "PYTHONDONTWRITEBYTECODE=1"
+set "PYTHONUTF8=1"
+set "PY="
+for /d %%R in ("deps\runtimes\*") do if exist "%%~R\python.exe" set "PY=%%~R\python.exe"
+if not defined PY (
+  echo [start][ERROR] 這份交付不完整:deps\runtimes\ 底下沒有 python.exe。
+  echo                請向提供者重新索取完整的資料夾。
+  popd
+  pause
+  exit /b 1
+)
+echo 正在啟動 {display_name}…(第一次啟動需要檢查共用元件,可能要幾分鐘)
+"%PY%" "bootstrap\bootstrap.py" --app {app_id} %*
+set "RC=%errorlevel%"
+popd
+if not "%RC%"=="0" (
+  echo.
+  echo [start] 啟動失敗(代碼 %RC%)。詳細記錄在 apps\{app_id}\data\logs\ 裡。
+  pause
+)
+exit /b %RC%
+"""
+
+
+_GC_BAT = r"""@echo off
+rem 回收沒有任何版本槽引用的版本與 runtime。先試算,確認後才真的刪。
+setlocal
+chcp 65001 >nul 2>&1
+title 回收磁碟空間
+pushd "%~dp0.." || (
+  echo [gc][ERROR] 無法進入程式資料夾。若是從網路磁碟機執行,請先複製到本機磁碟。
+  pause
+  exit /b 1
+)
+set "PYTHONDONTWRITEBYTECODE=1"
+set "PYTHONUTF8=1"
+set "PY="
+for /d %%R in ("deps\runtimes\*") do if exist "%%~R\python.exe" set "PY=%%~R\python.exe"
+if not defined PY (
+  echo [gc][ERROR] deps\runtimes\ 底下沒有 python.exe,這份交付不完整。
+  popd
+  pause
+  exit /b 1
+)
+echo === 先試算,不會刪除任何東西 ===
+echo.
+"%PY%" "bootstrap\gc.py"
+echo.
+set "YES="
+set /p YES=以上列出的項目要真的刪除嗎? 輸入 y 後按 Enter,其他任何鍵則取消:
+if /i not "%YES%"=="y" (
+  echo 已取消,沒有刪除任何東西。
+  popd
+  pause
+  exit /b 0
+)
+echo.
+echo === 開始回收 ===
+"%PY%" "bootstrap\gc.py" --apply
+popd
+pause
+"""
+
+
+# One console per app. The old one hardcoded apps[0] but was labelled with THIS
+# build's display name: in a two-app store, "退回上一版" rolled back the wrong app.
+_ADMIN_BAT = r"""@echo off
+rem 管理主控台:狀態 / 退版 / 套用更新包 / 設定更新來源 / 回收 / 清除失敗記錄。
+setlocal
+chcp 65001 >nul 2>&1
+title {display_name} - 管理主控台
+pushd "%~dp0.." || (
+  echo [admin][ERROR] 無法進入程式資料夾。若是從網路磁碟機執行,請先複製到本機磁碟。
+  pause
+  exit /b 1
+)
+set "PYTHONDONTWRITEBYTECODE=1"
+set "PYTHONUTF8=1"
+set "PY="
+for /d %%R in ("deps\runtimes\*") do if exist "%%~R\python.exe" set "PY=%%~R\python.exe"
+if not defined PY (
+  echo [admin][ERROR] deps\runtimes\ 底下沒有 python.exe,這份交付不完整。
+  popd
+  pause
+  exit /b 1
+)
+
+:menu
+cls
+echo ============================================
+echo   {display_name} - 管理主控台
+echo   應用代號:{app_id}
+echo ============================================
+echo.
+echo   [1] 檢視狀態
+echo   [2] 退回上一版
+echo   [3] 套用已複製進來的更新包
+echo   [4] 設定更新來源
+echo   [5] 回收磁碟空間
+echo   [6] 清除失敗記錄
+echo   [7] 取消還沒套用的更新
+echo   [0] 離開
+echo.
+set "CHOICE="
+set /p CHOICE=請輸入代號後按 Enter:
+if "%CHOICE%"=="1" goto status
+if "%CHOICE%"=="2" goto rollback
+if "%CHOICE%"=="3" goto install
+if "%CHOICE%"=="4" goto source
+if "%CHOICE%"=="5" goto reclaim
+if "%CHOICE%"=="6" goto clearfailed
+if "%CHOICE%"=="7" goto clearpending
+if "%CHOICE%"=="0" goto done
+goto menu
+
+:status
+echo.
+"%PY%" "bootstrap\bootstrap.py" --app {app_id} --status
+pause
+goto menu
+
+:rollback
+echo.
+echo 直接按 Enter = 退回上一個能用的版本;也可以輸入指定的版本號。
+set "VER="
+set /p VER=版本號(可留空):
+if defined VER (
+  "%PY%" "bootstrap\bootstrap.py" --app {app_id} --rollback-to "%VER%"
+) else (
+  "%PY%" "bootstrap\bootstrap.py" --app {app_id} --rollback
+)
+pause
+goto menu
+
+:install
+echo.
+echo 請先把更新包資料夾(裡面有 release.json)複製到這台電腦,再輸入它的路徑。
+set "PAYLOAD="
+set /p PAYLOAD=更新包資料夾路徑:
+if not defined PAYLOAD goto menu
+"%PY%" "bootstrap\bootstrap.py" --app {app_id} --install "%PAYLOAD%"
+pause
+goto menu
+
+:source
+echo.
+echo 更新來源是一個資料夾(USB 或網路磁碟),新版本會放在那裡,程式會自己去拿。
+set "SRC="
+set /p SRC=更新來源資料夾路徑:
+if not defined SRC goto menu
+"%PY%" "bootstrap\bootstrap.py" --app {app_id} --set-update-source "%SRC%"
+pause
+goto menu
+
+:reclaim
+echo.
+echo === 先試算,不會刪除任何東西 ===
+echo.
+"%PY%" "bootstrap\gc.py"
+echo.
+set "YES="
+set /p YES=以上列出的項目要真的刪除嗎? 輸入 y 後按 Enter,其他任何鍵則取消:
+if /i "%YES%"=="y" (
+  echo.
+  "%PY%" "bootstrap\gc.py" --apply
+) else (
+  echo 已取消,沒有刪除任何東西。
+)
+pause
+goto menu
+
+:clearfailed
+echo.
+echo 某個版本啟動失敗過就不會再被自動套用。修好之後,在這裡清掉它的失敗記錄。
+set "VER="
+set /p VER=要清除哪一個版本的失敗記錄:
+if not defined VER goto menu
+"%PY%" "bootstrap\bootstrap.py" --app {app_id} --clear-failed "%VER%"
+pause
+goto menu
+
+:clearpending
+echo.
+echo 已經裝好、但還沒套用的更新,可以在這裡取消(版本會留在磁碟上,之後還能再套用)。
+"%PY%" "bootstrap\bootstrap.py" --app {app_id} --clear-pending
+pause
+goto menu
+
+:done
+popd
+exit /b 0
+"""
+
+
+# One app: tools\admin.bat is the name the 讀我 and the docs point at, so it must
+# exist — it just forwards to that app's own console.
+_ADMIN_ONE_BAT = r"""@echo off
+rem 這棵樹只有一個應用,直接開它的管理主控台。
+call "%~dp0admin-{app_id}.bat" %*
+"""
+
+
+_ADMIN_CHOOSER_BAT = r"""@echo off
+rem 這棵樹有多個應用:先選要管理哪一個,再進它自己的主控台。
+rem (以前這裡寫死第一個 app,卻掛著另一個 app 的名字,退版會退錯 app。)
+setlocal
+chcp 65001 >nul 2>&1
+title 管理主控台 - 選擇應用
+pushd "%~dp0" || (
+  echo [admin][ERROR] 無法進入 tools 資料夾。若是從網路磁碟機執行,請先複製到本機磁碟。
+  pause
+  exit /b 1
+)
+:menu
+cls
+echo ============================================
+echo   管理主控台 - 這個資料夾裡有多個應用
+echo ============================================
+echo.
+{entries}
+echo   [0] 離開
+echo.
+set "CHOICE="
+set /p CHOICE=請輸入代號後按 Enter:
+{dispatch}
+if "%CHOICE%"=="0" (
+  popd
+  exit /b 0
+)
+goto menu
+"""
+
+
+_WEBVIEW2_BAT = r"""@echo off
+rem WebView2 Runtime:視窗的顯示元件。沒有它,應用會啟動但視窗一片空白。
+setlocal
+chcp 65001 >nul 2>&1
+title 安裝 Microsoft Edge WebView2 Runtime
+pushd "%~dp0.." || (
+  echo [webview2][ERROR] 無法進入程式資料夾。若是從網路磁碟機執行,請先複製到本機磁碟。
+  pause
+  exit /b 1
+)
+set "WV2="
+reg query "HKLM\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{webview2_client}" /v pv >nul 2>&1 && set "WV2=1"
+reg query "HKCU\SOFTWARE\Microsoft\EdgeUpdate\Clients\{webview2_client}" /v pv >nul 2>&1 && set "WV2=1"
+reg query "HKLM\SOFTWARE\Microsoft\EdgeUpdate\Clients\{webview2_client}" /v pv >nul 2>&1 && set "WV2=1"
+if defined WV2 (
+  echo 這台電腦已經有 WebView2 Runtime,不需要再安裝。
+  popd
+  pause
+  exit /b 0
+)
+if exist "{installer}" goto install
+echo 這份交付沒有附帶 WebView2 安裝檔。
+echo.
+echo 請用瀏覽器下載「Evergreen Bootstrapper」,執行它就會安裝:
+echo   {download}
+echo.
+echo 它可以用一般使用者權限安裝,不需要系統管理員。
+popd
+pause
+exit /b 1
+
+rem 這裡不用 () 區塊:區塊裡的 %errorlevel% 在進區塊前就被展開,永遠讀到舊值。
+:install
+echo 正在安裝 Microsoft Edge WebView2 Runtime,可能需要幾分鐘…
+"{installer}" /silent /install
+set "RC=%errorlevel%"
+if "%RC%"=="0" goto ok
+echo.
+echo [webview2][ERROR] 安裝失敗(代碼 %RC%)。
+echo                   請改用瀏覽器下載安裝:{download}
+popd
+pause
+exit /b %RC%
+
+:ok
+echo.
+echo 安裝完成。現在可以回到上一層,雙擊 start 開頭的 .bat 啟動應用。
+popd
+pause
+exit /b 0
+"""
+
+
+def _bat_safe(text: str) -> str:
+    """cmd.exe treats & | < > ^ ( ) % ! as syntax. A display name carrying any of
+    them turns `echo`/`title` into a parse error, so they never reach a .bat."""
+    cleaned = "".join(" " if ch in "&|<>^()%!\"" else ch for ch in str(text))
+    return " ".join(cleaned.split()) or "App"
+
+
+def _display_name_of(root: Path, app_id: str, default: str | None = None) -> str:
+    """The name to print on THAT app's own bat — read from that app's own manifest,
+    not from whatever build happens to be running right now."""
+    paths = AppPaths(Path(root), app_id)
+    candidates: list[Path] = []
+    try:
+        state = StateStore(paths.state_dir).load()
+        for slot in (state.current, state.pending, state.last_known_good, state.previous):
+            if slot:
+                candidates.append(paths.versions_dir / slot)
+    except Exception:
+        pass
+    if paths.versions_dir.is_dir():
+        candidates.extend(sorted(p for p in paths.versions_dir.iterdir() if p.is_dir()))
+    for vdir in candidates:
+        try:
+            manifest = json.loads((vdir / MANIFEST_NAME).read_text("utf-8"))
+        except (OSError, ValueError):
+            continue
+        name = manifest.get("display_name")
+        if name:
+            return str(name)
+    return default or app_id
+
+
+def _preferred_port_of(root: Path, apps: list[str]) -> int:
+    for app_id in apps:
+        paths = AppPaths(Path(root), app_id)
+        if not paths.versions_dir.is_dir():
+            continue
+        for vdir in sorted(paths.versions_dir.iterdir()):
+            try:
+                manifest = json.loads((vdir / MANIFEST_NAME).read_text("utf-8"))
+            except (OSError, ValueError):
+                continue
+            return int(manifest.get("preferred_port", 0) or 0)
+    return 0
+
+
+def _write_store_readme(root: Path, apps: list[str], bats: list[str], *,
+                        preferred_port: int = 0) -> None:
+    """The delivered root is otherwise apps\\ deps\\ bootstrap\\ and some .bat files —
+    not one word telling the user what to double-click or that a Start button is
+    waiting for them. Everything here must be TRUE on the machine that reads it."""
+    entry = bats[0] if len(bats) == 1 else "、".join(bats) if bats else "start.bat"
+    if preferred_port:
+        port_lines = [
+            f"* 這個應用預設使用 {preferred_port} 埠。",
+            f"  若 {preferred_port} 埠被其他程式占用,請先關掉那個程式再啟動。",
+        ]
+    else:
+        # The default preferred_port is 0 = "pick a free port in 8000-9000". The
+        # old README literally read 「若 0 埠被其他程式占用」.
+        port_lines = ["* 啟動程式每次會自動挑一個沒被占用的埠,不需手動處理。"]
+
+    lines = [
+        "使用方式",
+        "========",
+        "",
+        f"1. 雙擊 {entry}。",
+        "   (第一次啟動會先檢查共用元件的完整性,可能要幾分鐘,黑色視窗不要關。)",
+        "2. 應用視窗出現後,在上方的「工作流程」下拉選單選好要跑的項目,",
+        "   再按旁邊那個寫著 Start 的按鈕(按鈕上是英文 Start,不是中文)。",
+        "3. 應用就會顯示在視窗裡。",
+        "",
+        "開始之前:WebView2",
+        "-----------------",
+        "這個視窗是用 Microsoft Edge WebView2 Runtime 顯示的,這台電腦必須要有它。",
+        "大多數的 Windows 10/11 已經內建;如果沒有,啟動時會直接告訴你,不會開出空白視窗。",
+        f"缺的時候:雙擊 tools\\{WEBVIEW2_BAT_NAME}。",
+        "  · 交付包若附了安裝檔,它會直接幫你裝好。",
+        f"  · 沒附的話,它會印出下載網址:{WEBVIEW2_DOWNLOAD}",
+        "  · WebView2 可以用一般使用者權限安裝,不需要系統管理員。",
+        "",
+        "除了 WebView2 以外,這台電腦不需要安裝 Python、Streamlit、Node 或 Rust ——",
+        "全部都在這個資料夾裡。整個資料夾可以複製到別的位置或別台電腦,不需重新安裝。",
+        "",
+        "第一次執行的安全提示",
+        "--------------------",
+        "* 第一次執行可能出現「Windows 已保護您的電腦」(SmartScreen),",
+        "  請點「其他資訊」→「仍要執行」。",
+        "* 若公司的防毒軟體會把檔案隔離,請請 IT 把這個資料夾整個加進排除清單。",
+        "",
+        "連接埠",
+        "------",
+        *port_lines,
+        "",
+        "更新與回復",
+        "----------",
+        "* 新版本會在你使用時於背景準備好,並跳出「關閉並重新開啟後套用」的通知。",
+        "  下次啟動就會自動換成新版。",
+        "* 萬一新版啟動失敗,系統會自動退回上一個能用的版本,並告訴你。",
+        "* 管理員可雙擊 tools\\admin.bat:檢視狀態、退回上一版、套用已複製進來的更新包、",
+        "  設定更新來源、回收磁碟空間、清除失敗記錄。",
+        "",
+        "疑難排解",
+        "--------",
+        "* 錯誤訊息與記錄在 apps\\<應用>\\data\\logs\\ 底下。",
+        "* 應用視窗一開就關閉,或視窗一片空白:多半是缺 WebView2,見上面那一節。",
+        "* 不要直接執行 deps\\shells\\ 底下的 .exe —— 那是元件,不是應用程式入口。",
+        "",
+        f"這個資料夾包含的應用:{'、'.join(apps) if apps else '(無)'}",
+        "",
+    ]
+    (Path(root) / README_NAME).write_text("\n".join(lines), encoding="utf-8")
+
+
+def _write_tools(root: Path, apps: list[str], *, names_from: Path | None = None) -> None:
+    """tools/gc.bat + tools/安裝WebView2.bat + one admin console PER APP.
+
+    Written UTF-8 (a Chinese display name used to raise UnicodeEncodeError here).
+    `names_from` lets an export generate the consoles for a subset of apps while
+    still reading each app's real display name from the source store.
+    """
+    root = Path(root)
+    source = Path(names_from) if names_from else root
+    tools = root / "tools"
+    tools.mkdir(parents=True, exist_ok=True)
+
+    (tools / "gc.bat").write_text(_GC_BAT, encoding="utf-8")
+    (tools / WEBVIEW2_BAT_NAME).write_text(
+        _WEBVIEW2_BAT.format(webview2_client=WEBVIEW2_CLIENT,
+                             installer=WEBVIEW2_INSTALLER.replace("/", "\\"),
+                             download=WEBVIEW2_DOWNLOAD),
+        encoding="utf-8")
+
+    for stale in tools.glob("admin-*.bat"):
+        if stale.name[len("admin-"):-len(".bat")] not in apps:
+            stale.unlink()      # an app that is not here must not keep a console
+
+    names = {app_id: _bat_safe(_display_name_of(source, app_id)) for app_id in apps}
+    for app_id in apps:
+        (tools / f"admin-{app_id}.bat").write_text(
+            _ADMIN_BAT.format(app_id=app_id, display_name=names[app_id]), encoding="utf-8")
+
+    if len(apps) == 1:
+        (tools / "admin.bat").write_text(
+            _ADMIN_ONE_BAT.format(app_id=apps[0]), encoding="utf-8")
+    elif apps:
+        entries = "\n".join(f"echo   [{i}] {names[a]}  ({a})"
+                            for i, a in enumerate(apps, 1))
+        dispatch = "\n".join(f'if "%CHOICE%"=="{i}" call "%~dp0admin-{a}.bat"'
+                             for i, a in enumerate(apps, 1))
+        (tools / "admin.bat").write_text(
+            _ADMIN_CHOOSER_BAT.format(entries=entries, dispatch=dispatch), encoding="utf-8")
+
+
+def _install_bootstrap(root: Path) -> None:
+    target = Path(root) / "bootstrap"
+    target.mkdir(parents=True, exist_ok=True)
+    for source in DEVICE_DIR.glob("*.py"):
+        shutil.copy2(source, target / source.name)
+
+
+def _start_bat_text(root: Path, app_id: str, display_name: str) -> str:
+    return _START_BAT.format(app_id=app_id, display_name=_bat_safe(display_name),
+                             webview2_client=WEBVIEW2_CLIENT,
+                             webview2_bat=WEBVIEW2_BAT_NAME)
+
+
+def _write_entry_bats(root: Path, display_name: str = "App") -> tuple[list[str], bool]:
+    """Returns (the bats a user can double-click, whether start.bat was removed).
+
+    With one app the entry is just start.bat — a root with two files that do the
+    same thing is a coin flip for a factory operator. A second app makes start.bat
+    ambiguous, so it goes; the caller MUST tell the operator, because machines out
+    there have already been taught to double-click it.
+    """
+    root = Path(root)
+    apps = list_app_ids(root)
+    single = root / "start.bat"
+    if len(apps) <= 1:
+        for stale in root.glob("start-*.bat"):
+            stale.unlink()
+        if apps:
+            single.write_text(_start_bat_text(root, apps[0], display_name), encoding="utf-8")
+            return ["start.bat"], False
+        return [], False
+
+    removed = single.exists()
+    if removed:
+        single.unlink()          # ambiguous now — force the explicit per-app entry
+    bats = []
+    for app_id in apps:
+        name = f"start-{app_id}.bat"
+        (root / name).write_text(
+            _start_bat_text(root, app_id, _display_name_of(root, app_id)), encoding="utf-8")
+        bats.append(name)
+    return bats, removed
+
+
+# ── entry points ─────────────────────────────────────────────────────────────
+
+def _directory_size(path: Path) -> int:
+    return sum(f.stat().st_size for f in Path(path).rglob("*") if f.is_file())
+
+
+def build_into_store(request: BuildRequest, root: Path, *, version: str,
+                     update_source: Path | str | None = None,
+                     progress: Progress = _noop,
+                     should_cancel: Callable[[], bool] | None = None) -> StoreBuildResult:
+    root = Path(root)
+    started = time.monotonic()
+    warnings: list[str] = []
+    paths: AppPaths | None = None
+    try:
+        validate_identifier(version, "version")
+        found = requirements_mod.resolve(request.project_dir, request.explicit_requirements)
+        if found.generated:
+            raise StoreBuildError(
+                "Store 佈局需要完全釘死的 lock 檔,不能用 pyproject 的寬鬆相依。\n"
+                "  在專案的環境裡執行:pip freeze > requirements.lock.txt")
+        pins = normalize_lock(found.path.read_text("utf-8", errors="replace"))
+        if not any(p.startswith("streamlit==") for p in pins):
+            raise StoreBuildError("lock 檔未釘死 streamlit==<版本>")
+        if not request.entrypoint.is_file():
+            raise StoreBuildError(f"入口檔不存在:{request.entrypoint}")
+        if not request.shell_exe.is_file():
+            raise StoreBuildError(f"找不到預建 Tauri 殼:{request.shell_exe}")
+
+        # Big files / auto-exclusions: the fat path has always reported these, the
+        # store path declared a `warnings` field and then never filled it, so in
+        # Store mode the operator was told nothing. Scan BEFORE copying anything.
+        try:
+            warnings.extend(scan_project(request).warnings)
+        except Exception as exc:            # a scan must never kill a build
+            warnings.append(f"專案掃描失敗,這次沒有大檔警告:{exc}")
+
+        _check_cancel(should_cancel)
+        fingerprint, reused = ensure_runtime(root, request, pins, progress)
+
+        _check_cancel(should_cancel)
+        shell_fingerprint = ensure_shell(root, request.shell_exe, progress)
+
+        _check_cancel(should_cancel)
+        paths = AppPaths(root, request.app_id)
+        _build_version_dir(paths, request, version, fingerprint, shell_fingerprint, progress)
+
+        # The revision travels with the version from here to failed_versions: a
+        # rollback that records revision=None blocks EVERY future build of that
+        # version number, including the fixed one.
+        revision = version_revision(paths, version)
+
+        _check_cancel(should_cancel)
+        store = StateStore(paths.state_dir)
+        pending_set = False
+        if not store.exists():
+            store.initialize(request.app_id, version)
+            progress(f"初始化 state:current={version}")
+        else:
+            current = store.load()
+            if version not in (current.current, current.pending):
+                store.mutate(lambda s: set_pending(s, version, revision=revision))
+                pending_set = True
+                progress(f"已設定 pending={version}(這棵樹下次啟動時自動套用)")
+
+        _install_bootstrap(root)
+        apps = list_app_ids(root)
+        bats, removed_start_bat = _write_entry_bats(root, request.display_name)
+        try:
+            _write_store_readme(root, apps, bats, preferred_port=request.preferred_port)
+            _write_tools(root, apps)
+        except Exception as exc:
+            # NOT `except OSError`: writing an ascii .bat with a Chinese display
+            # name raises UnicodeEncodeError, which is a ValueError — it used to
+            # sail past the OSError guard and fail a build whose version directory
+            # was already complete and therefore immutable (unrecoverable).
+            warnings.append(
+                f"tools\\ 與說明檔沒有全部寫成功({exc})。應用本身可以啟動;"
+                "修好後重跑一次建置就會補上。")
+
+        if update_source:
+            (paths.app_dir / "config.json").write_text(
+                json.dumps({"update_source": str(update_source)}, ensure_ascii=False, indent=2),
+                encoding="utf-8")
+            progress(f"已設定更新來源:{update_source}")
+
+        version_bytes = _directory_size(paths.version_dir(version))
+        added = version_bytes if reused else version_bytes + _directory_size(
+            RuntimeStore(root / "deps").path_for(fingerprint))
+        progress(f"完成:{root}(本次新增 {added / 1024 ** 2:.0f} MB)")
+
+        return StoreBuildResult(
+            ok=True, root=root, app_id=request.app_id, version=version,
+            fingerprint=fingerprint, runtime_reused=reused,
+            pending_set=pending_set, is_first_app=len(apps) <= 1,
+            entry_bats=bats, removed_start_bat=removed_start_bat,
+            version_mb=version_bytes / 1024 ** 2, added_mb=added / 1024 ** 2,
+            duration_seconds=time.monotonic() - started, warnings=warnings)
+    except _Cancelled:
+        # Never leave a half-written version dir carrying a .complete: the tree
+        # would look installable and the next build of that number would refuse.
+        if paths is not None:
+            target = paths.versions_dir / version
+            if target.exists() and not integrity.is_complete(target):
+                shutil.rmtree(target, ignore_errors=True)
+        progress("已取消,沒有留下半成品版本。")
+        return StoreBuildResult(ok=False, cancelled=True, root=root,
+                                app_id=request.app_id, version=version,
+                                errors=["建置已取消(沒有留下半成品版本)"],
+                                warnings=warnings,
+                                duration_seconds=time.monotonic() - started)
+    except (StoreBuildError, LockfileError, requirements_mod.RequirementsError,
+            runtime_mod.RuntimeError_, OSError) as exc:
+        return StoreBuildResult(ok=False, errors=[str(exc)], warnings=warnings)
+
+
+# ── exports ──────────────────────────────────────────────────────────────────
+
+def _ignore_staging(_dir: str, names: list[str]) -> set[str]:
+    return {n for n in names if n.startswith(".staging-")}
+
+
+def _ignore_staging_and_sentinel(_dir: str, names: list[str]) -> set[str]:
+    return {n for n in names if n.startswith(".staging-") or n == integrity.SENTINEL}
+
+
+def _copy_state(src: Path, dst: Path) -> None:
+    """state.json (and nothing else): lock files and half-written temp files are
+    this build machine's business, not the target's."""
+    dst.mkdir(parents=True, exist_ok=True)
+    for item in Path(src).iterdir():
+        if item.is_file() and item.suffix not in (".lock", ".tmp") \
+                and not item.name.startswith("."):
+            shutil.copy2(item, dst / item.name)
+
+
+def _version_manifests(paths: AppPaths) -> dict[str, dict]:
+    found: dict[str, dict] = {}
+    if not paths.versions_dir.is_dir():
+        return found
+    for child in sorted(paths.versions_dir.iterdir()):
+        if not child.is_dir() or child.name.startswith("."):
+            continue
+        try:
+            found[child.name] = json.loads((child / MANIFEST_NAME).read_text("utf-8"))
+        except (OSError, ValueError):
+            continue
+    return found
+
+
+def export_full_tree(root: Path, out_dir: Path, *, app_id: str | None = None,
+                     progress: Progress | None = None) -> ExportResult:
+    """完整交付 — the whole store, ready to run on a machine that has nothing.
+
+    The GUI's 「匯出交付」 used to call export_update(), which copies a version and
+    some deps and nothing else: no bootstrap\\, no start bat, no state\\, no
+    讀我-使用說明.txt, no tools\\. The result could not be started at all.
+
+    Excluded on purpose:
+      * apps/<app>/data/  — this build machine's logs, leases and healthy markers.
+        Ship them and the target inherits a lease that was never its own.
+      * .staging-*        — half-copied debris.
+      * deps/*/.complete  — the target re-earns it by verifying (ensure_verified).
+    KEPT on purpose: apps/*/versions/<ver>/.complete — a full deployment must be
+    runnable at first boot, and nothing on the target re-verifies a version there.
+    """
+    root = Path(root)
+    out = Path(out_dir)
+    say = progress or _noop
+
+    all_apps = list_app_ids(root)
+    if app_id is not None:
+        if app_id not in all_apps:
+            raise StoreBuildError(
+                f"這棵 Store 樹裡沒有 app {app_id!r};現有:{all_apps or '(沒有任何 app)'}")
+        apps = [app_id]
+    else:
+        apps = list(all_apps)
+    if not apps:
+        raise StoreBuildError(f"這棵 Store 樹裡沒有任何 app,沒有東西可以交付:{root}")
+    if not (root / "bootstrap" / "bootstrap.py").is_file():
+        raise StoreBuildError(
+            f"這棵樹缺 bootstrap\\bootstrap.py,不是一棵完整的 Store 樹:{root}\n"
+            "  請重新建置一次(建置會補上 bootstrap\\)。")
+    if out.resolve() == root.resolve():
+        raise StoreBuildError("匯出目的地不能就是 Store 根目錄本身。")
+
+    out.mkdir(parents=True, exist_ok=True)
+
+    say("複製 bootstrap\\(裝置端程式,stdlib-only)…")
+    shutil.copytree(root / "bootstrap", out / "bootstrap",
+                    ignore=_ignore_staging, dirs_exist_ok=True)
+
+    versions: list[str] = []
+    runtime_fps: set[str] = set()
+    shell_fps: set[str] = set()
+    for a in apps:
+        src = AppPaths(root, a)
+        dst = AppPaths(out, a)
+        say(f"複製 {a} 的版本與狀態…")
+        if src.versions_dir.is_dir():
+            # .complete stays: the current version must be runnable at first boot.
+            shutil.copytree(src.versions_dir, dst.versions_dir,
+                            ignore=_ignore_staging, dirs_exist_ok=True)
+        if src.state_dir.is_dir():
+            _copy_state(src.state_dir, dst.state_dir)
+        else:
+            raise StoreBuildError(f"{a} 沒有 state\\,這棵樹不完整,無法交付。")
+        config = src.app_dir / "config.json"
+        if config.is_file():
+            shutil.copy2(config, dst.app_dir / "config.json")
+        # apps/<app>/data/ is NOT copied, and apps/<app>/staging/ is not either.
+
+        for name, manifest in _version_manifests(src).items():
+            versions.append(f"{a}/{name}" if len(apps) > 1 else name)
+            if manifest.get("runtime_fingerprint"):
+                runtime_fps.add(manifest["runtime_fingerprint"])
+            if manifest.get("shell_fingerprint"):
+                shell_fps.add(manifest["shell_fingerprint"])
+
+    rstore = RuntimeStore(root / "deps")
+    sstore = ShellStore(root / "deps")
+    for fingerprint in sorted(runtime_fps):
+        source = rstore.path_for(fingerprint)
+        if not source.is_dir():
+            raise StoreBuildError(
+                f"這棵樹缺共用 runtime {fingerprint},交付出去會啟動不了:{source}")
+        say(f"複製共用 runtime {fingerprint}(數百 MB,只有第一次要傳)…")
+        shutil.copytree(source, out / "deps" / "runtimes" / fingerprint,
+                        ignore=_ignore_staging_and_sentinel, dirs_exist_ok=True)
+    for fingerprint in sorted(shell_fps):
+        source = sstore.path_for(fingerprint)
+        if not source.is_dir():
+            raise StoreBuildError(
+                f"這棵樹缺共用 Tauri 殼 {fingerprint},交付出去開不出視窗:{source}")
+        say(f"複製共用 Tauri 殼 {fingerprint}…")
+        shutil.copytree(source, out / "deps" / "shells" / fingerprint,
+                        ignore=_ignore_staging_and_sentinel, dirs_exist_ok=True)
+
+    # The WebView2 bootstrapper, if this store bundles one.
+    prereq = root / "prereq"
+    if prereq.is_dir():
+        say("複製 prereq\\(WebView2 安裝檔)…")
+        shutil.copytree(prereq, out / "prereq", ignore=_ignore_staging, dirs_exist_ok=True)
+
+    say("寫入 start bat、tools\\ 與讀我-使用說明.txt…")
+    wanted_bats = {"start.bat"} | {f"start-{a}.bat" for a in apps}
+    for bat in sorted(root.glob("start*.bat")):
+        if bat.name in wanted_bats:
+            shutil.copy2(bat, out / bat.name)
+    if not any((out / n).is_file() for n in wanted_bats):
+        # An old tree (or a tree whose bats were deleted): regenerate rather than
+        # deliver a folder with nothing to double-click.
+        _write_entry_bats(out, _display_name_of(root, apps[0]))
+
+    # Regenerated, not copied: tools\ must describe EXACTLY the apps in this
+    # export (a chooser offering an app that is not here is worse than useless).
+    _write_tools(out, apps, names_from=root)
+
+    readme = root / README_NAME
+    if readme.is_file() and len(apps) == len(all_apps):
+        shutil.copy2(readme, out / README_NAME)
+    else:
+        bats = sorted(p.name for p in out.glob("start*.bat"))
+        _write_store_readme(out, apps, bats,
+                            preferred_port=_preferred_port_of(root, apps))
+
+    total = _directory_size(out)
+    say(f"完成:{out}({total / 1024 ** 2:.0f} MB)")
+    return ExportResult(out_dir=out, total_mb=total / 1024 ** 2, apps=apps,
+                        versions=versions, includes_runtime=bool(runtime_fps),
+                        kind="full")
+
+
+def _previous_manifest(paths: AppPaths, version: str) -> dict | None:
+    """The version this app shipped BEFORE `version` — i.e. what a machine that
+    already has this tree is most likely running."""
+    others = [(m.get("built_at", ""), name, m)
+              for name, m in _version_manifests(paths).items() if name != version]
+    if not others:
+        return None
+    others.sort()
+    return others[-1][2]
+
+
+def export_update(root: Path, app_id: str, version: str, out_dir: Path,
+                  *, include_runtime: bool | None = None,
+                  progress: Progress | None = None) -> ExportResult:
+    """自動更新來源 (spec §9.1 folder-provider layout) — NOT a deliverable folder.
+
+    Consumed by device/provider.py polling an update source, or copied to the
+    machine and applied with `bootstrap.py --install <payload>`. Every sentinel is
+    stripped: the target machine must verify before anything becomes visible.
+    For a machine that has never seen this app, use export_full_tree().
+    """
+    root = Path(root)
+    say = progress or _noop
+    paths = AppPaths(root, app_id)
+    vdir = paths.version_dir(version)
+    if not integrity.is_complete(vdir):
+        raise StoreBuildError(f"版本 {version} 不完整,不可匯出")
+    manifest = json.loads((vdir / MANIFEST_NAME).read_text("utf-8"))
+    fingerprint = manifest["runtime_fingerprint"]
+    shell_fp = manifest.get("shell_fingerprint")
+
+    # An incremental package that silently drops a changed runtime installs a
+    # version whose interpreter does not exist on the target: it stages, promotes,
+    # fails to start, and rolls back — every time, forever.
+    if include_runtime is False:
+        previous = _previous_manifest(paths, version)
+        if previous is not None:
+            changed = []
+            if previous.get("runtime_fingerprint") != fingerprint:
+                changed.append(f"Python 相依指紋:{previous.get('runtime_fingerprint')}"
+                               f" -> {fingerprint}")
+            if previous.get("shell_fingerprint") != shell_fp:
+                changed.append(f"Tauri 殼:{previous.get('shell_fingerprint')} -> {shell_fp}")
+            if changed:
+                raise StoreBuildError(
+                    "這一版換了 Python 相依(或殼),增量包不夠,必須勾選「包含 runtime」。\n"
+                    + f"  (跟上一版 {previous.get('version')} 相比)\n"
+                    + "".join(f"  · {line}\n" for line in changed)
+                    + "  只送版本的話,目標機器會裝好、啟動失敗、然後自動退回舊版。")
+
+    want_deps = include_runtime is None or include_runtime
+    out_app = Path(out_dir) / app_id
+    out_app.mkdir(parents=True, exist_ok=True)
+    # ONLY the sentinel is dropped (so the target machine earns it by verifying).
+    # Filtering anything else — we used to drop __pycache__/*.pyc — deletes files
+    # that files.json still declares, and every export then failed integrity on
+    # the target with "重新複製" advice that could never work.
+    say(f"複製版本 {version} …")
+    shutil.copytree(vdir, out_app / "versions" / version,
+                    ignore=_ignore_staging_and_sentinel, dirs_exist_ok=True)
+    if want_deps:
+        say(f"複製共用 runtime {fingerprint} …")
+        runtime_dir = RuntimeStore(paths.deps_dir).path_for(fingerprint)
+        shutil.copytree(runtime_dir, out_app / "runtimes" / fingerprint,
+                        ignore=_ignore_staging_and_sentinel, dirs_exist_ok=True)
+        # The shell is shared too: a target machine that has never seen this shell
+        # would otherwise install the version and then fail to open a window.
+        if shell_fp:
+            shell_dir = ShellStore(paths.deps_dir).path_for(shell_fp)
+            shutil.copytree(shell_dir, out_app / "shells" / shell_fp,
+                            ignore=_ignore_staging_and_sentinel, dirs_exist_ok=True)
+
+    files_manifest = (vdir / integrity.FILES_NAME).read_bytes()
+    revision = hashlib.sha256(files_manifest).hexdigest()[:12]
+    (out_app / "release.json").write_text(json.dumps({
+        "schema": 1, "app_id": app_id, "version": version,
+        "revision": revision, "runtime_fingerprint": fingerprint,
+        "shell_fingerprint": shell_fp,
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    total = _directory_size(out_app)
+    say(f"完成:{out_app}({total / 1024 ** 2:.0f} MB,自動更新來源)")
+    return ExportResult(out_dir=out_app, total_mb=total / 1024 ** 2, apps=[app_id],
+                        versions=[version], includes_runtime=bool(want_deps),
+                        kind="update")

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "native-provision"
+version = "1.0.0"
+description = "離線補給包產生器：把 CIM 平台專案的 plugin 相依打成無網路可安裝的 wheel 包"
+requires-python = ">=3.11"
+dependencies = []          # SPEC D2：runtime 零第三方相依（stdlib only）
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.package-data]
+"provision_builder.napp" = ["schemas/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = [
+    "network: 需要網路（真的 pip download）；預設不跑，用 -m network 明確開啟",
+    "platform_repo: 需要真實的 CIM 平台專案（用 --project-root 指定）",
+]

@@ -1,0 +1,39 @@
+# 產出（補給包本身很大，永遠不進 git）
+/dist/
+/build/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+/e2e/out/
+/.local-services/
+
+# 可攜 Python 範本快取(133MB,可用 GUI 重新下載)
+/.runtime-cache/
+
+# E2E 產出
+/e2e/runs/
+/e2e/reports/
+
+# 本地實驗用狀態(sqlite/blob),不進 git
+/.lab/
+/.lab-native-app/
+
+# E2E 執行產物(含整個 venv 與截圖),不是原始碼
+/e2e/gui-flow-validation/
+/e2e/native-app-fleet/
+/e2e/module001-validation/
+/e2e/source-build-flow/
+/e2e/source-pack-smoke/
+/e2e/streamlit-desktop/
+/e2e/streamlit-desktop-gui/
+/e2e/streamlit-desktop-store/
+/e2e/cv-viewer-check/
+/e2e/ai4bi-check/
+/e2e/screenshots/
+/e2e/out/
+/e2e/validation-work/
+/e2e/streamlit-desktop-store-gui/

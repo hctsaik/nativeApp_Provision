@@ -1,0 +1,51 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: native_registry
+      POSTGRES_USER: native_app
+      POSTGRES_PASSWORD: ${REGISTRY_DB_PASSWORD:-native-app-dev-only}
+    ports: ["5432:5432"]
+    volumes:
+      - registry-db:/var/lib/postgresql/data
+      - ./init-registry.sql:/docker-entrypoint-initdb.d/10-init-registry.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U native_app -d native_registry"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-native-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-native-minio-dev-only}
+    ports: ["9000:9000", "9001:9001"]
+    volumes: ["minio-data:/data"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-native-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-native-minio-dev-only}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"
+        mc mb --ignore-existing local/native-apps
+        mc anonymous set none local/native-apps
+
+volumes:
+  registry-db:
+  minio-data:
+

@@ -1,0 +1,67 @@
+run-platform.bat — 一鍵啟動說明
+=================================
+
+這支 bat 放在補給包根目錄（provision\），做三件事：
+  1. apply  ：把 wheel 搬到平台的 deppack-cache（只搬檔、不連網）
+  2. warmup ：把工具相依離線裝進 per-tool venv（首次較久，之後指紋命中秒過）
+  3. 啟動平台：開起來後你自己在 portal 選工具、按 Start
+
+apply 與 warmup 都是冪等的，每次啟動都會先跑一遍也沒關係（沒變動就秒過）。
+
+
+怎麼用
+------
+1) 用記事本打開 run-platform.bat，找到最上面的「CONFIG」區塊。
+2) 設定 MODE：
+     MODE=dev        本機測試：打真平台專案 + prebuilt cim-light.exe
+     MODE=portable   工廠離線機：標準 <APP_ROOT>\ 佈局
+3) 存檔，雙擊 run-platform.bat。
+
+
+先自測（強烈建議）
+------------------
+   run-platform.bat check
+
+只驗路徑與計畫、不寫入任何檔案、不啟動平台。看到
+「check done: paths and plan look good.」就代表接線正確。
+
+
+CONFIG 各欄位
+-------------
+  MODE          dev 或 portable
+  TOOLS         只處理某幾個工具（逗號分隔，例：app-lv,module_001）；留空 = 全部
+  DEV_PROJECT   （dev）平台專案根，含 sidecar\python-engine\engine.py 的那層
+  DEV_PYTHON    （dev）留空 = 自動用 py -3.11；也可填某顆 python.exe 的完整路徑
+  APP_ROOT      （portable）預設 = provision\ 的上一層；runtime\ 與 engine\ 須為其同級
+
+
+dev 模式做了什麼
+----------------
+  - 用 py -3.11 當 engine 直譯器
+  - 啟動 <DEV_PROJECT>\apps\host-tauri\prebuilt\cim-light.exe
+  - deppack-cache / tool-venvs 放在 provision\_run\ 底下（自足、可刪）
+  - 啟動時設定的環境變數與 E2E 驗證用的完全相同：
+      CIM_ENGINE_EXE / CIM_ENGINE_PYTHON / CIM_DEPPACK_CACHE /
+      CIM_TOOL_VENVS_DIR / CIM_REPO_ROOT / PYTHONUTF8
+
+
+portable 模式做了什麼
+---------------------
+  - 用 <APP_ROOT>\runtime\python311\python.exe
+  - 平台專案 = <APP_ROOT>\engine
+  - 自動偵測 <APP_ROOT>\data\<project-key>\，deppack-cache / tool-venvs 用它底下的
+  - 啟動走 <APP_ROOT>\start.bat（可攜模式自己設好其餘環境）
+
+  ※ 若還沒有 data\<project-key>\：請先雙擊一次 start.bat 讓它長出來（順便確認平台本身
+     跑得起來），再回來跑本 bat。
+
+
+常見狀況
+--------
+  - 按 Start 後顯示 Failed to start tool: undefined
+      → 沒先 warmup（殼 30 秒逾時）。本 bat 已內建 warmup，正常不會遇到；
+        若真遇到，等 engine 背景裝完再按一次 Start 即可。
+  - 畫面出現 ModuleNotFoundError
+      → deppack-cache 指錯位置。用 run-platform.bat check 核對路徑。
+
+完整原理見 docs\OFFLINE_DEPLOY.md（圖文版 docs\offline-deploy.html）。

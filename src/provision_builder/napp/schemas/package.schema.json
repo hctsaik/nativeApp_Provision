@@ -1,0 +1,33 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CV Reviewer built package proof (package.json)",
+  "type": "object",
+  "required": ["app_id", "version", "entrypoint", "dependency_fingerprint", "platform", "artifact"],
+  "properties": {
+    "app_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+    "version": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+    "entrypoint": {"type": "string"},
+    "source_commit": {"type": "string"},
+    "dependency_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "platform": {
+      "type": "object",
+      "properties": {
+        "os": {"type": "string"},
+        "arch": {"type": "string"},
+        "python": {"type": "string"},
+        "abi": {"type": "string"}
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "properties": {
+        "format_version": {"type": "integer"},
+        "source_files": {"type": "integer"},
+        "blob_references": {"type": "integer"}
+      }
+    },
+    "healthcheck": {"type": "object"},
+    "data_schema": {"type": "string"},
+    "created_at": {"type": "string"}
+  }
+}

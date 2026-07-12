@@ -1,0 +1,2 @@
+# 開發相依（僅測試用）。runtime 本身零第三方相依（SPEC D2）。
+pytest

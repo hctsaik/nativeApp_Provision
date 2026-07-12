@@ -1,0 +1,790 @@
+<title>離線補給包 — 讓模組在沒有網路的電腦上跑起來</title>
+
+<style>
+  /* ── Tokens ──────────────────────────────────────────────────────────────
+     主題:「冷儲存 / 氣隙」。中性色帶極淡的青綠偏移(與 signal teal 同源),
+     不是預設的純灰。展示字體用等寬 —— 這個主題的世界就是終端機、sha256、
+     wheel 檔名;讓等寬字承擔標題,而不是只用來排程式碼。                  */
+  :root {
+    --paper:      #F5F7F6;
+    --paper-sunk: #EBEFEE;
+    --ink:        #111619;
+    --ink-soft:   #38454A;
+    --muted:      #5F6A6B;
+    --rule:       #D6DCDA;
+    --rule-soft:  #E3E8E6;
+
+    --accent:     #0B6E75;   /* signal teal */
+    --accent-dim: #0B6E7514;
+    --caution:    #8F5A06;   /* hazard ochre —— 只給「大型相依」用 */
+    --caution-dim:#8F5A0614;
+    --pass:       #1D7A4C;
+    --fail:       #A32B21;
+
+    --term-bg:    #10171A;
+    --term-fg:    #D5DEDC;
+    --term-dim:   #7C8B8A;
+
+    --mono: "Cascadia Mono", "Cascadia Code", Consolas, "SF Mono", ui-monospace, monospace;
+    --sans: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Noto Sans TC", sans-serif;
+
+    --prose: 43rem;
+    --wide:  62rem;
+    --gutter: 3.25rem;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper:      #0C1012;
+      --paper-sunk: #131A1C;
+      --ink:        #E4E9E7;
+      --ink-soft:   #B4C0BE;
+      --muted:      #879493;
+      --rule:       #232B2D;
+      --rule-soft:  #1B2224;
+
+      --accent:     #4FBCC4;
+      --accent-dim: #4FBCC41F;
+      --caution:    #DDA33D;
+      --caution-dim:#DDA33D1F;
+      --pass:       #4FC08A;
+      --fail:       #F0796B;
+
+      --term-bg:    #080C0D;
+      --term-fg:    #C9D4D2;
+      --term-dim:   #6A7877;
+    }
+  }
+  /* 檢視器的主題切換必須贏過 media query —— 兩個方向都要。 */
+  :root[data-theme="light"] {
+    --paper: #F5F7F6; --paper-sunk: #EBEFEE; --ink: #111619; --ink-soft: #38454A;
+    --muted: #5F6A6B; --rule: #D6DCDA; --rule-soft: #E3E8E6;
+    --accent: #0B6E75; --accent-dim: #0B6E7514; --caution: #8F5A06; --caution-dim: #8F5A0614;
+    --pass: #1D7A4C; --fail: #A32B21;
+    --term-bg: #10171A; --term-fg: #D5DEDC; --term-dim: #7C8B8A;
+  }
+  :root[data-theme="dark"] {
+    --paper: #0C1012; --paper-sunk: #131A1C; --ink: #E4E9E7; --ink-soft: #B4C0BE;
+    --muted: #879493; --rule: #232B2D; --rule-soft: #1B2224;
+    --accent: #4FBCC4; --accent-dim: #4FBCC41F; --caution: #DDA33D; --caution-dim: #DDA33D1F;
+    --pass: #4FC08A; --fail: #F0796B;
+    --term-bg: #080C0D; --term-fg: #C9D4D2; --term-dim: #6A7877;
+  }
+
+  /* ── Base ──────────────────────────────────────────────────────────────── */
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 1.0625rem;
+    line-height: 1.72;
+    -webkit-font-smoothing: antialiased;
+  }
+  .page {
+    max-width: var(--wide);
+    margin: 0 auto;
+    padding: 3rem 1.5rem 6rem;
+    display: flex;
+    flex-direction: column;
+    gap: 3.5rem;
+  }
+  .prose { max-width: var(--prose); }
+  p { margin: 0; }
+  a { color: var(--accent); text-underline-offset: 2px; }
+  a:focus-visible, summary:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 2px;
+  }
+  strong { font-weight: 650; color: var(--ink); }
+  code {
+    font-family: var(--mono);
+    font-size: 0.86em;
+    background: var(--paper-sunk);
+    border: 1px solid var(--rule-soft);
+    border-radius: 3px;
+    padding: 0.08em 0.32em;
+    word-break: break-word;
+  }
+
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0;
+  }
+
+  /* ── Masthead:像一張貨運提單 ──────────────────────────────────────────── */
+  .masthead { display: flex; flex-direction: column; gap: 1.5rem; }
+  .masthead h1 {
+    font-family: var(--mono);
+    font-size: clamp(1.65rem, 1.1rem + 2.2vw, 2.7rem);
+    font-weight: 600;
+    letter-spacing: -0.015em;
+    line-height: 1.15;
+    text-wrap: balance;
+    margin: 0;
+  }
+  .masthead h1 .thin { color: var(--muted); font-weight: 400; }
+  .lede { max-width: var(--prose); color: var(--ink-soft); font-size: 1.14rem; }
+
+  .manifest {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+    gap: 1px;
+    background: var(--rule);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .manifest div { background: var(--paper); padding: 0.75rem 0.95rem; }
+  .manifest dt {
+    font-family: var(--mono); font-size: 0.66rem; letter-spacing: 0.14em;
+    text-transform: uppercase; color: var(--muted); margin: 0 0 0.3rem;
+  }
+  .manifest dd {
+    margin: 0; font-family: var(--mono); font-size: 0.86rem;
+    font-variant-numeric: tabular-nums; color: var(--ink); word-break: break-all;
+  }
+
+  /* ── Sections ─────────────────────────────────────────────────────────── */
+  section { display: flex; flex-direction: column; gap: 1.15rem; }
+  h2 {
+    font-family: var(--mono);
+    font-size: 1.28rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    margin: 0;
+    padding-bottom: 0.6rem;
+    border-bottom: 1px solid var(--rule);
+    text-wrap: balance;
+  }
+  h3 {
+    font-family: var(--sans);
+    font-size: 1.09rem;
+    font-weight: 640;
+    margin: 0;
+    text-wrap: balance;
+  }
+
+  /* ── Part spine + 步驟編號(內容真的是序列,編號才成立)──────────────────── */
+  .part { position: relative; padding-left: var(--gutter); display: flex; flex-direction: column; gap: 2.5rem; }
+  .part::before {
+    content: ""; position: absolute; left: 1.05rem; top: 0.5rem; bottom: 0.5rem;
+    width: 1px; background: var(--rule);
+  }
+  .step { position: relative; display: flex; flex-direction: column; gap: 1rem; }
+  .step::before {
+    content: attr(data-step);
+    position: absolute; left: calc(-1 * var(--gutter)); top: -0.1rem;
+    width: 2.1rem; height: 2.1rem;
+    display: grid; place-items: center;
+    font-family: var(--mono); font-size: 0.85rem; font-variant-numeric: tabular-nums;
+    color: var(--accent); background: var(--paper);
+    border: 1px solid var(--rule); border-radius: 3px;
+  }
+  @media (max-width: 640px) {
+    .part { padding-left: 0; }
+    .part::before { display: none; }
+    .step::before { position: static; margin-bottom: 0.2rem; }
+  }
+
+  /* ── AIR GAP:全頁唯一的大膽處 ─────────────────────────────────────────── */
+  .airgap {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    align-items: center;
+    gap: 1.1rem;
+    padding: 1.15rem 0;
+  }
+  .airgap-rule {
+    height: 10px; border-radius: 2px;
+    background: repeating-linear-gradient(
+      -45deg, var(--caution) 0 6px, transparent 6px 13px);
+    opacity: 0.72;
+  }
+  .airgap-label {
+    font-family: var(--mono); font-size: 0.68rem; letter-spacing: 0.2em;
+    text-transform: uppercase; color: var(--caution); white-space: nowrap;
+  }
+  .airgap-sides {
+    display: flex; justify-content: space-between;
+    font-family: var(--mono); font-size: 0.72rem; color: var(--muted);
+    letter-spacing: 0.06em;
+  }
+
+  /* ── 三個資料夾 ───────────────────────────────────────────────────────── */
+  .parcels { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); gap: 1px;
+             background: var(--rule); border: 1px solid var(--rule); border-radius: 4px; overflow: hidden; }
+  .parcel { background: var(--paper); padding: 1.15rem 1.2rem; display: flex; flex-direction: column; gap: 0.5rem; }
+  .parcel.is-focus { background: var(--accent-dim); }
+  .parcel h4 { margin: 0; font-family: var(--mono); font-size: 0.92rem; font-weight: 600; color: var(--ink); }
+  .parcel p { font-size: 0.9rem; color: var(--ink-soft); line-height: 1.6; }
+  .parcel .who { font-family: var(--mono); font-size: 0.72rem; color: var(--muted); }
+
+  /* ── 終端機輸出 ───────────────────────────────────────────────────────── */
+  figure { margin: 0; display: flex; flex-direction: column; gap: 0.6rem; }
+  .term {
+    margin: 0; background: var(--term-bg); color: var(--term-fg);
+    border: 1px solid var(--rule); border-radius: 4px;
+    font-family: var(--mono); font-size: 0.78rem; line-height: 1.62;
+    padding: 1rem 1.1rem; overflow-x: auto; tab-size: 2;
+  }
+  .term .cmd { color: #7FD1D8; }
+  .term .cmd::before { content: "> "; color: var(--term-dim); }
+  .term .dim { color: var(--term-dim); }
+  .term .ok  { color: #6FCB97; }
+  .term .bad { color: #F0796B; }
+  .term .warn{ color: #E3B061; }
+  figcaption {
+    font-family: var(--mono); font-size: 0.72rem; color: var(--muted);
+    line-height: 1.55; max-width: var(--prose);
+  }
+  figcaption b { color: var(--ink-soft); font-weight: 500; }
+
+  /* ── 截圖 ─────────────────────────────────────────────────────────────── */
+  .shot {
+    border: 1px solid var(--rule); border-radius: 4px; overflow: hidden;
+    background: var(--paper-sunk); line-height: 0;
+  }
+  .shot img { width: 100%; height: auto; display: block; }
+  .shot--flag { border-color: var(--fail); }
+  .shot--good { border-color: var(--pass); }
+
+  /* ── 表格 ─────────────────────────────────────────────────────────────── */
+  .table-wrap { overflow-x: auto; border: 1px solid var(--rule); border-radius: 4px; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.88rem; min-width: 34rem; }
+  th, td { text-align: left; padding: 0.65rem 0.9rem; border-bottom: 1px solid var(--rule-soft); vertical-align: top; }
+  thead th {
+    font-family: var(--mono); font-size: 0.68rem; letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--muted); font-weight: 500; background: var(--paper-sunk);
+    border-bottom: 1px solid var(--rule);
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  td.num { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  td code { background: none; border: none; padding: 0; }
+
+  .chip {
+    display: inline-flex; align-items: center; gap: 0.35rem;
+    font-family: var(--mono); font-size: 0.68rem; letter-spacing: 0.08em; text-transform: uppercase;
+    padding: 0.12rem 0.44rem; border-radius: 3px; white-space: nowrap;
+    border: 1px solid currentColor;
+  }
+  .chip--pass { color: var(--pass); }
+  .chip--fail { color: var(--fail); }
+  .chip--warn { color: var(--caution); }
+
+  /* ── Callout ──────────────────────────────────────────────────────────── */
+  .note {
+    border-left: 2px solid var(--accent);
+    background: var(--accent-dim);
+    padding: 1rem 1.15rem;
+    border-radius: 0 4px 4px 0;
+    display: flex; flex-direction: column; gap: 0.7rem;
+    max-width: var(--prose);
+  }
+  .note--caution { border-left-color: var(--caution); background: var(--caution-dim); }
+  .note .eyebrow { color: inherit; }
+  .note--caution .eyebrow { color: var(--caution); }
+  .note:not(.note--caution) .eyebrow { color: var(--accent); }
+  .note p { font-size: 0.95rem; color: var(--ink-soft); }
+
+  ul.plain { margin: 0; padding-left: 1.15rem; display: flex; flex-direction: column; gap: 0.5rem; }
+  ul.plain li { color: var(--ink-soft); }
+
+  details {
+    border: 1px solid var(--rule); border-radius: 4px; padding: 0.7rem 1rem;
+    max-width: var(--prose); background: var(--paper-sunk);
+  }
+  summary { cursor: pointer; font-family: var(--mono); font-size: 0.82rem; color: var(--ink-soft); }
+  details[open] summary { margin-bottom: 0.7rem; }
+
+  footer {
+    border-top: 1px solid var(--rule); padding-top: 1.5rem;
+    font-family: var(--mono); font-size: 0.72rem; color: var(--muted); line-height: 1.7;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+</style>
+
+<div class="page">
+
+  <!-- ══ Masthead ══════════════════════════════════════════════════════ -->
+  <header class="masthead">
+    <p class="eyebrow">native_Provision · 操作說明書</p>
+    <h1>讓模組在<span class="thin">沒有網路的</span>電腦上跑起來</h1>
+    <p class="lede prose">
+      工具的重相依（torch 那種）不裝在平台核心，而是宣告在各工具的
+      <code>plugin.yaml</code>，由平台在工具首次啟動時裝進專屬的 venv。
+      離線機沒有 PyPI，所以那些 wheel 必須事先下載好帶過去。
+      這份文件講怎麼帶、怎麼裝，以及在畫面上按下 Start 之後到底會看到什麼。
+    </p>
+
+    <dl class="manifest">
+      <div><dt>驗證對象</dt><dd>{{TOOL_ID}}</dd></div>
+      <div><dt>平台 commit</dt><dd>{{COMMIT}}</dd></div>
+      <div><dt>目標機器</dt><dd>{{TARGET}}</dd></div>
+      <div><dt>補給包大小</dt><dd>{{PACK_SIZE}}</dd></div>
+      <div><dt>驗證日期</dt><dd>{{RUN_DATE}}</dd></div>
+      <div><dt>E2E 結果</dt><dd>{{E2E_SUMMARY}}</dd></div>
+    </dl>
+  </header>
+
+  <!-- ══ 三個資料夾 ════════════════════════════════════════════════════ -->
+  <section>
+    <h2>一台離線機需要三個資料夾</h2>
+    <p class="prose">
+      全部在<strong>連網機</strong>準備好、複製過去即可。離線機不需要網路、不需要 admin、
+      不需要安裝任何東西。這份文件只講第三個。
+    </p>
+    <div class="parcels">
+      <div class="parcel">
+        <h4>runtime\</h4>
+        <p>可攜 Python 3.11 ＋ 平台核心相依（fastapi / streamlit / numpy…）。</p>
+        <p class="who">build-runtime.bat · Python 升版才重做</p>
+      </div>
+      <div class="parcel">
+        <h4>&lt;平台專案&gt;\</h4>
+        <p>engine、預建 portal dist、所有 plugin 原始碼。</p>
+        <p class="who">git clone --recursive · 專案更新時重做</p>
+      </div>
+      <div class="parcel is-focus">
+        <h4>provision\</h4>
+        <p>所有工具的離線 wheel、逐檔 sha256 清單，以及套用腳本 <code>apply.py</code>。</p>
+        <p class="who">provision.py build · 任何工具改 requires 就重做</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ══ PART 1 ════════════════════════════════════════════════════════ -->
+  <section>
+    <h2>Part 1 · 在連網機上準備補給包</h2>
+    <div class="part">
+
+      <article class="step" data-step="1">
+        <h3>先看清單，不下載</h3>
+        <p class="prose">
+          <code>--dry-run</code> 只掃描不抓檔。要看兩件事：工具數對不對，以及
+          <strong>目標標籤那一行</strong>。
+        </p>
+        <figure>
+          <pre class="term"><span class="cmd">py -3.11 provision.py build C:\code\claude\nativeApp --dry-run</span>
+掃描專案：C:\code\claude\nativeApp
+找到 1 個需要補給包的工具（另有 27 個不需要）
+
+計畫（--dry-run，未下載任何東西）：
+  [重建] app-lv（14 個 requires）— 尚未產包
+           requires: torch==2.6.0, torchvision&gt;=0.17.0, transformers==4.49.0, ...
+  <span class="dim">[跳過] app-ai4bi — no requires
+  [跳過] module_002 — disabled（enabled: false）
+  ...</span>
+目標標籤：win_amd64 / python 3.11 / cp311
+大相依門檻：100 MB</pre>
+          <figcaption>
+            掃描根鏡射 engine 的 <b>scripts/*/plugin.yaml</b> 與
+            <b>plugins/*/modules/*/plugin.yaml</b>。工具數少了，多半是 submodule 沒
+            <code>git submodule update --init --recursive</code>。
+          </figcaption>
+        </figure>
+
+        <div class="note note--caution">
+          <p class="eyebrow">這是最容易出事的地方</p>
+          <p>
+            曾經有人在 Python 3.14 的機器上 <code>pip download</code>，抓到 51 個
+            <code>cp314</code> 的 wheel，帶到鎖 3.11 的平台上<strong>一個都裝不起來</strong>。
+            本工具永遠把 <code>--platform</code> / <code>--python-version</code> /
+            <code>--abi</code> 明示傳給 pip，就是為了讓那件事不可能再發生。
+          </p>
+        </div>
+      </article>
+
+      <article class="step" data-step="2">
+        <h3>產包</h3>
+        <p class="prose">
+          下載時間視網路而定。它替你做了兩件不會想手動做的事：把單檔超過門檻的 wheel
+          搬進 <code>big-deps\</code>（跨工具只存一份），以及產完立刻用
+          <code>pip download --no-index</code> 對本地 wheelhouse 重解一次依賴圖——
+          <strong>在開發機就證明這包離線裝得起來</strong>。
+        </p>
+        <figure>
+          <pre class="term"><span class="cmd">py -3.11 provision.py build C:\code\claude\nativeApp --dest D:\provision</span>
+掃描專案：C:\code\claude\nativeApp
+找到 1 個需要補給包的工具（另有 27 個不需要）
+[產包] app-lv（尚未產包）… pip download 14 個 requires
+<span class="ok">[完成] app-lv：44 個 wheel，342.1 MB，其中 1 個移入 big-deps\</span>
+
+產出：D:\provision
+  工具 1 個、總大小 342.1 MB、大型相依 1 個
+  下一步：讀 D:\provision\REPORT.md</pre>
+          <figcaption>
+            自檢不過的工具會進 <b>failed_tools</b>，<code>REPORT.md</code> 會點名是哪個套件
+            解不開（通常是某個間接相依只有 sdist、沒有 win/cp311 的 wheel）。
+            失敗一個工具不會中斷其它工具。
+          </figcaption>
+        </figure>
+      </article>
+
+      <article class="step" data-step="3">
+        <h3>讀 REPORT.md，決定怎麼搬</h3>
+        <p class="prose">
+          第一個實質區塊就是大型相依——因為它決定你要不要分開搬運。
+        </p>
+        <figure>
+          <pre class="term"><span class="dim">## 大型相依（單檔 &gt; 100 MB）</span>
+
+下列 1 個 wheel 共 <span class="warn">194.7 MB</span>，已集中隔離在 big-deps\ 資料夾（跨工具只存一份）。
+
+  torch-2.6.0-cp311-cp311-win_amd64.whl   194.7 MB   app-lv
+
+<span class="dim">&gt; 這個資料夾很大，可以與補給包的其餘部分分開搬運（例如另用一顆隨身硬碟）。</span></pre>
+          <figcaption>
+            整包一起搬 342 MB 最單純；分開搬也安全——忘了把
+            <b>big-deps\</b> 放回去就執行 apply，用到它的工具會被明確跳過，
+            其餘工具照常套用，而且不會留下半套的 dep-pack。
+          </figcaption>
+        </figure>
+      </article>
+
+    </div>
+  </section>
+
+  <!-- ══ AIR GAP ═══════════════════════════════════════════════════════ -->
+  <div>
+    <div class="airgap" role="separator" aria-label="air gap:以下沒有網路">
+      <span class="airgap-rule"></span>
+      <span class="airgap-label">Air Gap</span>
+      <span class="airgap-rule"></span>
+    </div>
+    <div class="airgap-sides">
+      <span>連網機 · pip download</span>
+      <span>離線機 · 沒有 PyPI</span>
+    </div>
+  </div>
+
+  <!-- ══ PART 2 ════════════════════════════════════════════════════════ -->
+  <section>
+    <h2>Part 2 · 在沒有網路的電腦上</h2>
+    <div class="part">
+
+      <article class="step" data-step="4">
+        <h3>複製後先驗一次</h3>
+        <p class="prose">
+          搬運會損毀檔案。<code>verify</code> 逐檔重算 sha256，抓得到改了一個 byte 的
+          wheel、被截斷的檔案、缺檔、以及清單上沒有的多餘檔案。它<strong>不需要平台專案</strong>，
+          隨身碟插上就能驗。
+        </p>
+        <figure>
+          <pre class="term"><span class="cmd">py -3.11 provision.py verify D:\provision</span>
+補給包：D:\provision
+
+  <span class="ok">[OK]   app-lv</span>
+
+  結果：全部通過（1/1 個工具可套用）</pre>
+        </figure>
+      </article>
+
+      <article class="step" data-step="5">
+        <h3>找出 <code>--deppack-cache</code> 要指到哪裡</h3>
+        <p class="prose">
+          這是唯一需要動腦的參數。它必須等於平台 engine 的 <code>CIM_DEPPACK_CACHE</code>。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>啟動方式</th><th>--deppack-cache 指到</th></tr></thead>
+            <tbody>
+              <tr><td>可攜模式（<code>start.bat</code>）</td><td><code>&lt;APP_ROOT&gt;\data\&lt;project-key&gt;\deppack-cache</code></td></tr>
+              <tr><td>開發模式（<code>start-dev.bat</code>）</td><td><code>&lt;平台專案&gt;\sidecar\python-engine\.deppack-cache</code></td></tr>
+              <tr><td>有自訂 <code>CIM_DEPPACK_CACHE</code></td><td>該環境變數的值</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="prose">
+          可攜模式的 <code>&lt;project-key&gt;</code> 是 <code>start.bat</code> 算出來的
+          （<code>&lt;專案資料夾名&gt;-&lt;絕對路徑sha256前8碼&gt;</code>）。
+          <strong>先雙擊一次 <code>start.bat</code></strong> 讓 <code>data\&lt;project-key&gt;\</code>
+          長出來，再照抄那個路徑——順便確認 app 本身跑得起來。
+        </p>
+      </article>
+
+      <article class="step" data-step="6">
+        <h3>套用</h3>
+        <figure>
+          <pre class="term"><span class="cmd">runtime\python311\python.exe D:\provision\apply.py --deppack-cache D:\CIM\data\engine-a1b2c3d4\deppack-cache</span>
+補給包：D:\provision
+目標  ：D:\CIM\data\engine-a1b2c3d4\deppack-cache
+
+  <span class="ok">[OK]   app-lv：已套用（44 個 wheel，342.1 MB）</span>
+
+總結：成功 1、跳過 0、失敗 0（共 1 個工具）</pre>
+          <figcaption>
+            342 MB 在 <b>1.3 秒</b>完成——同磁碟區走 hardlink，沒有真的複製。
+          </figcaption>
+        </figure>
+
+        <p class="prose">apply 做的事很少，這是刻意的：</p>
+        <ul class="plain prose">
+          <li>它<strong>只搬檔案</strong>：把 <code>packs\&lt;工具&gt;\</code> 放到目標位置，把
+              <code>big-deps\</code> 的大 wheel 補回各工具的 <code>wheels\</code>。</li>
+          <li>它<strong>不執行 pip、不連網</strong>。真正的安裝是平台 engine 在工具首次啟動時做的。</li>
+          <li>它採「暫存組裝 → 全量 sha256 驗證 → 原子性換位」。中途失敗或斷電時目標維持原樣，
+              絕不留下 wheels 不完整但 <code>deppack.json</code> 存在的目錄。</li>
+        </ul>
+
+        <details>
+          <summary>如果 big-deps\ 分開搬運、還沒放回去</summary>
+          <pre class="term">  <span class="warn">[跳過] app-lv
+         大型相依未就位：torch-2.6.0-cp311-cp311-win_amd64.whl</span>
+
+總結：成功 0、跳過 1、失敗 0（共 1 個工具）
+
+缺少的大型相依（把檔案放回 D:\provision\big-deps 後重跑 apply 即可）：
+  - torch-2.6.0-cp311-cp311-win_amd64.whl
+影響的工具：app-lv</pre>
+          <p style="margin-top:.7rem;font-size:.9rem;color:var(--ink-soft)">
+            exit code = 1，目標資料夾完全乾淨。把檔案放回去、重跑一次就好。
+          </p>
+        </details>
+      </article>
+
+      <article class="step" data-step="7">
+        <h3>暖機：先把相依裝好，再開 GUI</h3>
+
+        <div class="note note--caution">
+          <p class="eyebrow">別跳過這一步</p>
+          <p>
+            Tauri 殼的 HTTP bridge（<code>bridge.rs::api_post</code>）對 engine 的請求有
+            <strong>30 秒逾時</strong>；而 engine 是在 <code>POST /tools/&lt;id&gt;/start</code>
+            的處理過程中<strong>同步</strong>安裝相依的。torch 級的相依實測要 76 秒——
+            殼會先放棄，畫面顯示「Failed to start tool: undefined」。
+            （相依其實裝完了，只是沒人收到回應。）
+          </p>
+        </div>
+
+        <p class="prose">
+          <code>warmup.py</code> 把安裝成本移出「按下 Start」那一刻。它跟 apply 的分工是：
+          <strong>apply 搬檔案，warmup 真的裝</strong>。warmup 借用平台自己的
+          <code>core.tool_deps</code>——同一套驗章、同一句 <code>pip --no-index</code>——
+          所以它需要平台專案，而且必須用<strong>平台會用的那顆 Python</strong> 跑
+          （venv 的 ABI 綁在建立它的直譯器上）。
+        </p>
+
+        <figure>
+          <pre class="term"><span class="cmd">runtime\python311\python.exe D:\provision\warmup.py --project D:\CIM\engine --deppack-cache D:\CIM\data\engine-a1b2c3d4\deppack-cache --tool-venvs D:\CIM\data\engine-a1b2c3d4\tool-venvs</span>
+補給包  ：D:\provision
+平台專案：D:\CIM\engine
+dep-pack：D:\CIM\data\engine-a1b2c3d4\deppack-cache
+venv 根 ：D:\CIM\data\engine-a1b2c3d4\tool-venvs
+
+  [暖機] app-lv（14 個 requires）… <span class="ok">離線安裝完成（{{WARMUP_SECONDS}}s）</span>
+
+全部就緒（1 個工具）。現在啟動平台，第一次點開工具就會直接算繪。</pre>
+          <figcaption>
+            全程零網路。相依只從 apply 過的 dep-pack 以 <b>pip --no-index --find-links</b> 安裝；
+            dep-pack 驗章失敗時平台 fail-closed（拒裝，且不退回連 PyPI）。
+            重跑一次是秒過（指紋命中）。
+          </figcaption>
+        </figure>
+      </article>
+
+      <article class="step" data-step="8">
+        <h3>啟動平台，在畫面上把工具點開</h3>
+        <p class="prose">
+          照平常方式啟動（<code>start.bat</code> 或 <code>start-dev.bat</code>）。
+          下面每一張都是 Playwright 經 CDP 連上真實 WebView2 拍的，
+          <strong>而且整台機器的 pip 索引被指向死位址</strong>——任何連網嘗試都會立刻失敗。
+        </p>
+
+        <figure>
+          <div class="shot"><img src="{{FIG:portal_ready}}" alt="Portal 載入完成，右上角工作流程下拉選單已填入工具清單" /></div>
+          <figcaption>Portal 載入完成。殼是「engine ready 之後才建視窗」，所以下拉選單有內容就代表 engine 活著。</figcaption>
+        </figure>
+
+        <figure>
+          <div class="shot"><img src="{{FIG:tool_selected}}" alt="下拉選單選中 VisualLatent (LV)，右側出現 Start 按鈕" /></div>
+          <figcaption>選 <b>VisualLatent (LV)</b>（tool_id <code>app-lv</code>，14 個 requires，含 torch 2.6.0），按 Start。</figcaption>
+        </figure>
+
+        <figure>
+          <div class="shot shot--good"><img src="{{FIG:warm_rendered}}" alt="VisualLatent 的 Streamlit 介面完整算繪在 Tauri 視窗內" /></div>
+          <figcaption>
+            <b>{{WARM_START_SECONDS}} 秒後算繪完成，第一次按就成功。</b>
+            engine.log：<code>Per-tool deps ready for app-lv: (cached)</code>——
+            指紋命中，這次連 pip 都沒呼叫。全程沒有任何一個位元組來自網路。
+          </figcaption>
+        </figure>
+      </article>
+
+    </div>
+  </section>
+
+  <!-- ══ 驗證 ══════════════════════════════════════════════════════════ -->
+  <section>
+    <h2>這份說明書是被證明的，不是被宣稱的</h2>
+    <p class="prose">
+      上面的每一步都跑過一次自動化 E2E：真的 Tauri 殼、真的 WebView2、真的
+      Streamlit 子程序。三個對照組，每組都把 <code>PIP_INDEX_URL</code> 指向
+      <code>http://127.0.0.1:1/simple</code>（死位址）。
+      <strong>若 engine 的安裝路徑漏掉 <code>--no-index</code>，pip 會去連那個位址並失敗，B 組就會紅。</strong>
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>對照組</th><th>條件</th><th>畫面</th><th>engine 相依</th>
+            <th>venv import torch</th><th class="num">秒數</th><th>結果</th>
+          </tr>
+        </thead>
+        <tbody>{{SCENARIO_ROWS}}</tbody>
+      </table>
+    </div>
+
+    <p class="prose">
+      判準刻意用三個<strong>互相獨立</strong>的證據，缺一不可：iframe 畫出真正的 UI
+      （而不是 Python traceback）、engine.log 說相依 ready、以及直接拿該工具 venv 的
+      <code>python.exe</code> 去 <code>import torch</code>。
+    </p>
+
+    <h3 style="margin-top:1rem">A · 忘了套用補給包</h3>
+    <p class="prose">
+      平台的 <code>_prewarm_deps_and_timeout()</code> 註解寫著
+      <em>never block launch on dep handling</em>——相依裝不起來時，engine 只記一行
+      warning，<strong>照樣把工具啟動起來</strong>。所以使用者不會看到「工具打不開」，
+      而是看到工具打開了、畫面上是一段 <code>ModuleNotFoundError</code>。
+      這只有把 GUI 真的點開才會發現；CLI 測不到。
+    </p>
+    <figure>
+      <div class="shot shot--flag"><img src="{{FIG:no_provision_error}}" alt="沒有套用補給包時，工具開啟但 Streamlit 畫面顯示 ModuleNotFoundError: No module named 'torch'" /></div>
+      <figcaption>
+        工具「啟動成功」、工具列顯示 running，但 Streamlit 把未捕捉的例外直接畫在頁面上。
+        <b>看到這一頁，就是去跑 apply.py 和 warmup.py。</b>
+      </figcaption>
+    </figure>
+
+    <h3 style="margin-top:1.5rem">B · 套用了，但跳過 warmup 直接按 Start</h3>
+    <p class="prose">
+      engine 開始在請求裡裝 torch。<strong>{{COLD_FAIL_SECONDS}} 秒後</strong>，
+      殼的 HTTP bridge 逾時，portal 顯示「Failed to start tool: undefined」——
+      但 engine 沒有停，它在背景把相依裝完、也把 Streamlit 拉起來了。
+    </p>
+    <figure>
+      <div class="shot shot--flag"><img src="{{FIG:cold_start_failed}}" alt="portal 狀態列顯示 Failed to start tool: undefined，Start 按鈕回到未啟動狀態" /></div>
+      <figcaption>
+        殼放棄了，engine 還在做事。這是<b>看起來壞掉、其實只是慢</b>的典型樣子。
+      </figcaption>
+    </figure>
+    <p class="prose">
+      解法是<strong>再按一次 Start</strong>：這次相依已在 venv 裡，指紋命中，
+      engine 幾秒內就回應。所以 B 最終仍然算繪成功（總計 {{COLD_TOTAL_SECONDS}} 秒）——
+      只是中間嚇了使用者一跳。第 7 步的 <code>warmup.py</code> 就是為了讓這一跳不會發生。
+    </p>
+    <figure>
+      <div class="shot shot--good"><img src="{{FIG:cold_rendered_after_retry}}" alt="再按一次 Start 之後，VisualLatent 介面正常算繪" /></div>
+      <figcaption>再按一次 Start 之後的畫面，與 C 組（先 warmup）完全相同。</figcaption>
+    </figure>
+
+    <div class="note">
+      <p class="eyebrow">順帶修掉一個假陽性</p>
+      <p>
+        平台既有的 E2E harness 只檢查 <code>[data-testid="stApp"]</code> 存在且沒有
+        “Not Found” 就判 <code>RENDERED</code>。但 Streamlit script 在 import 階段崩潰時，
+        <strong>stApp 容器仍然存在</strong>——A 組那張錯誤畫面會被判成通過。
+        本次的 harness 因此改成必須「有內容且不是 traceback」，並額外要求
+        engine.log 與 venv 的兩項獨立證據。
+      </p>
+    </div>
+
+    <div class="note note--caution">
+      <p class="eyebrow">建議給平台的修正</p>
+      <p>
+        真正的根治是讓 <code>bridge.rs</code> 對 <code>POST /tools/&lt;id&gt;/start</code>
+        放寬逾時（或把相依安裝改成非同步、回報進度）。在殼重編之前，
+        <code>warmup.py</code> 是不需要動 Rust 的完整解。
+        （本機 WDAC 擋 cargo，殼要在別台機器重編。）
+      </p>
+    </div>
+  </section>
+
+  <!-- ══ 維護 ══════════════════════════════════════════════════════════ -->
+  <section>
+    <h2>日常維護</h2>
+    <div class="prose" style="display:flex;flex-direction:column;gap:1.15rem">
+      <p>
+        <strong>工具改了 <code>requires:</code></strong> — 在連網機重跑同一條 build 指令。
+        它是增量的：requires 指紋、python 標籤、平台標籤、既有包的 sha256 驗證，
+        四項全對就沿用快取，不會重抓 195 MB 的 torch。想全部重來加 <code>--force</code>。
+      </p>
+      <p>
+        <strong>某個工具在離線機上壞了</strong> — 刪掉它的 venv
+        （<code>data\&lt;key&gt;\tool-venvs\&lt;tool_id&gt;\</code>），重啟平台，
+        下次點開時 engine 會從補給包離線重建。補給包不用重搬。
+      </p>
+      <p>
+        <strong>搬移整個 <code>&lt;APP_ROOT&gt;</code> 之後</strong> — venv 內含絕對路徑。
+        搬完刪掉 <code>data\*\tool-venvs\</code>，重啟，離線重建。
+      </p>
+    </div>
+  </section>
+
+  <!-- ══ 疑難排解 ══════════════════════════════════════════════════════ -->
+  <section>
+    <h2>疑難排解</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>症狀</th><th>原因</th><th>解法</th></tr></thead>
+        <tbody>
+          <tr><td>工具開得起來，畫面是 <code>ModuleNotFoundError</code></td><td>忘了在這台機器跑 apply，或 <code>--deppack-cache</code> 指錯位置</td><td>對照第 5 步的表確認路徑，重跑 apply</td></tr>
+          <tr><td>build 說「這不是 CIM 平台專案」</td><td>第一個參數指錯</td><td>指向含 <code>sidecar\python-engine\engine.py</code> 的那一層</td></tr>
+          <tr><td>build 說「找不到任何 plugin.yaml」</td><td>submodule 沒 clone</td><td><code>git submodule update --init --recursive</code></td></tr>
+          <tr><td>build 說「工具 id 重複」</td><td>兩個資料夾用了同一個 <code>id:</code></td><td>先修 plugin.yaml；補給包以 tool_id 為資料夾名，重複會互相覆蓋</td></tr>
+          <tr><td>某工具「離線可裝自檢失敗」</td><td>某個相依沒有 win/cp311 的 wheel（只有 sdist）</td><td>訊息會點名套件。改用有 wheel 的版本——離線機沒有編譯器</td></tr>
+          <tr><td>build 說「沒有 PyYAML」</td><td>用錯的直譯器跑本工具</td><td>用 <code>py -3.11</code>，或 <code>--python "py -3.11"</code></td></tr>
+          <tr><td>verify / apply 說「大型相依未就位」</td><td><code>big-deps\</code> 分開搬運後沒放回去</td><td>把檔案放回 <code>big-deps\</code> 再跑一次</td></tr>
+          <tr><td>verify / apply 說「sha256 不符」</td><td>搬運中檔案損毀</td><td>重新複製該檔；仍失敗就在連網機重產</td></tr>
+          <tr><td>工具啟動時「dep-pack 驗證失敗，拒絕安裝」</td><td>目標位置的包被改過或不完整</td><td>重跑 apply（原子性覆蓋）</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ══ 為什麼 ════════════════════════════════════════════════════════ -->
+  <section>
+    <h2>為什麼設計成這樣</h2>
+    <div class="prose" style="display:flex;flex-direction:column;gap:1.35rem">
+      <div>
+        <h3>為什麼不把 torch 裝進平台核心，讓所有工具共用？</h3>
+        <p style="margin-top:.5rem">
+          三個理由。<strong>版本綁架</strong>：不同工具對同一個套件的版本約束會打架，
+          同一個 site-packages 只能犧牲其中一個。<strong>部署矛盾</strong>：可攜模式的賣點是
+          「複製資料夾＝部署」，torch 進核心會讓每台機器、每個專案都背著 2 GB，
+          即使它根本不跑 AI 模組。<strong>卸載不乾淨</strong>：工具移除後，
+          它留在共用環境裡的套件沒人敢刪。
+        </p>
+      </div>
+      <div>
+        <h3>為什麼 apply.py 不直接跑 pip 裝好？</h3>
+        <p style="margin-top:.5rem">
+          因為安裝需要知道「裝進哪個 venv、用哪顆 Python、什麼時候裝」，那是平台 engine 的知識。
+          <code>apply.py</code> 只負責把檔案放到 engine 找得到的位置——職責單一、失敗模式少、
+          可以在只有標準函式庫的環境跑。而且 engine 的驗章（fail-closed）因此仍然是最後一道關卡。
+        </p>
+      </div>
+      <div>
+        <h3>為什麼大相依要獨立一個資料夾，而不是壓縮進去就好？</h3>
+        <p style="margin-top:.5rem">
+          因為「知道大東西在哪」本身就是使用者要的資訊。195 MB 的 torch 跟其餘 43 個 wheel
+          加起來是 342 MB，郵件寄不了、隨身碟要挑。把它單獨拉出來，使用者可以自己決定怎麼搬運。
+          <code>deppack.json</code> 保持完整、apply 時用 sha256 驗證重組，
+          所以「分開搬運」不犧牲任何正確性保證。
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    {{FOOTER}}
+  </footer>
+
+</div>

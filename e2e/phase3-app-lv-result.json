@@ -1,0 +1,6 @@
+{
+  "first": {"state": "UPDATED", "active": "1.0.0", "venv_reused": false},
+  "second": {"state": "UPDATED", "active": "1.0.1", "venv_reused": true},
+  "torch": "2.6.0+cpu",
+  "probe_returncode": 0
+}
