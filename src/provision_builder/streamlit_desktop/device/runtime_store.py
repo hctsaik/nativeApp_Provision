@@ -48,6 +48,81 @@ class LockfileError(RuntimeStoreError):
     """The dependency lock is not actually a lock (spec §7.1: hard requirement)."""
 
 
+class SharedComponentError(RuntimeStoreError):
+    """A SHARED component on THIS MACHINE is unusable: deps/runtimes/<fp> or
+    deps/shells/<fp>.
+
+    The distinction this class exists to make is the difference between a bad
+    build and a bad machine. Every version installed here points at the SAME
+    deps/runtimes/<fp> and deps/shells/<fp>; a missing or corrupt one is no
+    evidence at all against the version that happened to trip over it. Treating
+    it as a version-integrity failure (exit 4) marked a perfectly good version
+    failed, rolled back to a previous version that then failed in EXACTLY the
+    same way, and told the operator we had "restored the previous version" —
+    leaving two dead versions and a false story about why.
+
+    bootstrap turns this into EXIT_SHELL_ENVIRONMENT (5): no state written, no
+    version blamed, no rollback claimed — and advice() prints what actually fixes
+    it. Version-specific breakage (a bad manifest, a files.json mismatch inside
+    apps/<app>/versions/<ver>/) is NOT this: it stays a 4.
+    """
+
+    def __init__(self, message: str, *, component: str = "runtime",
+                 fingerprint: str = "", path: Path | None = None):
+        super().__init__(message)
+        self.component = component          # "runtime" | "shell"
+        self.fingerprint = fingerprint
+        self.path = Path(path) if path is not None else None
+
+    # Operator-facing text: Traditional Chinese, cp950-encodable (a zh-TW console
+    # cannot print an emoji or a box-drawing character — it raises instead).
+    def _what(self) -> str:
+        return "Tauri 殼(視窗外殼)" if self.component == "shell" else "Python runtime(共用直譯器)"
+
+    def _location(self) -> str:
+        folder = "shells" if self.component == "shell" else "runtimes"
+        if self.fingerprint:
+            return f"deps\\{folder}\\{self.fingerprint}"
+        return str(self.path) if self.path else f"deps\\{folder}"
+
+    def advice(self) -> str:
+        raise NotImplementedError
+
+
+class MissingSharedComponent(SharedComponentError):
+    """It is simply not there: never copied, or antivirus quarantined it."""
+
+    def advice(self) -> str:
+        return (
+            f"這台機器的共用元件不見了:{self._what()}。\n"
+            "  共用元件是「每一個版本都在用」的東西,所以這是「這台機器」壞了,不是版本壞了:"
+            "退版救不了,舊版會用同一份,一樣起不來。\n"
+            "  請照順序做:\n"
+            "    1. 請 IT 把整個安裝資料夾加進防毒軟體的排除清單(白名單)。"
+            "防毒把共用元件隔離或刪除,是最常見的原因。\n"
+            f"    2. 從交付來源把 {self._location()} 整個資料夾原樣複製回來。\n"
+            "    3. 如果連視窗都開不起來,請先執行 tools\\安裝WebView2.bat 安裝 WebView2 Runtime。\n"
+            "  沒有任何版本被標記為失敗,也沒有退回任何版本。"
+        )
+
+
+class CorruptSharedComponent(SharedComponentError):
+    """It is there, but its bytes do not match its own files.json (half-copied
+    delivery, a dying disk, an antivirus that "cleaned" a file in place)."""
+
+    def advice(self) -> str:
+        return (
+            f"這台機器的共用元件壞了:{self._what()}"
+            f"(檔案內容和它自己的清單對不起來)。\n"
+            "  共用元件是「每一個版本都在用」的東西,所以退版救不了:舊版會用同一份,一樣起不來。\n"
+            "  請照順序做:\n"
+            f"    1. 刪掉 {self._location()} 整個資料夾,再從交付來源重新複製一份。\n"
+            "    2. 重新複製後又壞掉:請 IT 把整個安裝資料夾加進防毒軟體的排除清單(白名單)。\n"
+            "    3. 一直驗證失敗:這台機器的磁碟可能有問題,請 IT 檢查(chkdsk)。\n"
+            "  沒有任何版本被標記為失敗,也沒有退回任何版本。"
+        )
+
+
 # ── dependency lock normalization ────────────────────────────────────────────
 
 def normalize_lock(text: str) -> list[str]:
@@ -129,18 +204,28 @@ class ShellStore:
         return integrity.is_complete(self.path_for(fingerprint))
 
     def resolve(self, fingerprint: str, name: str) -> Path:
-        """The shell to launch, or a loud, actionable error."""
+        """The shell to launch, or a loud, actionable error.
+
+        Both failures below are about the MACHINE, not about the version that
+        asked for the shell — every version shares this one tree. They are
+        therefore SharedComponentError (bootstrap: exit 5, state untouched),
+        never a version-integrity failure.
+        """
         exe = self.exe_for(fingerprint, name)
         if not exe.is_file():
-            raise RuntimeStoreError(
+            raise MissingSharedComponent(
                 f"缺共用 Tauri 殼 {fingerprint}:{exe}\n"
-                f"  請將交付來源的 deps\\shells\\{fingerprint} 複製到該位置。")
+                f"  請將交付來源的 deps\\shells\\{fingerprint} 複製到該位置。",
+                component="shell", fingerprint=fingerprint,
+                path=self.path_for(fingerprint))
         if not integrity.is_complete(self.path_for(fingerprint)):
             problems = integrity.verify_tree(self.path_for(fingerprint))
             if problems:
-                raise RuntimeStoreError(
+                raise CorruptSharedComponent(
                     f"Tauri 殼 {fingerprint} 驗證失敗:{problems[:3]}\n"
-                    f"  請刪除 {self.path_for(fingerprint)} 後重新複製。")
+                    f"  請刪除 {self.path_for(fingerprint)} 後重新複製。",
+                    component="shell", fingerprint=fingerprint,
+                    path=self.path_for(fingerprint))
             integrity.write_complete(self.path_for(fingerprint))
         return exe
 
@@ -157,7 +242,10 @@ class RuntimeStore:
         try:
             return json.loads(path.read_text("utf-8"))
         except (OSError, ValueError) as exc:
-            raise RuntimeStoreError(f"runtime.json 不可讀:{path}({exc})") from exc
+            raise CorruptSharedComponent(
+                f"runtime.json 不可讀:{path}({exc})",
+                component="runtime", fingerprint=fingerprint,
+                path=self.path_for(fingerprint)) from exc
 
     def python_exe(self, fingerprint: str) -> Path:
         return self.path_for(fingerprint) / "python.exe"
@@ -167,19 +255,28 @@ class RuntimeStore:
         return integrity.is_complete(root) and self.python_exe(fingerprint).is_file()
 
     def quick_check(self, fingerprint: str) -> None:
-        """Cheap per-start gate: sentinel + interpreter + fingerprint identity."""
+        """Cheap per-start gate: sentinel + interpreter + fingerprint identity.
+
+        Everything here is about the SHARED tree (deps/runtimes/<fp>), which no
+        single version owns — so every failure is a SharedComponentError and the
+        version that asked for it must not be blamed for it.
+        """
         root = self.path_for(fingerprint)
         if not root.is_dir():
-            raise RuntimeStoreError(
+            raise MissingSharedComponent(
                 f"缺共用 runtime {fingerprint}:{root}\n"
-                f"  請將更新來源的 deps\\runtimes\\{fingerprint} 複製到該位置。"
+                f"  請將更新來源的 deps\\runtimes\\{fingerprint} 複製到該位置。",
+                component="runtime", fingerprint=fingerprint, path=root,
             )
         if not self.python_exe(fingerprint).is_file():
-            raise RuntimeStoreError(f"runtime {fingerprint} 缺 python.exe:{root}")
+            raise MissingSharedComponent(
+                f"runtime {fingerprint} 缺 python.exe:{root}",
+                component="runtime", fingerprint=fingerprint, path=root)
         recorded = self.read_meta(fingerprint).get("fingerprint")
         if recorded != fingerprint:
-            raise RuntimeStoreError(
-                f"runtime 指紋不一致:資料夾 {fingerprint} 但 runtime.json 記錄 {recorded!r}"
+            raise CorruptSharedComponent(
+                f"runtime 指紋不一致:資料夾 {fingerprint} 但 runtime.json 記錄 {recorded!r}",
+                component="runtime", fingerprint=fingerprint, path=root,
             )
 
     def ensure_verified(self, fingerprint: str, *, progress=None) -> Path:
@@ -197,9 +294,10 @@ class RuntimeStore:
                                              progress=progress)
             if problems:
                 head = "\n  ".join(problems[:10])
-                raise RuntimeStoreError(
+                raise CorruptSharedComponent(
                     f"runtime {fingerprint} 驗證失敗({len(problems)} 項):\n  {head}\n"
-                    f"  請刪除 {root} 後重新從更新來源複製。"
+                    f"  請刪除 {root} 後重新從更新來源複製。",
+                    component="runtime", fingerprint=fingerprint, path=root,
                 )
             integrity.write_complete(root)
         return root

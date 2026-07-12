@@ -12,6 +12,8 @@ import pytest
 
 from provision_builder.streamlit_desktop import imports as imports_mod
 from provision_builder.streamlit_desktop import requirements as req_mod
+from provision_builder.streamlit_desktop import validate as validate_mod
+from provision_builder.streamlit_desktop.models import BuildRequest
 
 TEMPLATES = (Path(__file__).resolve().parents[1] / "src" / "provision_builder"
              / "streamlit_desktop" / "templates")
@@ -204,6 +206,191 @@ def test_import_aliases_map_to_their_distribution_names(tmp_path):
     assert report.required == [] and report.optional == []
 
 
+# ── "not declared" is not "will not be installed" ────────────────────────────
+
+def _ai4bi_shaped(project: Path) -> Path:
+    """AI4BI in miniature: the app imports numpy at module level, and numpy is
+    nowhere in [project].dependencies — it arrives with pandas."""
+    (project / "analysis").mkdir(parents=True)
+    (project / "app.py").write_text(
+        "import streamlit as st\nfrom analysis import rfm\nst.title('x')\n",
+        encoding="utf-8")
+    (project / "analysis" / "__init__.py").write_text("", encoding="utf-8")
+    (project / "analysis" / "rfm.py").write_text(
+        "import numpy as np\nimport pandas as pd\n", encoding="utf-8")
+    return project / "app.py"
+
+
+def test_a_transitive_dependency_missing_from_pyproject_does_not_block_the_build(tmp_path):
+    """The S6 blocker, exactly as measured on the real AI4BI: the app imports numpy,
+    numpy is not in `pyproject [project].dependencies` — because pandas brings it —
+    and the gate refused to build a project that builds. A direct-dependency list is
+    NOT the transitive closure, and treating absence from it as proof of absence is
+    a guess presented to the operator as a fact."""
+    project = tmp_path / "ai4bi"
+    entry = _ai4bi_shaped(project)
+    pyproject_deps = "pandas>=2.0\nstreamlit>=1.35\nduckdb>=0.9\n"
+
+    report = imports_mod.missing_from_lock(entry, project, pyproject_deps)
+
+    assert report.required == ["numpy"]      # still noticed…
+    assert report.blocking == []             # …but never a reason to refuse
+    assert report.undeclared == ["numpy"]
+    assert not report                        # `if missing:` callers must not fire
+
+    warning = "\n".join(report.warning_lines())
+    assert "numpy" in warning and "pandas" in warning          # who probably brings it
+    assert "只宣告直接相依" in warning                          # why we are not sure
+    assert "安裝完成後會再驗一次" in warning                     # what still guards it
+    warning.encode("cp950")                                     # zh-TW console safe
+
+
+def test_from_package_import_module_is_followed_into_the_module(tmp_path):
+    """`from ai4bi.ui import workspace` — AI4BI's app.py line 34 — reaches
+    ai4bi/ui/workspace.py, but we only ever opened ai4bi/ui/__init__.py. Every
+    module-level import behind a line of that shape was invisible: the gate said
+    「檢查通過」 and the missing package surfaced as a red traceback on the factory
+    floor, which is the exact failure this module exists to prevent."""
+    project = tmp_path / "proj"
+    (project / "ui").mkdir(parents=True)
+    (project / "app.py").write_text(
+        "import streamlit as st\nfrom ui import workspace\nst.title('x')\n",
+        encoding="utf-8")
+    (project / "ui" / "__init__.py").write_text("", encoding="utf-8")     # empty!
+    (project / "ui" / "workspace.py").write_text("import duckdb\n", encoding="utf-8")
+
+    reached = imports_mod.runtime_sources(project, project / "app.py")
+    assert project / "ui" / "workspace.py" in reached
+
+    report = imports_mod.missing_from_lock(project / "app.py", project,
+                                           "streamlit==1.40.0\n")
+    assert report.blocking == ["duckdb"]
+
+
+def test_a_module_missing_from_a_fully_pinned_lock_still_blocks_the_build(tmp_path):
+    """The other half: a pinned lock IS the closure (that is what `pip freeze`
+    emits, and what Store mode demands). A module that is not in it will not be
+    installed, and finding that out now beats finding it out after a six-minute
+    pip install. Softening this would throw away the whole point of the gate."""
+    project = tmp_path / "ai4bi"
+    entry = _ai4bi_shaped(project)
+    lock = "pandas==2.2.3\nstreamlit==1.40.0\nduckdb==1.1.3\n"      # no numpy line
+
+    report = imports_mod.missing_from_lock(entry, project, lock)
+
+    assert report.blocking == ["numpy"]
+    assert report.undeclared == []
+    assert report                                        # `if missing:` DOES fire
+    assert "numpy" in report.failure_message()
+
+
+def test_a_pinned_lock_that_does_carry_the_module_is_clean(tmp_path):
+    project = tmp_path / "ai4bi"
+    entry = _ai4bi_shaped(project)
+    lock = "numpy==2.1.3\npandas==2.2.3\nstreamlit==1.40.0\n"
+    report = imports_mod.missing_from_lock(entry, project, lock)
+    assert report.blocking == [] and report.required == []
+
+
+@pytest.mark.parametrize("text,closure", [
+    ("streamlit==1.40.0\npandas==2.2.3\n", True),
+    ("Streamlit[extra]==1.40.0\n", True),
+    ("streamlit==1.40.0 ; python_version >= '3.11'\n", True),
+    # `pip freeze --all` on a python-build-standalone runtime always emits this;
+    # it must not demote a real lock to a guess.
+    ("streamlit==1.40.0\npip @ file:///D:/a/pip-24.1.2-py3-none-any.whl\n", True),
+    ("# 註解\n\nstreamlit==1.40.0\n", True),
+    # pip-compile's shape: a pinned line continued by --hash rows. Still a closure,
+    # and reading it as "not a lock" would disarm the gate for the careful locker.
+    ("numpy==2.4.6 \\\n    --hash=sha256:aaaa \\\n    --hash=sha256:bbbb\n"
+     "streamlit==1.40.0 --hash=sha256:cccc\n", True),
+    ("streamlit>=1.35\npandas>=2.0\n", False),          # pyproject-shaped
+    ("streamlit==1.40.0\npandas\n", False),             # one bare name is enough
+    ("streamlit==1.40.0\n-e .\n", False),
+    ("streamlit==1.40.0\nlib @ git+https://x/y.git\n", False),
+    ("", False),                                        # nothing pinned, nothing known
+])
+def test_is_pinned_closure_tells_a_lock_from_a_wish_list(text, closure):
+    """The whole decision hangs off this: a pinned lock is the transitive closure
+    and absence is proof; anything else lists what a human typed."""
+    assert imports_mod.is_pinned_closure(text) is closure
+
+
+def _request(tmp_path: Path, project: Path, entry: Path, **kw) -> BuildRequest:
+    shell = tmp_path / "cim-light.exe"
+    shell.write_bytes(b"MZ")
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(exist_ok=True)
+    (runtime / "python.exe").write_bytes(b"MZ")
+    return BuildRequest(project_dir=project, entrypoint=entry, display_name="AI4BI",
+                        output_dir=tmp_path / "out", shell_exe=shell,
+                        runtime_template=runtime, **kw)
+
+
+def test_validate_does_not_refuse_a_pyproject_only_project_over_a_transitive_dep(tmp_path):
+    """The S6 blocker seen from the GUI: 「檢查專案」 refused to let the operator
+    build AI4BI at all. It must pass, and it must SAY the thing it is unsure about
+    (a warning), rather than dress the guess up as a blocking error."""
+    project = tmp_path / "ai4bi"
+    entry = _ai4bi_shaped(project)
+    (project / "pyproject.toml").write_text(
+        '[project]\nname = "ai4bi"\n'
+        'dependencies = ["streamlit>=1.35", "pandas>=2.0", "duckdb>=0.9"]\n',
+        encoding="utf-8")
+    request = _request(tmp_path, project, entry)
+
+    assert validate_mod.validate_request(request) == []      # the build may start
+
+    warnings = validate_mod.warnings_for(request)
+    assert any("numpy" in w and "只宣告直接相依" in w for w in warnings)
+
+
+def test_validate_still_refuses_a_pinned_lock_that_is_missing_a_package(tmp_path):
+    """…and the six-minute-pip-install saver is still armed where it can be trusted."""
+    project = tmp_path / "ai4bi"
+    entry = _ai4bi_shaped(project)
+    (project / "requirements.lock.txt").write_text(
+        "streamlit==1.40.0\npandas==2.2.3\nduckdb==1.1.3\n", encoding="utf-8")
+    request = _request(tmp_path, project, entry)
+
+    errors = validate_mod.validate_request(request)
+    assert any("numpy" in e for e in errors)
+
+
+def test_extras_that_a_lock_file_cannot_honour_are_not_dropped_in_silence(tmp_path):
+    """The admin ticks 「llm」, the project ships a lock, and `resolve()` quietly
+    ignores the group: they wait six minutes for an `anthropic` that was never
+    going to be installed. Extras only mean something to pyproject — say so."""
+    project = tmp_path / "ai4bi"
+    entry = _ai4bi_shaped(project)
+    (project / "requirements.lock.txt").write_text(
+        "streamlit==1.40.0\npandas==2.2.3\nnumpy==2.1.3\nduckdb==1.1.3\n", encoding="utf-8")
+    request = _request(tmp_path, project, entry, extras=("llm",))
+
+    found = req_mod.resolve(project, extras=("llm",))
+    assert found.ignored_extras == ("llm",)
+
+    warnings = validate_mod.warnings_for(request)
+    assert any("llm" in w and "不會生效" in w for w in warnings)
+    assert validate_mod.validate_request(request) == []       # a warning, not a block
+
+
+def test_the_post_install_probe_is_always_authoritative(tmp_path, monkeypatch):
+    """The staged interpreter has already had pip run against it, so what it cannot
+    import will not be there at the factory. That report must keep blocking — the
+    "maybe transitive" escape hatch belongs to the pre-check ONLY, and a default of
+    complete=False here would quietly disarm the last gate before delivery."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "app.py").write_text("import streamlit\nimport numpy\n", encoding="utf-8")
+
+    monkeypatch.setattr(imports_mod, "importable_in", lambda *_a, **_k: {"streamlit"})
+    report = imports_mod.missing_dependencies(project / "app.py", project,
+                                              tmp_path / "python.exe")
+    assert report.complete is True
+    assert report.blocking == ["numpy"] and bool(report) is True
+
+
 def test_a_probe_that_cannot_run_must_not_condemn_every_module(tmp_path, monkeypatch):
     """`importable_in()` returned set() when the subprocess failed — "nothing is
     importable", i.e. "everything is missing". A tooling failure of ours must not
@@ -216,6 +403,31 @@ def test_a_probe_that_cannot_run_must_not_condemn_every_module(tmp_path, monkeyp
     monkeypatch.setattr(imports_mod.subprocess, "run", lambda *_a, **_k: Failed())
     with pytest.raises(imports_mod.ImportProbeError):
         imports_mod.importable_in(tmp_path / "python.exe", {"streamlit"})
+
+
+def test_the_import_probe_does_not_write_bytecode_into_the_shared_runtime(monkeypatch, tmp_path):
+    """The probe runs the SHARED runtime's own python.exe. Without -B it imports
+    json/importlib and leaves stdlib __pycache__ *inside* that runtime — after its
+    files.json was computed. The runtime then fails its own integrity check on every
+    machine we deliver it to ("undeclared file: Lib/encodings/__pycache__/...").
+    A read-only question must not leave fingerprints on what it asks about."""
+    seen = {}
+
+    class Result:
+        returncode = 0
+        stdout = '["streamlit"]'
+        stderr = ""
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        seen["env"] = kwargs.get("env") or {}
+        return Result()
+
+    monkeypatch.setattr(imports_mod.subprocess, "run", fake_run)
+    imports_mod.importable_in(tmp_path / "python.exe", {"streamlit"})
+
+    assert "-B" in seen["cmd"], "缺 -B:探測會把 .pyc 寫進共用 runtime"
+    assert seen["env"].get("PYTHONDONTWRITEBYTECODE") == "1"
 
 
 def test_preflight_finds_first_party_modules_next_to_a_nested_entrypoint(tmp_path):

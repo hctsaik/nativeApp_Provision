@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from provision_builder.streamlit_desktop import imports as imports_mod
 from provision_builder.streamlit_desktop import runtime as runtime_mod
 from provision_builder.streamlit_desktop import store_builder
 from provision_builder.streamlit_desktop.device import (
@@ -410,27 +411,38 @@ def test_gc_dry_run_deletes_nothing(tree):
 
 # ── store builder ────────────────────────────────────────────────────────────
 
-@pytest.fixture
-def build_request(tmp_path: Path) -> BuildRequest:
-    project = tmp_path / "proj"
-    project.mkdir()
+def make_store_project(tmp_path: Path, name: str = "Demo App") -> BuildRequest:
+    """A buildable project + the shared (fake) shell and runtime template."""
+    project = tmp_path / f"proj-{store_builder.slugify(name)}"
+    project.mkdir(exist_ok=True)
     (project / "app.py").write_text("import streamlit as st\nst.write('READY')\n",
                                     encoding="utf-8")
     (project / "requirements.txt").write_text("streamlit==1.40.0\n", encoding="utf-8")
     shell = tmp_path / "cim-light.exe"
-    shell.write_bytes(b"MZ shell")
+    if not shell.exists():
+        shell.write_bytes(b"MZ shell")
     template = tmp_path / "rt-template"
-    (template / "Lib" / "site-packages").mkdir(parents=True)
-    (template / "python.exe").write_bytes(b"MZ python")
-    (template / "Scripts").mkdir()
+    if not template.exists():
+        (template / "Lib" / "site-packages").mkdir(parents=True)
+        (template / "python.exe").write_bytes(b"MZ python")
+        (template / "Scripts").mkdir()
     return BuildRequest(project_dir=project, entrypoint=project / "app.py",
-                        display_name="Demo App", output_dir=tmp_path / "unused",
+                        display_name=name, output_dir=tmp_path / "unused",
                         shell_exe=shell, runtime_template=template)
 
 
 @pytest.fixture
+def build_request(tmp_path: Path) -> BuildRequest:
+    return make_store_project(tmp_path)
+
+
+@pytest.fixture
 def stub_toolchain(monkeypatch):
-    """No real pip / no real interpreter probing inside unit tests."""
+    """No real pip / no real interpreter probing inside unit tests.
+
+    The import probe answers "nothing is missing" — but it answers with a real
+    MissingReport, because that is what the gate consumes.
+    """
     monkeypatch.setattr(store_builder, "_python_version_of", lambda _p: "3.11.9")
     monkeypatch.setattr(store_builder, "_freeze",
                         lambda _p: ["streamlit==1.40.0", "setuptools==69.0"])
@@ -438,7 +450,7 @@ def stub_toolchain(monkeypatch):
                         lambda *_a, **_k: None)
     monkeypatch.setattr(runtime_mod, "verify_imports", lambda *_a, **_k: None)
     monkeypatch.setattr(store_builder.imports_mod, "missing_dependencies",
-                        lambda *_a, **_k: [])
+                        lambda *_a, **_k: imports_mod.MissingReport())
 
 
 def test_shell_lives_in_the_store_not_in_every_version(build_request, stub_toolchain, tmp_path):
@@ -569,6 +581,106 @@ def test_version_slot_excludes_build_artifacts(build_request, stub_toolchain, tm
     assert result.ok
     slot = root / "apps" / build_request.app_id / "versions" / "v1.0.0"
     assert not list((slot / "application" / "wheels").glob("*.whl"))
+
+
+# ── the missing-import gate (it must survive a REUSED runtime) ───────────────
+
+def missing_report(*required: str) -> "imports_mod.MissingReport":
+    report = imports_mod.MissingReport(required=list(required))
+    report.sites = {name: ["application/app.py:1(模組層級 import)"] for name in required}
+    return report
+
+
+def gate_reports(monkeypatch, report, *, seen: list | None = None):
+    """Make the import probe answer `report`, recording which python it was asked."""
+    def probe(entrypoint, project_dir, python):
+        if seen is not None:
+            seen.append(Path(python))
+        return report
+    monkeypatch.setattr(store_builder.imports_mod, "missing_dependencies", probe)
+
+
+def test_reused_runtime_still_gets_the_missing_import_gate(build_request, stub_toolchain,
+                                                           monkeypatch, tmp_path):
+    """S8, the one the store layout is FOR. The gate used to sit after the
+    `return fingerprint, True` of ensure_runtime(), so it ran only on the build
+    that installed the runtime. Every version after that — and every 2nd..Nth app,
+    which is the entire reason the store exists — got no gate at all: a version
+    importing a package nobody installed was built, marked .complete, and shipped.
+    """
+    root = tmp_path / "ROOT"
+    first = store_builder.build_into_store(build_request, root, version="v1.0.0")
+    assert first.ok, first.errors
+
+    # v2 grows an import of something the (unchanged) lock never installed.
+    seen: list[Path] = []
+    gate_reports(monkeypatch, missing_report("duckdb"), seen=seen)
+    (build_request.project_dir / "app.py").write_text(
+        "import streamlit as st\nimport duckdb\n", encoding="utf-8")
+
+    second = store_builder.build_into_store(build_request, root, version="v2.0.0")
+    assert not second.ok
+    assert any("duckdb" in e for e in second.errors), second.errors
+    assert any("app.py:1" in e for e in second.errors), second.errors      # where
+    assert any("requirements" in e for e in second.errors), second.errors  # way out 1
+    assert any("try/except ImportError" in e for e in second.errors), second.errors  # way 2
+
+    # asked the runtime that will really run the app — the shared, reused one
+    assert seen == [root / "deps" / "runtimes" / first.fingerprint / "python.exe"]
+
+    # and NOTHING was left behind: no version dir, so certainly no .complete on one
+    slot = root / "apps" / build_request.app_id / "versions" / "v2.0.0"
+    assert not slot.exists()
+    assert not integrity.is_complete(slot)
+    state = state_mod.StateStore(root / "apps" / build_request.app_id / "state").load()
+    assert state.pending is None and state.current == "v1.0.0"
+
+
+def test_a_second_app_reusing_a_runtime_cannot_ship_a_missing_import(stub_toolchain,
+                                                                     monkeypatch, tmp_path):
+    """Same hole, the multi-app shape: app B reuses the runtime app A's lock built.
+    B's imports were never checked against it, because B's build never installed
+    anything."""
+    root = tmp_path / "ROOT"
+    alpha = make_store_project(tmp_path, "Alpha")
+    assert store_builder.build_into_store(alpha, root, version="v1").ok
+
+    beta = make_store_project(tmp_path, "Beta")
+    gate_reports(monkeypatch, missing_report("pandas"))
+    result = store_builder.build_into_store(beta, root, version="v1")
+    assert not result.ok and any("pandas" in e for e in result.errors)
+    assert result.runtime_reused is False        # never got that far
+    assert not (root / "apps" / beta.app_id / "versions" / "v1").exists()
+
+
+def test_a_probe_that_cannot_run_is_not_blamed_on_the_project(build_request, stub_toolchain,
+                                                              monkeypatch, tmp_path):
+    """Not knowing is not the same as knowing the worst: if we cannot ASK the
+    runtime what it can import, say so — and still refuse to ship."""
+    def explode(*_a, **_k):
+        raise imports_mod.ImportProbeError("python.exe 沒有回應")
+    monkeypatch.setattr(store_builder.imports_mod, "missing_dependencies", explode)
+
+    result = store_builder.build_into_store(build_request, tmp_path / "ROOT",
+                                            version="v1.0.0")
+    assert not result.ok
+    assert any("沒辦法用交付包裡的 Python 檢查" in e for e in result.errors), result.errors
+    assert not (tmp_path / "ROOT" / "apps" / build_request.app_id
+                / "versions" / "v1.0.0").exists()
+
+
+def test_optional_imports_are_a_warning_not_a_failed_build(build_request, stub_toolchain,
+                                                           monkeypatch, tmp_path):
+    """A lazy `import anthropic` inside a function cannot crash a first render, so
+    it can never be a reason to refuse a build — but the operator still hears it."""
+    report = imports_mod.MissingReport(optional=["anthropic"])
+    report.sites = {"anthropic": ["application/app.py:9(函式內延遲 import)"]}
+    gate_reports(monkeypatch, report)
+
+    result = store_builder.build_into_store(build_request, tmp_path / "ROOT",
+                                            version="v1.0.0")
+    assert result.ok, result.errors
+    assert any("anthropic" in w for w in result.warnings), result.warnings
 
 
 def test_store_build_requires_a_real_lockfile(build_request, stub_toolchain, tmp_path):

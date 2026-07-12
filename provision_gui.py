@@ -11,7 +11,7 @@ import sys
 import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
@@ -31,6 +31,8 @@ from provision_builder.streamlit_desktop import build as build_streamlit_desktop
 from provision_builder.streamlit_desktop import build_into_store as build_streamlit_store  # noqa: E402
 from provision_builder.streamlit_desktop import export_update as export_streamlit_update  # noqa: E402
 from provision_builder.streamlit_desktop import export_full_tree as export_streamlit_full  # noqa: E402
+from provision_builder.streamlit_desktop import warnings_for as streamlit_warnings_for  # noqa: E402
+from provision_builder.streamlit_desktop.store_builder import update_needs_runtime  # noqa: E402
 from provision_builder.streamlit_desktop.device.gc import run_gc as streamlit_gc  # noqa: E402
 from provision_builder.streamlit_desktop import (  # noqa: E402
     default_output,
@@ -57,6 +59,31 @@ USER_STEPS = (
     "  2. 視窗出現後，在上方「工作流程」下拉確認選到這個 App\n"
     "  3. 按一次旁邊的「Start」按鈕，App 就會顯示在視窗裡"
 )
+
+
+def list_store_apps(root: Path) -> list[dict]:
+    """讀一棵既有 Store 樹上有哪些 App、各自跑在哪一版。
+
+    只讀 state.json（它就是那棵樹的事實來源），不需要這個 session 建過任何東西。
+    """
+    apps: list[dict] = []
+    apps_dir = Path(root) / "apps"
+    if not apps_dir.is_dir():
+        return apps
+    for child in sorted(apps_dir.iterdir()):
+        state_file = child / "state" / "state.json"
+        if not (child.is_dir() and state_file.is_file()):
+            continue
+        try:
+            data = json.loads(state_file.read_text("utf-8"))
+        except (OSError, ValueError):
+            continue
+        apps.append({
+            "app_id": child.name,
+            "current": data.get("current"),
+            "pending": data.get("pending"),
+        })
+    return apps
 
 
 class ProvisionApp(tk.Tk):
@@ -348,6 +375,14 @@ class ProvisionApp(tk.Tk):
         self.sd_gc_button = ttk.Button(deliver_row, text="回收未使用的版本／runtime（先試算）",
                                        command=self._gc_store, state="disabled")
         self.sd_gc_button.pack(side="left", padx=(8, 0))
+        # 「交付與維護」以前只有在「這個 session 剛好建過一版」時才活著。管理員早上
+        # 打開工具想把上週那一版發出去、或想清磁碟，會發現三個按鈕全是灰的，而且
+        # 沒有任何地方告訴他要先重建一次——那正是他不想做的事。
+        ttk.Button(deliver_row, text="開啟既有 Store 樹…",
+                   command=self._open_existing_store).pack(side="left", padx=(16, 0))
+        self.sd_store_info = ttk.Label(self.sd_deliver, text="", foreground="#17663a",
+                                       wraplength=780, justify="left")
+        self.sd_store_info.pack(anchor="w", pady=(6, 0))
         ttk.Label(self.sd_deliver,
                   text="完整交付＝整棵樹（bootstrap + start.bat + 共用 runtime + 殼 + 這一版），拿到就能跑。"
                        "更新包＝只有這一版（十幾 MB），要放進更新來源，或在目標機用 admin.bat 的"
@@ -620,6 +655,67 @@ class ProvisionApp(tk.Tk):
         if value:
             self.sd_update_source_var.set(value)
 
+    def _open_existing_store(self) -> None:
+        """讓「發一版出去」與「清磁碟」不再綁在「這個 session 剛建過」上。
+
+        管理員星期一早上打開工具,想把上週建好的 v1.2.0 發給產線——以前三個按鈕
+        全是灰的,唯一的解法是「再建一次」,而那正是他不想做的事(而且同一個版本號
+        還會被版本目錄不可變的規則擋下來)。"""
+        value = filedialog.askdirectory(title="選擇既有的 Store 樹根目錄（裡面有 apps\\ 與 deps\\）",
+                                        initialdir=self.sd_output_var.get())
+        if not value:
+            return
+        root = Path(value)
+        try:
+            apps = list_store_apps(root)
+        except Exception as exc:  # GUI 邊界
+            messagebox.showerror("讀不到這棵 Store 樹", f"{exc}\n\n{root}")
+            return
+        if not apps:
+            messagebox.showerror(
+                "這不是一棵 Store 樹",
+                f"{root}\n\n找不到 apps\\<app>\\state\\state.json。\n"
+                "請選「輸出位置」指到的那個根目錄（裡面應該有 apps\\、deps\\、bootstrap\\）。")
+            return
+
+        if len(apps) == 1:
+            chosen = apps[0]
+        else:
+            names = "\n".join(f"  · {a['app_id']}（目前 {a['current'] or '未設定'}）" for a in apps)
+            answer = simpledialog.askstring(
+                "這棵樹上有多個 App",
+                f"要操作哪一個?請輸入 app id:\n\n{names}",
+                initialvalue=apps[0]["app_id"], parent=self)
+            if not answer:
+                return
+            match = [a for a in apps if a["app_id"] == answer.strip()]
+            if not match:
+                messagebox.showerror("找不到這個 App", f"{answer} 不在這棵樹上。")
+                return
+            chosen = match[0]
+
+        self._sd_last_store = root
+        self._sd_last_app = chosen["app_id"]
+        # 匯出的預設對象是「目前版本」——那才是產線上正在跑的東西。
+        self._sd_last_version = chosen["current"] or chosen["pending"]
+        self._sd_last_package = root
+        self.sd_store_var.set(True)
+        self._on_store_mode_toggled()
+        self.sd_output_var.set(str(root))
+        self.sd_export_full_button.configure(state="normal")
+        self.sd_export_update_button.configure(state="normal")
+        self.sd_gc_button.configure(state="normal")
+        self.sd_open_button.configure(state="normal")
+        summary = "、".join(
+            f"{a['app_id']}(目前 {a['current'] or '未設定'}"
+            + (f",待套用 {a['pending']}" if a["pending"] else "") + ")"
+            for a in apps)
+        self.sd_store_info.configure(
+            text=f"已開啟 Store 樹:{root}\n"
+                 f"這棵樹上的 App:{summary}\n"
+                 f"接下來的匯出／回收都會針對「{self._sd_last_app} {self._sd_last_version}」。")
+        self.sd_status_var.set(f"已開啟既有 Store 樹({self._sd_last_app} {self._sd_last_version})。")
+
     def _export_store(self, *, full: bool) -> None:
         """完整交付 = 整棵可執行的樹；更新包 = 只有這一版，要靠 --install 或更新來源套用。
 
@@ -627,6 +723,30 @@ class ProvisionApp(tk.Tk):
         沒有 start.bat、沒有 state/——目標機拿到一個永遠打不開的資料夾。"""
         if not (self._sd_last_store and self._sd_last_app and self._sd_last_version):
             return
+
+        # 更新包預設不含 runtime(那正是它只有十幾 MB 的原因)。但如果這一版換了
+        # Python 相依或換了殼,不帶 runtime 的包在目標機上是裝不起來的。與其讓
+        # export_update() 丟例外、管理員盯著一個看不懂的錯誤,不如先問清楚。
+        include_runtime = False
+        if not full:
+            try:
+                needs = update_needs_runtime(self._sd_last_store, self._sd_last_app,
+                                             self._sd_last_version)
+            except Exception:                       # 讀不到就當作不需要,讓匯出自己去擋
+                needs = False
+            if needs:
+                if not messagebox.askyesno(
+                        "這一版換了相依,更新包必須包含 runtime",
+                        f"版本 {self._sd_last_version} 的 Python 相依（或 Tauri 殼）"
+                        "跟上一版不一樣。\n\n"
+                        "只帶版本的增量包在目標機上會裝不起來——它會去找一份那台機器\n"
+                        "沒有的 runtime。\n\n"
+                        "要改成「包含 runtime」的更新包嗎？（會大很多，約 500 MB）\n"
+                        "選「否」則不匯出。"):
+                    self.sd_status_var.set("已取消匯出。")
+                    return
+                include_runtime = True
+
         out = filedialog.askdirectory(title="匯出到哪裡（USB／交付資料夾）")
         if not out:
             return
@@ -635,14 +755,20 @@ class ProvisionApp(tk.Tk):
         self.sd_status_var.set("匯出中…")
         store, app_id, version = self._sd_last_store, self._sd_last_app, self._sd_last_version
 
+        say = lambda line: self._events.put(("desktop_line", line))   # noqa: E731
+
         def work() -> None:
             try:
                 if full:
                     result = export_streamlit_full(store, Path(out), app_id=app_id,
-                                                   progress=lambda l: self._events.put(("desktop_line", l)))
+                                                   progress=say)
                 else:
+                    # include_runtime 是上面問過使用者的答案。這裡曾經硬寫 False，
+                    # 於是「這一版換了相依，要含 runtime 嗎？」問了、答了、然後被忽略——
+                    # 產出的包在目標機一樣裝不起來。
                     result = export_streamlit_update(store, app_id, version, Path(out),
-                                                     include_runtime=False)
+                                                     include_runtime=include_runtime,
+                                                     progress=say)
                 self._events.put(("desktop_export_done", (result, full)))
             except Exception as exc:  # GUI 邊界
                 self._events.put(("desktop_error", f"匯出失敗：{exc}"))
@@ -705,6 +831,16 @@ class ProvisionApp(tk.Tk):
         self._append_desktop_log(f"✓ 專案：{request.project_dir}")
         self._append_desktop_log(f"✓ 入口：{request.entrypoint}")
         self._append_desktop_log(f"✓ 應用 ID：{request.app_id}")
+
+        # 「還不確定，但你該知道」的事：requirements.txt/pyproject 只宣告直接相依，
+        # 所以 numpy 沒被列出來不代表裝不到（pandas 會帶進來）。這種事不該擋建置，
+        # 但沉默也不對——安裝完成後我們會再驗一次，真的缺才擋。
+        try:
+            soft = streamlit_warnings_for(request)
+        except Exception:                     # 檢查的附加資訊失敗，不該讓檢查失敗
+            soft = []
+        for warning in soft:
+            self._append_desktop_log("⚠ " + warning)
 
         # 真實預估，不是寫死的「450–550 MB」：實際掃專案 + 判斷 runtime 會不會重用。
         preview = scan_streamlit_project(request)
@@ -1042,11 +1178,14 @@ class ProvisionApp(tk.Tk):
                                  f"　·　{result.duration_seconds:.0f} 秒", ""]
                         if result.pending_set:
                             lines += [
-                                "這棵樹上：已設為 pending，下次啟動時自動套用。",
+                                "這棵樹上：已設為「待套用」，下次啟動時會換到這一版；",
+                                "　　      若它啟動失敗，會自動退回上一版。",
                                 "",
                                 "已經交付出去的機器不會自動拿到這一版。要發給它們：",
                                 "　·　按「匯出更新包（給已部署的機器）…」，",
                                 "　　  把包放進更新來源，或在目標機用 admin.bat 套用。",
+                                "　·　設了更新來源的機器：下次啟動時會在背景把新版抓回來、",
+                                "　　  驗證、設為待套用——要「再下一次」啟動才會真的換版。",
                             ]
                         else:
                             lines += ["這是這個 App 的第一個版本，已直接設為目前版本。", "",

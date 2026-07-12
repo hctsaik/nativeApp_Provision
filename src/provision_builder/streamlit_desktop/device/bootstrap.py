@@ -20,20 +20,26 @@ must agree, so the contract is written down here, once:
     0   OK. Clean exit (the user closed the window).
     3   APP FAILURE. The Streamlit app or its script died: import error, bad
         entrypoint, exception at start-up. VERSION-SPECIFIC.
-    4   VERSION INTEGRITY FAILURE. This version's own files are wrong: the
-        entrypoint the manifest names is missing, the engine shim will not load.
-        VERSION-SPECIFIC.
-    5   SHELL / ENVIRONMENT FAILURE. The Tauri shell could not start: no WebView2
-        runtime on this machine, the .exe was quarantined by antivirus, the GPU
-        stack refused. **NOT version-specific** — the shell and WebView2 are
-        SHARED across versions.
+    4   VERSION INTEGRITY FAILURE. THIS VERSION's own tree is wrong: a bad
+        manifest, a files.json mismatch inside apps/<app>/versions/<ver>/, the
+        entrypoint the manifest names is missing. VERSION-SPECIFIC.
+    5   ENVIRONMENT FAILURE. THIS MACHINE is broken, in a way no version can fix:
+        no WebView2 runtime, an .exe quarantined by antivirus, a SHARED component
+        (deps/runtimes/<fp>, deps/shells/<fp>) missing or failing verification, a
+        location bootstrap cannot even write its log to. **NOT version-specific.**
 
 Only 3 and 4 mark the candidate failed and roll back. Rolling back on 5 is worse
 than useless: the older version launches the same shell against the same missing
-WebView2, fails identically, and the operator is left with an app that will not
-start AND a version they did not ask to downgrade — while the real cause (install
-WebView2 / un-quarantine the exe) goes unmentioned. So 5 prints the likely cause
-and changes NOTHING.
+WebView2 — or names the same missing shared runtime — fails identically, and the
+operator is left with an app that will not start AND a version they did not ask
+to downgrade, while the real cause (install WebView2 / un-quarantine the folder /
+re-copy the shared component) goes unmentioned. Do that twice and the machine has
+two versions in failed_versions and a false story about what happened.
+
+So 5 touches NO state, blames NO version, claims NO rollback, and prints what to
+DO about it. That is why runtime_store raises SharedComponentError for a missing
+or corrupt SHARED tree: the shell and the runtime belong to the machine, not to
+the version that happened to trip over them.
 
 Any other non-zero code (a hard crash, an access violation, a code we have never
 heard of) is treated as 3: we cannot prove it is environmental, and the app dying
@@ -64,9 +70,11 @@ from pathlib import Path
 
 if __package__:
     from . import integrity, leases, notifications, paths as paths_mod, state as state_mod, updater
+    from .identifiers import IdentifierError
     from .locks import LockTimeout, app_lock
     from .provider import FolderUpdateProvider, ProviderError
-    from .runtime_store import RuntimeStore, RuntimeStoreError, ShellStore
+    from .runtime_store import (
+        RuntimeStore, RuntimeStoreError, SharedComponentError, ShellStore)
 else:  # loose files in <ROOT>/bootstrap/
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import integrity
@@ -75,9 +83,11 @@ else:  # loose files in <ROOT>/bootstrap/
     import paths as paths_mod
     import state as state_mod
     import updater
+    from identifiers import IdentifierError
     from locks import LockTimeout, app_lock
     from provider import FolderUpdateProvider, ProviderError
-    from runtime_store import RuntimeStore, RuntimeStoreError, ShellStore
+    from runtime_store import (
+        RuntimeStore, RuntimeStoreError, SharedComponentError, ShellStore)
 
 log = logging.getLogger("bootstrap")
 
@@ -107,11 +117,31 @@ def is_version_failure(code: int) -> bool:
 _SHELL_ENVIRONMENT_HELP = (
     "應用程式外殼(Tauri / WebView2)無法啟動。這不是版本的問題,退回舊版也不會好。\n"
     "  最可能的原因:\n"
-    "    1. 這台電腦沒有安裝 Microsoft Edge WebView2 Runtime。\n"
-    "    2. 防毒軟體把外殼的 .exe 隔離或刪除了。\n"
+    "    1. 這台電腦沒有安裝 Microsoft Edge WebView2 Runtime"
+    "(請執行 tools\\安裝WebView2.bat)。\n"
+    "    2. 防毒軟體把外殼的 .exe 隔離或刪除了"
+    "(請 IT 把整個安裝資料夾加進防毒排除清單)。\n"
     "  請先安裝 WebView2 Runtime,或把整個安裝資料夾加入防毒白名單,再重新啟動。\n"
     "  (版本狀態沒有任何變更,也沒有退回任何版本。)"
 )
+
+
+def _report_shared_component(paths: paths_mod.AppPaths, exc: SharedComponentError) -> int:
+    """A SHARED tree is missing or corrupt: exit 5, blame nobody, fix nothing.
+
+    This is the failure the exit-code contract exists for. deps/runtimes/<fp> and
+    deps/shells/<fp> are used by EVERY version on the machine, so the version that
+    tripped over one of them is not the suspect — and marking it failed (which is
+    what mapping this to exit 4 did) costs the operator a good version, rolls back
+    onto a version that fails identically, and reports "已恢復前一版本" about a
+    recovery that never happened.
+    """
+    log.error("共用元件不可用(這台機器的問題,不是版本的問題):%s", exc)
+    print(f"\n[bootstrap][ERROR] 這台機器的共用元件壞了,退版救不了。\n"
+          f"  {exc}\n"
+          f"{exc.advice()}\n"
+          f"  記錄:{paths.data_dir / 'logs'}\n", file=sys.stderr, flush=True)
+    return EXIT_SHELL_ENVIRONMENT
 
 
 # ── pending promotion (spec §8.1 top half) ───────────────────────────────────
@@ -129,6 +159,22 @@ def promote_if_pending(paths: paths_mod.AppPaths, store: state_mod.StateStore,
             manifest = paths_mod.load_manifest(paths.version_dir(current.pending))
             try:
                 rstore.ensure_verified(manifest["runtime_fingerprint"])
+            except SharedComponentError as exc:
+                # The SHARED runtime is missing/corrupt — that says nothing about
+                # the pending version's own tree, which just verified byte for
+                # byte. Quarantining it here would blacklist a good build (and
+                # the updater would then refuse to re-stage it) because antivirus
+                # ate a folder every version uses. Keep it pending, blame nobody,
+                # and say what to fix.
+                log.error("待套用的 %s 需要的共用 runtime 不可用,這次不套用也不標記失敗:%s",
+                          current.pending, exc)
+                print(f"\n[bootstrap][注意] 待套用的版本 {current.pending} 需要的共用元件"
+                      f"目前不可用,所以這次仍然啟動 {current.current}。\n"
+                      f"  {exc}\n"
+                      f"{exc.advice()}\n"
+                      f"  {current.pending} 沒有被標記為失敗,共用元件修好後會自動套用。\n",
+                      file=sys.stderr, flush=True)
+                return current
             except RuntimeStoreError as exc:
                 problems = [str(exc)]
 
@@ -161,8 +207,11 @@ def _launch_env(paths: paths_mod.AppPaths, marker: Path, shell_exe: Path | None)
 
 def run_version(paths: paths_mod.AppPaths, store: state_mod.StateStore,
                 rstore: RuntimeStore, version: str, launcher_args: list[str], *,
-                is_candidate: bool, notify=notifications.notify,
+                is_candidate: bool, notify=None,
                 popen=subprocess.Popen) -> int:
+    # Resolved at call time, not bound as a default: a default freezes the real
+    # MessageBox into the signature, where no test can get at it.
+    notify = notify or notifications.notify
     problems = paths_mod.verify_version(paths, version, deep=False)
     if problems:
         raise BootstrapError(f"版本 {version} 不可啟動:{'; '.join(problems)}")
@@ -290,7 +339,8 @@ def _report_environment_failure(paths: paths_mod.AppPaths, version: str, code: i
 
 
 def start_app(paths: paths_mod.AppPaths, launcher_args: list[str], *,
-              notify=notifications.notify, popen=subprocess.Popen) -> int:
+              notify=None, popen=subprocess.Popen) -> int:
+    notify = notify or notifications.notify
     store = state_mod.StateStore(paths.state_dir)
     rstore = RuntimeStore(paths.deps_dir)
 
@@ -301,12 +351,18 @@ def start_app(paths: paths_mod.AppPaths, launcher_args: list[str], *,
     try:
         code = run_version(paths, store, rstore, version, launcher_args,
                            is_candidate=is_candidate, notify=notify, popen=popen)
+    except SharedComponentError:
+        # NOT this version's fault: the shared runtime/shell belongs to the
+        # machine and every version points at the same one. main() turns this
+        # into EXIT_SHELL_ENVIRONMENT (5) with actionable advice; nothing here
+        # writes state, fails a version, or pretends to have rolled anything back.
+        raise
     except (BootstrapError, RuntimeStoreError) as exc:
         if not is_candidate:
             raise  # a stable version failing is an environment problem: fail loud
-        # We could not even get to the launcher: this version's tree or the
-        # runtime/shell it names did not check out. That is version-specific
-        # (a different version names a different runtime and shell).
+        # We could not even get to the launcher and it was NOT a shared component:
+        # this version's own tree did not check out (bad manifest, files.json
+        # mismatch under versions/<ver>/). That is version-specific.
         code = EXIT_VERSION_INTEGRITY
         log.error("candidate %s 無法啟動:%s", version, exc)
 
@@ -340,6 +396,11 @@ def start_app(paths: paths_mod.AppPaths, launcher_args: list[str], *,
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
+def _store_root() -> Path:
+    """<ROOT> of the deployed tree: bootstrap.py lives in <ROOT>\\bootstrap\\."""
+    return Path(__file__).resolve().parents[1]
+
+
 def _setup_logging(paths: paths_mod.AppPaths) -> None:
     paths.ensure_data_dirs()
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -349,6 +410,31 @@ def _setup_logging(paths: paths_mod.AppPaths) -> None:
                                       encoding="utf-8"),
                   logging.StreamHandler(sys.stdout)],
     )
+
+
+def _report_unwritable_location(paths: paths_mod.AppPaths, exc: OSError) -> int:
+    """We cannot even open our own log file. Say so in Chinese, in the terms of
+    the machine it happened on.
+
+    This used to run OUTSIDE main()'s try block, so on a locked-down production
+    machine or a read-only USB stick the very first thing the product ever showed
+    a line operator was an English Python traceback out of logging.FileHandler.
+    It is an ENVIRONMENT failure (exit 5): no version is at fault, nothing is
+    written, nothing is rolled back.
+    """
+    print(f"\n[bootstrap][ERROR] 這台機器不讓程式寫入自己的資料夾,連記錄檔都建立不了。\n"
+          f"  想寫入:{paths.data_dir}\n"
+          f"  系統回報:{exc}\n"
+          f"  最可能的原因與做法:\n"
+          f"    1. 這份程式放在唯讀的位置(唯讀 USB、光碟、唯讀的網路磁碟機)。"
+          f"請整個資料夾複製到本機硬碟(例如 D:\\)再執行。\n"
+          f"    2. 這台機器不給這個資料夾寫入權限。"
+          f"請 IT 給目前登入的使用者「修改」權限,或改放到使用者自己的磁碟位置。\n"
+          f"    3. 防毒軟體擋住寫入。請 IT 把整個安裝資料夾加進防毒排除清單(白名單)。\n"
+          f"  這是「這台機器」的問題,不是版本的問題:"
+          f"沒有任何版本被標記為失敗,也沒有退回任何版本。\n",
+          file=sys.stderr, flush=True)
+    return EXIT_SHELL_ENVIRONMENT
 
 
 def _resolve_app(root: Path, requested: str | None) -> str:
@@ -477,12 +563,19 @@ def rollback_to_version(paths: paths_mod.AppPaths, version: str, *,
 # ── --install: the offline delivery path ─────────────────────────────────────
 
 def _payload_root(payload_dir: Path, app_id: str) -> Path:
-    """Accept either the app payload dir itself or the folder it sits in.
+    """The folder that actually holds release.json — the payload dir itself, or
+    the folder it sits in.
 
     export_update(root, app_id, ver, out) returns <out>/<app_id>/ and writes
     release.json there — but the operator copies "the whole thing" onto a stick
     and then points --install at whatever they see. Both are unambiguous, so
     accept both rather than teaching a factory the difference.
+
+    What we must NOT do is remember only the PARENT and re-derive the payload as
+    <parent>/<app_id>: the folder is only called <app_id> until somebody renames
+    it to 「v1.1.0更新包」 — an entirely human thing to do — and then --install
+    goes looking for a release.json at a path that has never existed. Whatever we
+    find here is what gets read (see FolderUpdateProvider.from_payload_dir).
     """
     payload_dir = Path(payload_dir)
     if not payload_dir.is_dir():
@@ -494,7 +587,8 @@ def _payload_root(payload_dir: Path, app_id: str) -> Path:
         return nested
     raise BootstrapError(
         f"{payload_dir} 不是更新資料夾:裡面沒有 release.json。\n"
-        f"  正確的更新資料夾長這樣:<資料夾>\\release.json + versions\\ + runtimes\\")
+        f"  正確的更新資料夾長這樣:<資料夾>\\release.json + versions\\ + runtimes\\\n"
+        f"  (資料夾叫什麼名字都可以,重點是 release.json 要在裡面。)")
 
 
 def install_payload(paths: paths_mod.AppPaths, payload_dir: Path, *,
@@ -512,7 +606,10 @@ def install_payload(paths: paths_mod.AppPaths, payload_dir: Path, *,
     delivered by the updater must not be able to differ in their safety checks.
     """
     root = _payload_root(payload_dir, paths.app_id)
-    provider = FolderUpdateProvider(root.parent)
+    # Read the payload from the folder we ACTUALLY found release.json in — not
+    # from <its parent>/<app_id>, which only exists while nobody has renamed or
+    # copied the folder.
+    provider = FolderUpdateProvider.from_payload_dir(root)
     release = provider.get_latest_release(paths.app_id, "")
     if release is None:
         raise BootstrapError(f"更新資料夾缺 release.json:{root}")
@@ -689,14 +786,28 @@ def main(argv: list[str] | None = None) -> int:
                         help="管理員:手動把已複製好的版本設為待更新")
     args, passthrough = parser.parse_known_args(argv)
 
-    root = Path(__file__).resolve().parents[1]
+    root = _store_root()
     try:
+        # AppPaths validates the app id, so a hand-renamed apps\<dir> ("我的 App")
+        # raises here rather than as a raw IdentifierError traceback.
         app_id = _resolve_app(root, args.app)
-    except BootstrapError as exc:
+        paths = paths_mod.AppPaths(root, app_id)
+    except (BootstrapError, IdentifierError) as exc:
         print(f"[bootstrap][ERROR] {exc}", file=sys.stderr, flush=True)
         return 2
-    paths = paths_mod.AppPaths(root, app_id)
-    _setup_logging(paths)
+    except OSError as exc:
+        print(f"[bootstrap][ERROR] 讀不到 {root / 'apps'}:{exc}\n"
+              f"  如果這份程式放在網路磁碟機或 USB 上,請先整個複製到本機硬碟再執行。",
+              file=sys.stderr, flush=True)
+        return EXIT_SHELL_ENVIRONMENT
+
+    try:
+        _setup_logging(paths)
+    except OSError as exc:
+        # Read-only stick, locked-down factory PC, antivirus blocking writes:
+        # an environment failure, and the operator's FIRST contact with the
+        # product. Never a traceback.
+        return _report_unwritable_location(paths, exc)
 
     try:
         if args.status:
@@ -735,6 +846,12 @@ def main(argv: list[str] | None = None) -> int:
                                is_candidate=False)
 
         return start_app(paths, passthrough)
+    except SharedComponentError as exc:
+        # THE mapping this contract turns on: a SHARED runtime/shell that is
+        # missing or corrupt is exit 5 (this machine), never exit 4 (this
+        # version). It must be caught BEFORE RuntimeStoreError below, which is
+        # its base class.
+        return _report_shared_component(paths, exc)
     except (BootstrapError, state_mod.StateError, RuntimeStoreError,
             paths_mod.LayoutError, ProviderError, updater.UpdateError,
             integrity.IntegrityError, LockTimeout) as exc:
@@ -742,6 +859,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\n[bootstrap][ERROR] {exc}\n  記錄:{paths.data_dir / 'logs'}",
               file=sys.stderr, flush=True)
         return 2
+    except OSError as exc:
+        # Disk full, USB yanked mid-copy, a file the app still has open. Same
+        # shape as the logging failure: the machine, not the version — and the
+        # operator got a raw traceback for it until now.
+        log.error("檔案系統操作失敗:%s", exc)
+        print(f"\n[bootstrap][ERROR] 磁碟或檔案操作失敗,這是「這台機器」的問題:\n"
+              f"  {exc}\n"
+              f"  請檢查:磁碟空間是否不足、USB 是否被拔掉、"
+              f"防毒軟體是否鎖住了安裝資料夾。\n"
+              f"  沒有任何版本被標記為失敗,也沒有退回任何版本。\n"
+              f"  記錄:{paths.data_dir / 'logs'}\n", file=sys.stderr, flush=True)
+        return EXIT_SHELL_ENVIRONMENT
 
 
 if __name__ == "__main__":

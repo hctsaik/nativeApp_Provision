@@ -313,18 +313,22 @@ def build_runtime(root: Path, fingerprint: str, *, complete: bool = True) -> Pat
 
 
 def build_version(vdir: Path, version: str, fingerprint: str, *,
-                  app: str = APP, complete: bool = True, body: str = "x") -> Path:
+                  app: str = APP, complete: bool = True, body: str = "x",
+                  shell_fp: str | None = None) -> Path:
     vdir = Path(vdir)
     (vdir / "application").mkdir(parents=True, exist_ok=True)
     (vdir / "application" / "app.py").write_text(f"# {body}", encoding="utf-8")
     (vdir / "launcher").mkdir(exist_ok=True)
     (vdir / "launcher" / "launch.py").write_text("# fake launcher", encoding="utf-8")
-    (vdir / "app-package.json").write_text(json.dumps({
+    manifest = {
         "schema_version": 2, "app_id": app, "display_name": "Demo",
         "version": version, "entrypoint": "application/app.py",
         "runtime_fingerprint": fingerprint,
         "shell_executable": "shell/cim-light.exe",
-    }), encoding="utf-8")
+    }
+    if shell_fp:                      # the shell lives in the SHARED store
+        manifest["shell_fingerprint"] = shell_fp
+    (vdir / "app-package.json").write_text(json.dumps(manifest), encoding="utf-8")
     integrity.write_files_json(vdir)
     if complete:
         integrity.write_complete(vdir)
@@ -459,6 +463,36 @@ def test_install_rejects_a_folder_that_is_not_a_payload(tree, tmp_path):
     (tmp_path / "junk").mkdir()
     with pytest.raises(bootstrap.BootstrapError, match="release.json"):
         bootstrap.install_payload(paths_of(tree), tmp_path / "junk")
+
+
+def test_install_works_from_a_payload_folder_the_operator_renamed(tree, tmp_path):
+    """--install rebuilt the payload path as <given>.parent / <app_id>, so it only
+    worked while the exported folder was still literally named <app_id>. Renaming
+    it to 「v1.1.0更新包」 — an entirely human thing to do before copying it to a
+    stick — sent the provider looking for <parent>\\demo\\release.json, a path that
+    has never existed on that machine, and the install failed with it."""
+    payload = make_payload(tmp_path, "v2", FP2, with_runtime=True)
+    renamed = payload.parent / "v1.1.0更新包"
+    payload.rename(renamed)
+
+    assert bootstrap.install_payload(paths_of(tree), renamed) == 0
+    assert store_of(tree).load().pending == "v2"
+    # versions/ AND runtimes/ must resolve against the folder we were handed.
+    assert integrity.is_complete(tree / "apps" / APP / "versions" / "v2")
+    assert runtime_store.RuntimeStore(tree / "deps").is_complete(FP2)
+
+
+def test_install_works_from_a_copy_of_the_payload_left_at_the_drive_root(tree, tmp_path):
+    """The other half of the same bug: the operator copies the payload folder to
+    D:\\ (or a second stick), so its parent is a drive root with no <app_id> in it."""
+    payload = make_payload(tmp_path, "v2")
+    import shutil
+    copied = tmp_path / "elsewhere" / "更新包"
+    copied.parent.mkdir()
+    shutil.copytree(payload, copied)
+
+    assert bootstrap.install_payload(paths_of(tree), copied) == 0
+    assert store_of(tree).load().pending == "v2"
 
 
 # ── --set-update-source ──────────────────────────────────────────────────────
@@ -700,6 +734,140 @@ def test_exit_code_classification():
     assert not bootstrap.is_environment_failure(bootstrap.EXIT_APP_FAILURE)
 
 
+# ── a BROKEN MACHINE is not a broken version (exit 5, never 4) ───────────────
+#
+# deps/runtimes/<fp> and deps/shells/<fp> are SHARED by every version installed on
+# the machine. When antivirus quarantines one, or a dying disk corrupts one, the
+# version that trips over it is not the suspect — but RuntimeStoreError used to map
+# straight to EXIT_VERSION_INTEGRITY, so bootstrap marked a good version failed,
+# rolled back, told the operator 「已恢復前一版本」, and the previous version then
+# failed in exactly the same way. Two versions in failed_versions, and a false story.
+
+def run_main(tree, monkeypatch, argv, *, notified=None):
+    """bootstrap.main() against a temp store — the real operator entry point.
+
+    Popen is booby-trapped: every failure below must be caught BEFORE a launcher
+    is ever started, and notify is redirected so a regression cannot pop a real
+    MessageBox and hang the suite.
+    """
+    monkeypatch.setattr(bootstrap, "_store_root", lambda: Path(tree))
+    monkeypatch.setattr(bootstrap.subprocess, "Popen",
+                        lambda *a, **k: pytest.fail("launcher must not be started"))
+    monkeypatch.setattr(bootstrap.notifications, "notify",
+                        lambda *a: (notified if notified is not None else []).append(a))
+    return bootstrap.main(["--app", APP, *argv])
+
+
+def eat_shared_runtime(tree, fingerprint: str = FP1) -> None:
+    """What an antivirus quarantine looks like from here: the shared runtime that
+    EVERY version points at is simply gone."""
+    import shutil
+    shutil.rmtree(Path(tree) / "deps" / "runtimes" / fingerprint)
+
+
+def test_a_missing_shared_runtime_never_marks_a_version_failed(tree, monkeypatch, capsys):
+    """The S10 blocker: an environment failure blamed on the version. The pending
+    build verified byte for byte; the RUNTIME under it is what went missing."""
+    arm_candidate(tree)                      # v1 = LKG, v2 = a good, staged build
+    eat_shared_runtime(tree)
+    notified = []
+
+    code = run_main(tree, monkeypatch, [], notified=notified)
+    assert code == bootstrap.EXIT_SHELL_ENVIRONMENT     # 5 — not 4, not 2
+
+    final = store_of(tree).load()
+    assert final.failed_versions == []       # nobody is blamed for the machine
+    assert final.pending == "v2"             # the good build is still armed
+    assert final.current == "v1"             # nothing was promoted, nothing rolled back
+    assert notified == []                    # nobody was told 「已恢復前一版本」
+
+    err = capsys.readouterr().err
+    assert "防毒" in err and "排除清單" in err          # what to DO
+    assert "安裝WebView2.bat" in err
+    assert "退版救不了" in err
+    assert "沒有任何版本被標記為失敗" in err
+    err.encode("cp950")                                # a zh-TW console can print it
+
+
+def test_a_quarantined_shared_shell_does_not_fail_the_candidate(tree, monkeypatch, capsys):
+    """The same defect through the other shared component. The candidate is live
+    here, which is exactly the path that used to call fail_candidate() and notify()."""
+    make_version(tree, "v2", body="two", shell_fp="shell-eaten")   # not in deps/shells
+    store_of(tree).mutate(state.commit_candidate)                  # v1 proven
+    store_of(tree).mutate(lambda s: state.set_pending(s, "v2"))
+    notified = []
+
+    code = run_main(tree, monkeypatch, [], notified=notified)
+    assert code == bootstrap.EXIT_SHELL_ENVIRONMENT
+
+    final = store_of(tree).load()
+    assert final.current == "v2" and final.candidate == "v2"   # promoted, still unproven
+    assert final.failed_versions == []                         # and NOT blamed
+    assert notified == []                                      # no false recovery story
+
+    err = capsys.readouterr().err
+    assert "缺共用 Tauri 殼" in err
+    assert "安裝WebView2.bat" in err and "排除清單" in err
+    assert "沒有退回任何版本" in err
+
+
+def test_a_corrupt_shared_runtime_is_the_machine_not_the_version(tree, monkeypatch, capsys):
+    """A dying disk flips a byte in the SHARED runtime. Deep verification fails —
+    for every version on the machine, so rolling back cannot help and must not be
+    claimed. The advice has to be about the disk, not about the release."""
+    arm_candidate(tree)
+    rdir = tree / "deps" / "runtimes" / FP1
+    integrity.remove_complete(rdir)                    # not yet deep-verified
+    (rdir / "Lib" / "os.py").write_text("# CORRUPT", encoding="utf-8")
+    notified = []
+
+    code = run_main(tree, monkeypatch, [], notified=notified)
+    assert code == bootstrap.EXIT_SHELL_ENVIRONMENT
+    final = store_of(tree).load()
+    assert final.failed_versions == [] and final.pending == "v2" and notified == []
+
+    err = capsys.readouterr().err
+    assert "驗證失敗" in err and "chkdsk" in err
+    assert "退版救不了" in err
+
+
+def test_a_broken_version_tree_is_still_the_version_s_fault(tree, monkeypatch):
+    """The other side of the line: a files.json mismatch INSIDE
+    apps/<app>/versions/<ver>/ is version-specific. It must still roll back —
+    fixing exit 5 must not turn every version failure into 'blame the machine'."""
+    arm_candidate(tree)
+    store_of(tree).mutate(state.promote_pending)       # current=v2 (candidate)
+    # THIS version's tree, not a shared one: half-installed, no sentinel.
+    integrity.remove_complete(tree / "apps" / APP / "versions" / "v2")
+    monkeypatch.setattr(bootstrap.time, "sleep", lambda _s: None)
+    popen = popen_factory([dict(healthy=True)])        # only v1 ever gets launched
+
+    code = bootstrap.start_app(paths_of(tree), [], notify=lambda *a: None, popen=popen)
+    assert code == 0
+    final = store_of(tree).load()
+    assert final.current == "v1" and final.is_failed("v2")
+
+
+def test_an_unwritable_install_location_says_what_to_do_instead_of_a_traceback(
+        tree, monkeypatch, capsys):
+    """_setup_logging() was called OUTSIDE main()'s try block, so on a read-only USB
+    stick or a locked-down production PC the very first thing the product ever showed
+    a line operator was an English Python traceback out of logging.FileHandler."""
+    def denied(_self):
+        raise PermissionError(13, "Access is denied")
+
+    monkeypatch.setattr(paths_mod.AppPaths, "ensure_data_dirs", denied)
+
+    code = run_main(tree, monkeypatch, ["--status"])
+    assert code == bootstrap.EXIT_SHELL_ENVIRONMENT    # the machine, not a version
+
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+    assert "唯讀" in err and "權限" in err              # what to DO
+    assert "沒有任何版本被標記為失敗" in err
+    err.encode("cp950")                                # a zh-TW console can print it
+
+
 # ── the CLI surface itself ───────────────────────────────────────────────────
 
 def test_every_new_flag_is_documented_in_help(capsys):
@@ -771,6 +939,67 @@ def test_gc_reclaims_build_and_download_leftovers(tree):
     for path in leftovers:
         assert not path.exists()
     assert (tree / "apps" / APP / "versions" / "v1").is_dir()   # current, untouched
+
+
+def test_gc_does_not_say_nothing_to_reclaim_when_the_orphan_is_what_it_runs_from(
+        tree, monkeypatch):
+    """S9. tools\\gc.bat takes python.exe from whichever runtime folder the FOR loop
+    sees last, so GC can easily be executing from the very orphan it should delete.
+    It then finds nothing else, prints 「沒有可回收的項目。」 — and the operator
+    believes it. The 450 MB they came to reclaim stays on the disk forever."""
+    orphan = build_runtime(tree, FP2)               # nothing references it
+    monkeypatch.setattr(gc_mod.sys, "prefix", str(orphan))
+
+    plan = gc_mod.collect_plan(tree)
+    assert plan.self_hosted == FP2 and plan.is_empty()
+
+    text = plan.summary()
+    assert "沒有可回收的項目" not in text            # the lie
+    assert FP2 in text and "回收不掉" in text        # the truth
+    # …and the exact command that reclaims it: another runtime's python.exe.
+    assert f"deps\\runtimes\\{FP1}\\python.exe bootstrap\\gc.py --apply" in text
+    text.encode("cp950")                            # a zh-TW console can print it
+
+
+def test_gc_reports_what_it_deleted_not_what_it_planned_to(tree):
+    """The plan text was built before the delete loop and printed after it, so an
+    --apply run signed off with 「可刪 runtime …」 and 「可回收合計 N MB」 about
+    trees it had just deleted. Past tense, or it is not a report."""
+    build_runtime(tree, FP2)
+    lines: list[str] = []
+
+    plan = gc_mod.run_gc(tree, apply=True, log=lines.append)
+    text = "\n".join(lines)
+
+    assert plan.applied and [label for label, _mb in plan.deleted]
+    assert f"已刪除 runtime {FP2}" in text
+    assert "實際回收合計" in text
+    assert "可回收合計" not in text and "可刪" not in text
+    text.encode("cp950")
+
+
+def test_gc_reports_trees_it_could_not_delete_instead_of_claiming_the_space(
+        tree, monkeypatch):
+    """shutil.rmtree(ignore_errors=True) turned 'the App still has this file open'
+    into silence, and GC signed off with 「可回收 480 MB」 having reclaimed nothing."""
+    orphan = build_runtime(tree, FP2)
+
+    def in_use(_path, *_a, **_kw):
+        raise PermissionError(32, "the file is in use by another process")
+
+    monkeypatch.setattr(gc_mod.shutil, "rmtree", in_use)
+    lines: list[str] = []
+
+    plan = gc_mod.run_gc(tree, apply=True, log=lines.append)
+    text = "\n".join(lines)
+
+    assert plan.failures and plan.deleted == []
+    assert plan.reclaimed_mb() == 0
+    assert orphan.is_dir()                          # the truth on disk
+    assert "刪不掉" in text and str(orphan) in text
+    assert "實際回收合計" not in text                # nothing was reclaimed
+    assert "App 完全關掉" in text                    # what to DO
+    text.encode("cp950")
 
 
 def test_gc_and_the_updater_take_the_same_lock(tree):

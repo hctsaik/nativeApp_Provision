@@ -54,10 +54,27 @@ class FolderUpdateProvider:
     is "the folder you exported into" and nothing else.
     """
 
-    def __init__(self, source_dir: Path):
+    def __init__(self, source_dir: Path, *, app_root: Path | None = None):
         self.source = Path(source_dir)
+        # An update SOURCE holds <source>/<app_id>/…; a payload FOLDER *is* that
+        # inner directory, and the operator is free to rename it ("v1.1.0更新包")
+        # or copy it somewhere else. When the caller already knows exactly which
+        # directory holds release.json, it says so and we never re-derive the
+        # path from the app id — deriving it is how --install came to look for
+        # <renamed>/../<app_id>/release.json and fail on a path nobody created.
+        self._app_root_override = Path(app_root) if app_root is not None else None
+
+    @classmethod
+    def from_payload_dir(cls, payload_dir: Path) -> "FolderUpdateProvider":
+        """Read release.json / versions/ / runtimes/ / shells/ from THIS folder,
+        whatever it happens to be called."""
+        payload_dir = Path(payload_dir)
+        return cls(payload_dir.parent, app_root=payload_dir)
 
     def _app_root(self, app_id: str) -> Path:
+        if self._app_root_override is not None:
+            validate_identifier(app_id, "app_id")
+            return self._app_root_override
         return self.source / validate_identifier(app_id, "app_id")
 
     def get_latest_release(self, app_id: str, current_version: str) -> ReleaseMetadata | None:

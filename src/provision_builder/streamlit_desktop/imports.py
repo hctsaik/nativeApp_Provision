@@ -23,6 +23,24 @@ The rule, therefore, is about SCOPE:
     inside a def / async def / class body
     inside a try/except ImportError guard (its body AND its fallbacks)
         OPTIONAL — reported as a warning, never fails a build.
+
+The second trap is what we compare against. "Not in the requirements file" is not
+the same as "will not be installed": `pyproject [project].dependencies` and a
+hand-written requirements.txt name DIRECT dependencies only. AI4BI declares
+pandas and never numpy, its `rfm.py` imports numpy at module level, and numpy
+arrives anyway — pandas drags it in. Refusing that build was a guess dressed up
+as a fact, and it made a perfectly good project unbuildable.
+
+So the gate also has a SOURCE:
+
+    a fully-pinned lock (every line `name==version` — what `pip freeze` emits,
+    and what Store mode demands) IS the transitive closure. A name that is not in
+    it will not be installed → hard failure, before the six-minute pip install.
+
+    anything looser only lists what the author typed. A name that is not in it
+    MAY still arrive transitively → warning, and the build goes on. The proof is
+    `missing_dependencies()` against the staged interpreter after the install:
+    that one knows, and it is still there to fail on.
 """
 
 from __future__ import annotations
@@ -30,6 +48,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -109,6 +128,11 @@ class ImportSite:
     path: Path
     line: int
     scope: str
+    # `from ai4bi.ui import workspace, viewer` -> ("workspace", "viewer"). Needed
+    # because those may be MODULES, not attributes: without them we followed
+    # ai4bi/ui/__init__.py and never opened workspace.py, so whatever it imports at
+    # module level was invisible to a gate whose whole job is to look.
+    names: tuple[str, ...] = ()
 
     @property
     def top(self) -> str:
@@ -132,24 +156,52 @@ class ImportSite:
 class MissingReport:
     """What the app imports but nothing provides.
 
-    `required` is a hard failure — the module is imported at module level, so the
-    very first render raises ModuleNotFoundError. `optional` is a warning: a lazy
-    or guarded import that a running app can live without.
+    `required` is a module-level import that nothing in the source we compared
+    against provides. Whether that is a HARD FAILURE depends on `complete`:
+
+        complete=True  — we compared against the whole truth (a fully-pinned lock,
+                         or the staged interpreter itself). Not there = not
+                         installed = the first render dies. Blocking.
+
+        complete=False — we compared against a list of DIRECT dependencies. Not
+                         there = we do not know; it may well arrive transitively
+                         (numpy via pandas). A warning, never a block.
+
+    `optional` is always a warning: a lazy or guarded import a running app lives
+    without.
     """
     required: list[str] = field(default_factory=list)
     optional: list[str] = field(default_factory=list)
     sites: dict[str, list[str]] = field(default_factory=dict)
+    # True = the source is the transitive closure, so absence is proof of absence.
+    # Defaults to True because the post-install probe (`missing_dependencies`) is
+    # exactly that, and it is the caller that must opt into uncertainty.
+    complete: bool = True
+    # The distribution names the source declared — used to point at the package
+    # that most likely drags a missing module in ("numpy 可能由 pandas 帶進來").
+    declared: frozenset[str] = frozenset()
+
+    @property
+    def blocking(self) -> list[str]:
+        """Modules that WILL be missing. The only reason to refuse a build."""
+        return list(self.required) if self.complete else []
+
+    @property
+    def undeclared(self) -> list[str]:
+        """Modules not named in a non-closure source: maybe transitive, maybe not.
+        Worth saying; never worth blocking on."""
+        return [] if self.complete else list(self.required)
 
     # Older callers do `if missing:` / `for name in missing:` and mean the hard
     # failures. Keep them honest instead of accidentally truthy.
     def __bool__(self) -> bool:
-        return bool(self.required)
+        return bool(self.blocking)
 
     def __iter__(self):
-        return iter(self.required)
+        return iter(self.blocking)
 
     def __len__(self) -> int:
-        return len(self.required)
+        return len(self.blocking)
 
     def where(self, name: str) -> str:
         return "、".join(self.sites.get(name, [])) or "(找不到位置)"
@@ -158,7 +210,7 @@ class MissingReport:
         """What the operator reads when the build stops. Not an accusation: the
         module, where it is imported from, and the two ways out."""
         lines = ["這些模組在 App 啟動時就會被 import,但相依宣告裡沒有:"]
-        for name in self.required:
+        for name in self.blocking:
             hint = suggest_distribution(name)
             extra = f"(套件名可能是 {hint})" if hint and hint != name else ""
             lines.append(f"  · {name}{extra}")
@@ -174,8 +226,17 @@ class MissingReport:
         return "\n".join(lines)
 
     def warning_lines(self) -> list[str]:
-        """Optional imports: worth saying out loud, never worth failing on."""
+        """Everything worth saying out loud and nothing worth failing on: the
+        lazy/guarded imports, plus (when the source is not a closure) the
+        module-level ones that are probably someone else's transitive dependency."""
         out = []
+        for name in self.undeclared:
+            carrier = _likely_carrier(name, self.declared)
+            via = f"{name} 可能由 {carrier} 帶進來" if carrier else f"{name} 可能由其它套件帶進來"
+            out.append(
+                f"「{name}」沒有列在相依宣告裡(import 位置:{self.where(name)})。"
+                f"requirements.txt / pyproject 只宣告直接相依,{via};"
+                "安裝完成後會再驗一次,真的缺才會擋下來。")
         for name in self.optional:
             out.append(f"選用相依「{name}」沒有宣告,但只在 {self.where(name)} 用到,"
                        "不會擋住啟動;若那條路徑要能用,請把它加進 requirements。")
@@ -236,7 +297,8 @@ def _parse_import_sites(path: Path) -> list[ImportSite]:
                     found.append(ImportSite(alias.name, path, child.lineno, scope))
             elif isinstance(child, ast.ImportFrom):
                 if child.level == 0 and child.module:      # relative = first-party
-                    found.append(ImportSite(child.module, path, child.lineno, scope))
+                    found.append(ImportSite(child.module, path, child.lineno, scope,
+                                            tuple(alias.name for alias in child.names)))
             elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 # Only runs when someone calls it: it cannot break the first render.
                 # A method inside a class is still a function — say so, or the
@@ -296,9 +358,15 @@ def runtime_sources(project_dir: Path, entrypoint: Path) -> list[Path]:
             continue
         seen.add(path)
         for site in import_sites(path):
-            local = _module_file(project_dir, entry_dir, site.module)
-            if local is not None and local not in seen:
-                queue.append(local)
+            # `from ai4bi.ui import workspace` reaches ai4bi/ui/workspace.py, not
+            # just ai4bi/ui/__init__.py — AI4BI's app.py does exactly this, and the
+            # module-level imports of every file behind such a line were being
+            # skipped. Following the package alone is how a gate goes quiet.
+            dotted = [site.module] + [f"{site.module}.{name}" for name in site.names]
+            for name in dotted:
+                local = _module_file(project_dir, entry_dir, name)
+                if local is not None and local not in seen:
+                    queue.append(local)
     return sorted(seen)
 
 
@@ -370,6 +438,100 @@ def local_module_names(project_dir: Path) -> set[str]:
 
 # ── what the declarations provide ────────────────────────────────────────────
 
+# Who famously drags whom in. Only used to make a warning concrete — "numpy 可能由
+# pandas 帶進來" is a sentence the operator can check in five seconds, where "可能
+# 由其它套件帶進來" leaves them nothing to look at. Never used to decide anything.
+_TRANSITIVE_CARRIERS: dict[str, tuple[str, ...]] = {
+    "numpy": ("pandas", "scipy", "matplotlib", "pyarrow", "scikit-learn",
+              "opencv-python", "streamlit"),
+    "pandas": ("streamlit",),
+    "pyarrow": ("streamlit", "pandas"),
+    "altair": ("streamlit",),
+    "pil": ("streamlit", "matplotlib"),
+    "packaging": ("streamlit", "matplotlib"),
+    "jinja2": ("streamlit", "flask"),
+    "click": ("streamlit", "flask"),
+    "tornado": ("streamlit",),
+    "requests": ("streamlit",),
+    "urllib3": ("requests",),
+    "certifi": ("requests",),
+    "charset-normalizer": ("requests",),
+    "idna": ("requests",),
+    "dateutil": ("pandas", "matplotlib"),
+    "pytz": ("pandas",),
+    "tzdata": ("pandas",),
+    "attr": ("jsonschema",),
+    "jsonschema": ("altair", "streamlit"),
+    "yaml": ("uvicorn",),
+    "typing-extensions": ("pydantic", "streamlit"),
+    "pydantic": ("fastapi",),
+    "et-xmlfile": ("openpyxl",),
+    "openpyxl": ("pandas",),
+    "matplotlib": ("seaborn",),
+    "scipy": ("scikit-learn", "seaborn"),
+    "joblib": ("scikit-learn",),
+    "protobuf": ("streamlit",),
+    "pyparsing": ("matplotlib",),
+    "six": ("python-dateutil",),
+}
+
+
+def _likely_carrier(dotted: str, declared: frozenset[str]) -> str:
+    """A declared package that plausibly pulls `dotted` in, or "" if we cannot
+    name one. Honest by construction: only ever names something the project
+    ACTUALLY declared."""
+    if not declared:
+        return ""
+    key = _normalize(dotted.split(".")[0])
+    for carrier in _TRANSITIVE_CARRIERS.get(key, ()):
+        if _normalize(carrier) in declared:
+            return carrier
+    return ""
+
+
+# `name==1.2.3`, extras and an environment marker tolerated. Anything else — a
+# range, a bare name, a URL, `-e .` — means the file was written by a human and
+# lists only what they thought of, not what pip will end up installing.
+_PIN_LINE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*(?:\[[A-Za-z0-9,._\s-]+\])?\s*==\s*[^\s;]+"
+    r"(?:\s*;.*)?$")
+# pip-compile writes `numpy==2.4.6 \` + `    --hash=sha256:…` continuation lines.
+# That is a closure too — reading it as "not a lock" would quietly disarm the gate
+# for every project that locks the careful way.
+_HASH_FRAG = re.compile(r"\s+--hash=\S+")
+
+
+def is_pinned_closure(requirements_text: str) -> bool:
+    """True when the requirements text is a fully-pinned lock — every dependency
+    line is `name==version`, i.e. what `pip freeze` / `pip-compile` produces.
+
+    That is the only shape whose ABSENCES mean anything. A `pyproject`
+    `[project].dependencies` list and a hand-written requirements.txt name direct
+    dependencies only: numpy is missing from AI4BI's pyproject and installs
+    anyway, because pandas needs it. Calling that "will be missing" blocks a build
+    that works.
+    """
+    from . import requirements as requirements_mod       # circular at module level
+
+    saw_pin = False
+    for raw in requirements_text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line.startswith("--hash"):                    # a hash continuation line
+            continue
+        line = _HASH_FRAG.sub("", line.rstrip("\\").strip()).strip()
+        if not line:
+            continue
+        if _PIN_LINE.match(line):
+            saw_pin = True
+            continue
+        # pip's own plumbing is stripped before install, so a `pip @ file:///…`
+        # line from `pip freeze --all` must not demote a real lock to a guess.
+        if requirements_mod.distribution_name(line) in requirements_mod.PLUMBING:
+            continue
+        return False                       # a range, a bare name, a URL, `-e .`
+    return saw_pin
+
+
 def _normalize(name: str) -> str:
     return name.strip().lower().replace("_", "-")
 
@@ -414,6 +576,11 @@ def missing_from_lock(entrypoint: Path, project_dir: Path,
 
     This is what 「檢查專案」 runs: the operator learns in about a second that
     `duckdb` is not declared, instead of after a six-minute pip install.
+
+    How much that second is worth depends on what they declared. Against a
+    fully-pinned lock the answer is certain and the build stops here
+    (`report.blocking`). Against a direct-dependency list it is a suspicion, and
+    a suspicion gets a warning (`report.undeclared`) — see `is_pinned_closure`.
     """
     project_dir, entrypoint = Path(project_dir), Path(entrypoint)
     required, optional = classify(project_dir, entrypoint)
@@ -423,7 +590,9 @@ def missing_from_lock(entrypoint: Path, project_dir: Path,
         return sorted(name for name in names
                       if not (set(candidate_distributions(name)) & declared))
 
-    report = MissingReport(required=unsatisfied(required), optional=unsatisfied(optional))
+    report = MissingReport(required=unsatisfied(required), optional=unsatisfied(optional),
+                           complete=is_pinned_closure(requirements_text),
+                           declared=frozenset(declared))
     for name in report.required:
         report.sites[name] = _sites_of(name, required, project_dir)
     for name in report.optional:
@@ -449,9 +618,17 @@ def importable_in(python: Path, names: set[str]) -> set[str]:
         "print(json.dumps(ok))\n"
     )
     try:
-        proc = subprocess.run([str(python), "-c", script, json.dumps(sorted(names))],
+        # -B / PYTHONDONTWRITEBYTECODE: this probe runs the SHARED, immutable
+        # runtime's own python.exe. Without them, importing json/importlib writes
+        # stdlib __pycache__ INTO that runtime — after its files.json was already
+        # computed. The runtime then no longer matches its own manifest, and every
+        # machine we deliver it to rejects it as corrupt ("undeclared file:
+        # Lib/encodings/__pycache__/cp950.cpython-311.pyc"). A read-only question
+        # must not leave fingerprints on the thing it is asking about.
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", PYTHONUTF8="1")
+        proc = subprocess.run([str(python), "-B", "-c", script, json.dumps(sorted(names))],
                               capture_output=True, text=True, encoding="utf-8",
-                              errors="replace", check=False)
+                              errors="replace", check=False, env=env)
     except OSError as exc:
         raise ImportProbeError(
             f"無法執行交付包裡的 Python 來檢查 import:{python}({exc})") from exc
@@ -489,6 +666,9 @@ def missing_dependencies(entrypoint: Path, project_dir: Path,
     report = MissingReport(
         required=sorted(set(required) - available),
         optional=sorted(set(optional) - available),
+        # The staged interpreter IS the closure: whatever pip was going to drag in
+        # is already on disk. Absence here is proof, and it blocks (complete=True).
+        complete=True,
     )
     for name in report.required:
         report.sites[name] = _sites_of(name, required, project_dir)

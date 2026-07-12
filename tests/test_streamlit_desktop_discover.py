@@ -172,6 +172,87 @@ def test_two_plausible_pages_ask_instead_of_guessing(tmp_path):
     assert "one.py" in found.hint and "two.py" in found.hint
 
 
+# ── the wrong-tab rescue, in BOTH directions ─────────────────────────────────
+#
+# The CIM tab has told Streamlit users "you are on the wrong tab" since day one.
+# The Streamlit tab never returned the courtesy: point ANnoTation (18 CIM modules
+# at modules/module_XXX/plugin.yaml, each of which imports streamlit) at it and it
+# confidently offered four of those modules as candidate entry points — sending the
+# operator to pick one, on a tab that could never build this project.
+
+def _module_collection(root: Path, count: int = 3) -> Path:
+    """ANnoTation's shape: plugin.yaml two levels down, and modules that DO import
+    streamlit — so the entry-point search fails with "too many", not "none"."""
+    for i in range(count):
+        module = root / "modules" / f"module_{i:03d}"
+        module.mkdir(parents=True)
+        (module / "plugin.yaml").write_text("id: module\n", encoding="utf-8")
+        (module / f"{i:03d}_input.py").write_text(
+            "import streamlit as st\nst.title('module')\n", encoding="utf-8")
+    return root
+
+
+def test_plugin_yaml_is_found_a_few_levels_down(tmp_path):
+    """ANnoTation's 18 live at modules/module_XXX/plugin.yaml. A top-level-only
+    look finds nothing and the rescue never fires."""
+    _module_collection(tmp_path, count=18)
+    hits = discover.find_plugin_manifests(tmp_path)
+    assert len(hits) == 18
+
+
+def test_a_cim_module_collection_on_the_streamlit_tab_is_told_which_tab_to_use(tmp_path):
+    """The ANnoTation case, exactly: many streamlit-importing files, no single app,
+    and a hint that said 「請用「瀏覽…」自行指定」 — inviting the operator to pick a
+    CIM module as a Streamlit entry point. Name what the folder is and where it goes."""
+    _module_collection(tmp_path, count=18)
+
+    found = discover.find_entrypoint(tmp_path)
+
+    assert not found.found
+    assert "plugin.yaml" in found.hint                       # what this folder IS
+    assert "CIM 平台模組" in found.hint                       # the tab that wants it
+    assert "平台專案" in found.hint                           # the field on that tab
+    found.hint.encode("cp950")
+
+
+def test_a_folder_with_neither_streamlit_nor_an_app_still_names_the_other_tab(tmp_path):
+    """The empty dead end (no `import streamlit` anywhere) needs the same way out."""
+    module = tmp_path / "modules" / "module_001"
+    module.mkdir(parents=True)
+    (module / "plugin.yaml").write_text("id: m\n", encoding="utf-8")
+    (module / "run.py").write_text("print('no streamlit here')\n", encoding="utf-8")
+
+    found = discover.find_entrypoint(tmp_path)
+
+    assert not found.found
+    assert "import streamlit" in found.hint                  # the original diagnosis
+    assert "CIM 平台模組" in found.hint                       # …plus the rescue
+
+
+def test_a_real_streamlit_project_is_not_sent_to_the_other_tab(tmp_path):
+    """The rescue must not fire on a folder that has no plugin.yaml — a project with
+    two plausible pages needs 「瀏覽…」, not a lecture about the CIM tab."""
+    for name in ("one.py", "two.py"):
+        (tmp_path / name).write_text("import streamlit as st\nst.title('x')\n", encoding="utf-8")
+    found = discover.find_entrypoint(tmp_path)
+    assert "CIM 平台模組" not in found.hint
+
+
+def test_a_platform_project_error_names_the_gui_field_not_the_cli_argument(tmp_path):
+    """The other end of the same rescue. `PlatformGateway` told an operator staring
+    at a GUI to fix 「build 的第一個參數」 — a CLI concept that appears nowhere on
+    their screen. The field in front of them is labelled 「平台專案」."""
+    from provision_builder.gateway import GatewayError, PlatformGateway
+
+    with pytest.raises(GatewayError) as exc:
+        PlatformGateway(tmp_path)                    # a folder with no engine.py
+
+    message = str(exc.value)
+    assert "平台專案" in message                      # the field they can see
+    assert str(tmp_path) in message                   # and what it currently points at
+    message.encode("cp950")
+
+
 # ── name / output ────────────────────────────────────────────────────────────
 
 def test_suggested_name_is_readable(tmp_path):

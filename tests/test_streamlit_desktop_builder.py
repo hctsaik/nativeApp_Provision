@@ -253,6 +253,37 @@ def test_egg_info_is_excluded_by_the_same_rule_that_estimates_it(request_, stub_
     assert not (pkg / "application" / "myapp.egg-info").exists()
 
 
+def test_a_path_pattern_does_not_exclude_the_entire_project():
+    """`data/*` used to be collapsed to its last segment — `*` — and fnmatch(x, "*")
+    is True for everything. So typing ONE exclude pattern silently dropped every
+    file in the project, and the build still reported success: a delivered folder
+    with no application code in it. This is the highest-cost class of bug we have:
+    it produces a broken artefact and calls it done."""
+    keep = builder_mod.should_ignore
+    assert not keep("app.py", False, ("data/*", "*.mp4"), "app.py")
+    assert not keep("utils.py", False, ("data/*",), "utils.py")
+    assert not keep("notes.md", False, ("data/*",), "docs/notes.md")
+
+    assert keep("demo.mp4", False, ("*.mp4",), "demo.mp4")
+    assert keep("raw.csv", False, ("data/*",), "data/raw.csv")
+    assert keep("deep.csv", False, ("data/*",), "data/nested/deep.csv")   # 整棵子樹
+    assert keep("data", True, ("data/",), "data")
+
+
+def test_the_store_slot_honours_the_same_exclusions_as_the_fat_package(request_, stub_pip):
+    """They used to disagree: store mode called shutil.ignore_patterns() directly and
+    never saw .provisionignore or the GUI's 額外排除 field. The same project excluded
+    a 85MB recording in fat mode and shipped it in every store update."""
+    from provision_builder.streamlit_desktop import builder as b
+    (request_.project_dir / "demo.mp4").write_text("x" * 1024, encoding="utf-8")
+    (request_.project_dir / ".provisionignore").write_text("*.mp4\n", encoding="utf-8")
+
+    ignore = b.copytree_ignore(b.ignore_patterns_for(request_), request_.project_dir)
+    dropped = ignore(str(request_.project_dir), ["app.py", "demo.mp4"])
+    assert "demo.mp4" in dropped
+    assert "app.py" not in dropped
+
+
 def test_the_scan_says_what_it_threw_away_and_how_big_it_was(request_, stub_pip):
     """「為什麼我的資料夾有 700 MB」 deserves an answer up front."""
     wheels = request_.project_dir / "wheels"

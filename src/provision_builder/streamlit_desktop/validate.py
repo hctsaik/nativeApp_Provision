@@ -42,12 +42,46 @@ def missing_imports(request: BuildRequest,
     when the runtime was NOT reused, so the operator could be told "this cannot
     start" by a build they had already waited six minutes for — or not told at
     all. It belongs in 「檢查專案」.
+
+    What comes back is deliberately two-sided (see imports.MissingReport):
+    `.blocking` only when the declarations are a fully-pinned lock and absence is
+    therefore proof; `.undeclared` — a warning — when they are a direct-dependency
+    list and the module may still arrive transitively.
     """
     try:
         text = requirements_mod.declared_text(found, request.extras)
     except requirements_mod.RequirementsError:
         return imports_mod.MissingReport()
     return imports_mod.missing_from_lock(request.entrypoint, request.project_dir, text)
+
+
+def warnings_for(request: BuildRequest) -> list[str]:
+    """Everything 「檢查專案」 should SAY but must not fail on.
+
+    The counterpart of `validate_request`: that one returns the reasons a build
+    cannot start, this one the things the operator wants to know before waiting
+    six minutes — an undeclared module that will probably arrive transitively, a
+    lazy import nothing provides. Returning them from a separate call is what
+    lets the GUI render them as ⚠ instead of ✗; folding them into the error list
+    is exactly the lie this pair exists to undo.
+    """
+    if not request.project_dir.is_dir() or not request.entrypoint.is_file():
+        return []
+    try:
+        found = requirements_mod.resolve(request.project_dir,
+                                         request.explicit_requirements,
+                                         extras=request.extras)
+    except requirements_mod.RequirementsError:
+        return []
+
+    notes: list[str] = []
+    if found.ignored_extras:
+        notes.append(
+            f"你勾的選用群組({'、'.join(found.ignored_extras)})這次不會生效:"
+            f"相依來源是「{found.source}」,而選用群組只對 pyproject.toml 的 "
+            "[project.optional-dependencies] 有意義——lock 檔本身就已經是完整的相依清單。"
+            "要帶這些套件,請把它們加進 lock 檔。")
+    return notes + missing_imports(request, found).warning_lines()
 
 
 def is_inside(root: Path, candidate: Path) -> bool:
@@ -125,7 +159,14 @@ def validate_request(request: BuildRequest) -> list[str]:
                 )
             if request.entrypoint.is_file():
                 report = missing_imports(request, found)
-                if report.required:
+                # `.blocking`, not `.required`: a name absent from a fully-pinned
+                # lock really will be missing, but a name absent from pyproject's
+                # [project].dependencies may simply be somebody else's transitive
+                # dependency (AI4BI imports numpy and declares pandas — numpy
+                # arrives with it). Blocking on that made a working project
+                # unbuildable; it is a warning (see warnings_for) and the
+                # post-install probe in builder.py stays as the real gate.
+                if report.blocking:
                     errors.append(report.failure_message())
 
     if not request.shell_exe.is_file():

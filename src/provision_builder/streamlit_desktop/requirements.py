@@ -28,6 +28,11 @@ class Requirements:
     path: Path            # the file to hand to pip (may be generated)
     source: str           # human-readable: where the declarations came from
     generated: bool       # True when we wrote `path` ourselves from pyproject
+    # Extras the admin asked for that this source cannot honour. A lock file is
+    # the whole truth by definition — there is nothing to opt into — but silently
+    # dropping the group they ticked would leave them waiting six minutes for a
+    # package that was never going to be installed. Say it instead.
+    ignored_extras: tuple[str, ...] = ()
 
 
 def _pyproject_data(pyproject: Path) -> dict:
@@ -90,12 +95,16 @@ def resolve(project_dir: Path, explicit: Path | None = None,
         explicit = Path(explicit)
         if not explicit.is_file():
             raise RequirementsError(f"找不到指定的 requirements 檔:{explicit}")
-        return Requirements(explicit, f"指定檔案:{explicit.name}", generated=False)
+        # An explicitly chosen pyproject.toml is still a pyproject: extras apply.
+        lost = () if explicit.name == "pyproject.toml" else tuple(extras)
+        return Requirements(explicit, f"指定檔案:{explicit.name}", generated=False,
+                            ignored_extras=lost)
 
     for name in (*LOCK_NAMES, *PLAIN_NAMES):
         candidate = project_dir / name
         if candidate.is_file():
-            return Requirements(candidate, f"專案的 {name}", generated=False)
+            return Requirements(candidate, f"專案的 {name}", generated=False,
+                                ignored_extras=tuple(extras))
 
     pyproject = project_dir / "pyproject.toml"
     if pyproject.is_file():
@@ -115,7 +124,12 @@ def resolve(project_dir: Path, explicit: Path | None = None,
 
     raise RequirementsError(
         f"找不到相依宣告:{project_dir}\n"
-        "  需要 requirements.txt、requirements.lock.txt,或 pyproject.toml 的 [project].dependencies。")
+        "  需要 requirements.txt、requirements.lock.txt,或 pyproject.toml 的 "
+        "[project].dependencies。\n"
+        "  兩條路,擇一即可:\n"
+        "  1. 在專案的虛擬環境裡產一份:pip freeze > requirements.lock.txt\n"
+        "  2. 已經有現成的 lock 檔(在別的位置也可以):在「進階設定 → 相依 lock 檔」"
+        "直接指定它,不必動到專案。")
 
 
 def declared_names(found: "Requirements", extras: tuple[str, ...] = ()) -> list[str]:
@@ -172,23 +186,60 @@ def is_unportable(line: str) -> bool:
     return head in (".", "..")
 
 
+_VCS_SCHEME = re.compile(r"(?:^|[\s@=])(?:git|hg|svn|bzr)\+", re.IGNORECASE)
+
+
+def is_vcs(line: str) -> bool:
+    """True for a requirement pip would have to CLONE — `git+https://…`,
+    `-e git+ssh://…`, `pkg @ git+https://…`.
+
+    Worth telling apart from `-e .`: `-e .` is the project itself, and the project
+    travels in `application/`, so dropping it costs nothing. A VCS dependency is
+    somebody else's package, and dropping it means it is simply not there.
+    """
+    head = line.split("#", 1)[0].strip()
+    return bool(_VCS_SCHEME.search(head))
+
+
 def sanitize_for_pip(requirements: Path, staging: Path, progress=None) -> Path:
     """A copy of the requirements with the lines pip cannot use dropped, written
-    where pip can read it. We never edit the user's file."""
+    where pip can read it. We never edit the user's file.
+
+    Two kinds of dropped line, and conflating them was a lie: `-e .` /
+    `ai4bi @ file:///C:/code/AI4BI` is the project itself and is packaged anyway,
+    but `-e git+https://…/internal-lib.git` is a third-party package that will
+    now simply be ABSENT — and the operator was being told, in the same breath,
+    that "專案自己的原始碼會直接打包進去".
+    """
     lines = Path(requirements).read_text("utf-8", errors="replace").splitlines()
-    kept, dropped = [], []
+    kept, self_lines, vcs_lines = [], [], []
     for line in lines:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             kept.append(line)
+        elif is_vcs(stripped) and (stripped.startswith(("-e", "--editable"))
+                                   or is_unportable(stripped)):
+            vcs_lines.append(stripped)
         elif distribution_name(line) in PLUMBING or is_unportable(line):
-            dropped.append(stripped)
+            self_lines.append(stripped)
         else:
             kept.append(line)
-    if dropped and progress is not None:
-        progress("已略過不能在別台機器安裝的相依行(專案自己的原始碼會直接打包進去):")
-        for line in dropped:
-            progress(f"    - {line}")
+
+    if progress is not None:
+        if self_lines:
+            progress("已略過不能在別台機器安裝的相依行(專案自己的原始碼會直接打包進去):")
+            for line in self_lines:
+                progress(f"    - {line}")
+        for line in vcs_lines:
+            progress(f"略過了一行 editable / VCS 相依:{line}")
+            progress("      為什麼不能帶:editable 安裝只會在交付包裡留下一條指回這台建置機的路徑,"
+                     "而 git+ 相依要在安裝時 clone——工廠現場的機器沒有 git、也不能連網,"
+                     "這個套件到了現場就是不存在。")
+            progress("      怎麼辦:(1) 改成釘死的版本,例如 internal-lib==1.2.3;"
+                     "(2) 或先在這台機器 `pip wheel <這行>` 產出 .whl,"
+                     "把 wheel 放進專案自帶的 wheelhouse 後改指向它。")
+            progress("      如果 App 在啟動時就 import 它,建置會在安裝後的 import 檢查停下來。")
+
     staging = Path(staging)
     staging.mkdir(parents=True, exist_ok=True)
     target = staging / "requirements.build.txt"

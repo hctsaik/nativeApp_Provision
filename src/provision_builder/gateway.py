@@ -60,9 +60,15 @@ class PlatformGateway:
         self.project_root = Path(project_root).resolve()
         self.engine_root = self.project_root.joinpath(*ENGINE_SUBPATH)
         if not (self.engine_root / "engine.py").is_file():
+            # 「build 的第一個參數」是 CLI 的講法；按下按鈕的人看到的是一個標著
+            # 「平台專案」的欄位，聽不懂前者，也找不到它。名字要用他螢幕上的那個。
             raise GatewayError(
-                f"這不是 CIM 平台專案（找不到 {self.engine_root / 'engine.py'}）。"
-                f"請把 build 的第一個參數指向平台專案根，例如 C:\\code\\claude\\nativeApp"
+                f"這不是 CIM 平台專案（找不到 {self.engine_root / 'engine.py'}）。\n"
+                f"請把「CIM 平台模組（需 plugin.yaml）」分頁裡的「平台專案」欄位改指到"
+                f"平台專案根，例如 C:\\code\\claude\\nativeApp"
+                f"（= 底下有 sidecar\\python-engine\\engine.py 的那一層）。\n"
+                f"你現在指的是：{self.project_root}\n"
+                f"（CLI 的話，就是 build 的第一個參數。）"
             )
         # pip download 用的直譯器。預設 = 跑本工具的直譯器（開發機，應為 3.11）。
         self.python_cmd: list[str] = list(python_cmd) if python_cmd else [sys.executable]

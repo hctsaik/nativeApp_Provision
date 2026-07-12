@@ -31,6 +31,7 @@ from pathlib import Path
 from . import imports as imports_mod
 from . import requirements as requirements_mod
 from . import runtime as runtime_mod
+from . import builder
 from .builder import _rename_with_retry, scan_project
 from .device import integrity
 from .device.identifiers import validate_identifier
@@ -190,7 +191,15 @@ def _strip_pip(runtime_dir: Path) -> None:
 
 def ensure_runtime(root: Path, request: BuildRequest, pins: list[str],
                    progress: Progress = _noop) -> tuple[str, bool]:
-    """Return (fingerprint, reused). Builds under .staging-* then renames."""
+    """Return (fingerprint, reused). Builds under .staging-* then renames.
+
+    This function is about the RUNTIME, not about the app. The missing-import
+    gate used to live at the bottom of the try-block below — i.e. AFTER the
+    `return fingerprint, True` a few lines down — so the moment a runtime was
+    reused (which is the entire point of the store layout, and the normal case
+    for every version after the first) the gate never ran at all. It now lives
+    in build_into_store(), which runs it whether the runtime was built or reused.
+    """
     template_python = request.runtime_template / "python.exe"
     python_version = _python_version_of(template_python)
     abi = f"cp{python_version.split('.')[0]}{python_version.split('.')[1]}"
@@ -211,14 +220,6 @@ def ensure_runtime(root: Path, request: BuildRequest, pins: list[str],
         lock_file.write_text("\n".join(pins) + "\n", encoding="utf-8")
         runtime_mod.install_requirements(python, lock_file, build_log, progress=progress)
         runtime_mod.verify_imports(python, build_log)
-
-        progress("檢查 App 的每一個 import 都裝得到…")
-        missing = imports_mod.missing_dependencies(request.project_dir, request.entrypoint, python)
-        if missing:
-            raise StoreBuildError(
-                "這個 App 會 import 一些「lock 檔裡沒有」的套件,交付出去一啟動就會出現紅色錯誤:\n"
-                + "".join(f"  · {name}\n" for name in missing)
-                + "  請把它們加進 lock 檔後重新建置。")
 
         problems = _reconcile_lock_with_freeze(pins, _freeze(python))
         if problems:
@@ -252,6 +253,50 @@ def ensure_runtime(root: Path, request: BuildRequest, pins: list[str],
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
         raise
+
+
+def runtime_python(root: Path, fingerprint: str) -> Path:
+    """The interpreter this version will actually be launched under."""
+    return RuntimeStore(Path(root) / "deps").path_for(fingerprint) / "python.exe"
+
+
+def check_app_imports(root: Path, request: BuildRequest, fingerprint: str, *,
+                      reused: bool = False, progress: Progress = _noop) -> list[str]:
+    """The import gate, asked of the runtime that will really run the app.
+
+    Returns the OPTIONAL-import warnings; raises StoreBuildError on a required
+    one. It must run on every build, not only on the builds that install a
+    runtime: the whole point of the store is that the 2nd..Nth app reuses a
+    runtime someone else's lock produced, and that is exactly the build whose app
+    is most likely to import something the shared runtime never installed.
+
+    Ground truth is the interpreter, not the lock file: a distribution can be
+    pinned and still not import (wrong ABI, a wheel that quietly failed), and a
+    runtime built for another app can satisfy a lock this app never wrote.
+    """
+    python = runtime_python(root, fingerprint)
+    progress("檢查 App 的每一個 import,共用 runtime 是不是真的都載得進來…")
+    try:
+        report = imports_mod.missing_dependencies(request.entrypoint, request.project_dir,
+                                                  python)
+    except imports_mod.ImportProbeError as exc:
+        # We could not ASK. Not knowing is not the same as knowing the worst —
+        # say it is our probe that broke, not the operator's project.
+        raise StoreBuildError(
+            f"沒辦法用交付包裡的 Python 檢查 App 的 import,這次不敢直接放行:\n  {exc}\n"
+            f"  這份 runtime:{python.parent}") from exc
+
+    if report:
+        # A build that just paid six minutes for a runtime should be told the
+        # runtime survived — and, honestly, that it may turn out to be an orphan
+        # (adding the package to the lock moves the fingerprint; moving the import
+        # into a function does not, and then the reinstall is free).
+        kept = ("  這份共用 runtime 已經建好、留在 deps\\ 裡了,沒有白等;"
+                "若最後用不到,tools\\gc.bat 可以回收它。\n") if not reused else ""
+        raise StoreBuildError(
+            report.failure_message() + "\n\n"
+            + f"  檢查用的 runtime:{fingerprint}\n" + kept)
+    return list(report.warning_lines())
 
 
 # ── version + tree ───────────────────────────────────────────────────────────
@@ -338,10 +383,14 @@ def _build_version_dir(paths: AppPaths, request: BuildRequest, version: str,
     staging = paths.versions_dir / f".staging-{uuid.uuid4().hex[:8]}"
     try:
         progress(f"組裝版本 {version} …")
-        # Same exclusions as the fat builder: a version slot must stay small —
-        # it is the thing that travels on every update.
+        # The SAME rule as the fat builder — not a re-implementation of it. This
+        # line used to call shutil.ignore_patterns(EXCLUDED_*) directly, which
+        # ignored .provisionignore and the GUI's 額外排除 field entirely: the same
+        # project excluded demo.mp4 in fat mode and shipped it in store mode, and
+        # the store slot is the thing that travels on every single update.
         shutil.copytree(request.project_dir, staging / "application",
-                        ignore=shutil.ignore_patterns(*EXCLUDED_DIRS, *EXCLUDED_FILES))
+                        ignore=builder.copytree_ignore(
+                            builder.ignore_patterns_for(request), request.project_dir))
         (staging / "launcher").mkdir()
         for name in ("launch.py", "engine_shim.py"):
             shutil.copy2(TEMPLATES / name, staging / "launcher" / name)
@@ -376,7 +425,7 @@ pushd "%~dp0" || (
   exit /b 1
 )
 rem 視窗是用 Microsoft Edge WebView2 Runtime 畫出來的。缺了它,Streamlit 會起來、
-rem 視窗卻是一片空白 —— 先檢查再啟動,不要讓人等 60 秒才看到空白視窗。
+rem 視窗卻是一片空白:先檢查再啟動,不要讓人等 60 秒才看到空白視窗。
 set "WV2="
 reg query "HKLM\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{webview2_client}" /v pv >nul 2>&1 && set "WV2=1"
 reg query "HKCU\SOFTWARE\Microsoft\EdgeUpdate\Clients\{webview2_client}" /v pv >nul 2>&1 && set "WV2=1"
@@ -417,6 +466,85 @@ exit /b %RC%
 """
 
 
+# Which python.exe do the tools run under? It matters, and it used to be decided
+# by accident: `for /d %%R in ("deps\runtimes\*") do ... set "PY=..."` has no
+# break, so PY ended up holding whichever runtime the loop happened to visit
+# LAST. In a store with two runtimes that is a coin flip, and the losing side of
+# the flip is the whole point of gc: gc.py refuses to delete the runtime its own
+# interpreter is executing from (rmtree of a live python = a half-dead store), so
+# running gc under the orphan runtime makes gc report `self_hosted` and reclaim
+# nothing. The operator runs 「回收磁碟空間」, is told there is nothing to
+# reclaim, and the 450 MB they came for stays on the disk forever. That is S9.
+#
+# So: pick the runtime a CURRENT version actually references (state.json ->
+# current -> that version's app-package.json -> runtime_fingerprint). It is by
+# definition in gc's keep-set, so it is never a deletion candidate and can never
+# be the thing that gets skipped. Only if no such runtime can be resolved do we
+# fall back — and then to the FIRST one found, deterministically, not the last.
+#
+# Delayed expansion is confined to this block and handed back through
+# `endlocal & set "PY=..."`: the rest of the console reads paths from `set /p`,
+# and a path containing `!` would be eaten alive by delayed expansion.
+#
+# NOTHING in a .bat may contain U+2014 (—). cmd.exe mis-parses it under
+# `chcp 65001`: it splits the line it sits on and the tail is then executed as a
+# command ("'...' is not recognized"), and it corrupts a LATER line too. Proven
+# by holding the file size fixed and swapping — for a CJK character of identical
+# byte length: two em-dashes, two mangled lines; same bytes, no em-dash, clean.
+# See test_no_generated_bat_contains_an_em_dash, which enforces it on every bat
+# this module writes.
+_PICK_PYTHON = r"""set "PY="
+setlocal enabledelayedexpansion
+rem 1) 先找「目前這一版真的在用」的 runtime。GC 不會刪掉自己正在執行的那份 runtime,
+rem    所以絕不能拿一份「沒人引用的孤兒 runtime」來跑 GC:那樣它就永遠刪不掉了。
+for /d %%A in ("apps\*") do (
+  if not defined PY (
+    set "CUR="
+    for /f "tokens=2 delims=:," %%C in ('findstr /i /c:"current" "%%~A\state\state.json" 2^>nul') do (
+      if not defined CUR set "CUR=%%C"
+    )
+    if defined CUR (
+      set CUR=!CUR: =!
+      set CUR=!CUR:~1,-1!
+      if exist "%%~A\versions\!CUR!\app-package.json" (
+        set "FP="
+        for /f "tokens=2 delims=:," %%F in ('findstr /i /c:"runtime_fingerprint" "%%~A\versions\!CUR!\app-package.json" 2^>nul') do (
+          if not defined FP set "FP=%%F"
+        )
+        if defined FP (
+          set FP=!FP: =!
+          set FP=!FP:~1,-1!
+          if exist "deps\runtimes\!FP!\python.exe" set "PY=deps\runtimes\!FP!\python.exe"
+        )
+      )
+    )
+  )
+)
+rem 2) 真的問不出來(state.json 壞了之類):退而求其次,取「第一個」找得到的 runtime。
+rem    取第一個而不是最後一個,結果才是可預期、可重現的。
+if not defined PY (
+  for /d %%R in ("deps\runtimes\*") do (
+    if not defined PY if exist "%%~R\python.exe" set "PY=%%~R\python.exe"
+  )
+)
+endlocal & set "PY=%PY%"
+if not defined PY (
+  echo.
+  echo [{tag}][ERROR] 找不到任何可用的 python.exe:deps\runtimes\ 底下是空的,
+  echo                這份交付不完整,沒有東西可以執行。
+  echo                請向提供者重新索取完整的資料夾。
+  popd
+  pause
+  exit /b 1
+)
+"""
+
+
+def _pick_python(tag: str) -> str:
+    """The interpreter-picking block, tagged with the console it prints from."""
+    return _PICK_PYTHON.format(tag=tag)
+
+
 _GC_BAT = r"""@echo off
 rem 回收沒有任何版本槽引用的版本與 runtime。先試算,確認後才真的刪。
 setlocal
@@ -429,17 +557,13 @@ pushd "%~dp0.." || (
 )
 set "PYTHONDONTWRITEBYTECODE=1"
 set "PYTHONUTF8=1"
-set "PY="
-for /d %%R in ("deps\runtimes\*") do if exist "%%~R\python.exe" set "PY=%%~R\python.exe"
-if not defined PY (
-  echo [gc][ERROR] deps\runtimes\ 底下沒有 python.exe,這份交付不完整。
-  popd
-  pause
-  exit /b 1
-)
+{pick_python}
 echo === 先試算,不會刪除任何東西 ===
 echo.
 "%PY%" "bootstrap\gc.py"
+rem 呼叫完馬上把結果收進 RC。errorlevel 在 () 區塊裡是進區塊前就展開的,讀到的會是舊值。
+set "RC=%errorlevel%"
+if not "%RC%"=="0" goto failed
 echo.
 set "YES="
 set /p YES=以上列出的項目要真的刪除嗎? 輸入 y 後按 Enter,其他任何鍵則取消:
@@ -452,8 +576,23 @@ if /i not "%YES%"=="y" (
 echo.
 echo === 開始回收 ===
 "%PY%" "bootstrap\gc.py" --apply
+set "RC=%errorlevel%"
+if not "%RC%"=="0" goto failed
+echo.
+echo [gc] 回收完成。上面列出的項目都已經刪掉了。
 popd
 pause
+exit /b 0
+
+rem 沒有這一段的時候,失敗的 GC 和成功的 GC 在畫面上長得一模一樣:視窗關掉,
+rem 磁碟一點也沒少,而操作的人以為自己已經回收過了。
+:failed
+echo.
+echo [gc][ERROR] 回收失敗(代碼 %RC%),沒有刪掉任何東西。原因在上面那幾行。
+echo             常見原因:目前正在下載或安裝更新(store 鎖被佔用),等它做完再重跑一次。
+popd
+pause
+exit /b %RC%
 """
 
 
@@ -471,15 +610,7 @@ pushd "%~dp0.." || (
 )
 set "PYTHONDONTWRITEBYTECODE=1"
 set "PYTHONUTF8=1"
-set "PY="
-for /d %%R in ("deps\runtimes\*") do if exist "%%~R\python.exe" set "PY=%%~R\python.exe"
-if not defined PY (
-  echo [admin][ERROR] deps\runtimes\ 底下沒有 python.exe,這份交付不完整。
-  popd
-  pause
-  exit /b 1
-)
-
+{pick_python}
 :menu
 cls
 echo ============================================
@@ -552,14 +683,32 @@ echo.
 echo === 先試算,不會刪除任何東西 ===
 echo.
 "%PY%" "bootstrap\gc.py"
+rem 呼叫完馬上把結果收進 RC。errorlevel 在 () 區塊裡是進區塊前就展開的,讀到的會是舊值。
+set "RC=%errorlevel%"
+if not "%RC%"=="0" (
+  echo.
+  echo [admin][ERROR] 回收試算失敗(代碼 %RC%),沒有刪掉任何東西。原因在上面那幾行。
+  pause
+  goto menu
+)
 echo.
 set "YES="
 set /p YES=以上列出的項目要真的刪除嗎? 輸入 y 後按 Enter,其他任何鍵則取消:
-if /i "%YES%"=="y" (
-  echo.
-  "%PY%" "bootstrap\gc.py" --apply
-) else (
+if /i not "%YES%"=="y" (
   echo 已取消,沒有刪除任何東西。
+  pause
+  goto menu
+)
+echo.
+"%PY%" "bootstrap\gc.py" --apply
+set "RC=%errorlevel%"
+if "%RC%"=="0" (
+  echo.
+  echo [admin] 回收完成。上面列出的項目都已經刪掉了。
+) else (
+  echo.
+  echo [admin][ERROR] 回收失敗(代碼 %RC%),可能一個也沒刪掉。原因在上面那幾行。
+  echo               常見原因:目前正在下載或安裝更新(store 鎖被佔用),等它做完再試一次。
 )
 pause
 goto menu
@@ -793,19 +942,31 @@ def _write_store_readme(root: Path, apps: list[str], bats: list[str], *,
     (Path(root) / README_NAME).write_text("\n".join(lines), encoding="utf-8")
 
 
-def _write_tools(root: Path, apps: list[str], *, names_from: Path | None = None) -> None:
+def _write_tools(root: Path, apps: list[str] | None = None, *,
+                 names_from: Path | None = None) -> None:
     """tools/gc.bat + tools/安裝WebView2.bat + one admin console PER APP.
 
     Written UTF-8 (a Chinese display name used to raise UnicodeEncodeError here).
     `names_from` lets an export generate the consoles for a subset of apps while
     still reading each app's real display name from the source store.
+
+    The app list is the UNION of what the caller asked for and what is actually
+    installed under `root`. tools\\ describes a MACHINE, not a build: an admin
+    console is removed only when its app is not in the tree that console lives
+    in. Passing this function one build's app while the store holds two would
+    otherwise delete the still-installed app's console — the machine keeps
+    running an app it can no longer administer. (An export into a fresh folder
+    is the same rule seen from the other side: only the exported apps are in
+    that tree, so only their consoles are written.)
     """
     root = Path(root)
     source = Path(names_from) if names_from else root
+    apps = sorted(set(apps or []) | set(list_app_ids(root)))
     tools = root / "tools"
     tools.mkdir(parents=True, exist_ok=True)
 
-    (tools / "gc.bat").write_text(_GC_BAT, encoding="utf-8")
+    (tools / "gc.bat").write_text(_GC_BAT.format(pick_python=_pick_python("gc")),
+                                  encoding="utf-8")
     (tools / WEBVIEW2_BAT_NAME).write_text(
         _WEBVIEW2_BAT.format(webview2_client=WEBVIEW2_CLIENT,
                              installer=WEBVIEW2_INSTALLER.replace("/", "\\"),
@@ -819,7 +980,8 @@ def _write_tools(root: Path, apps: list[str], *, names_from: Path | None = None)
     names = {app_id: _bat_safe(_display_name_of(source, app_id)) for app_id in apps}
     for app_id in apps:
         (tools / f"admin-{app_id}.bat").write_text(
-            _ADMIN_BAT.format(app_id=app_id, display_name=names[app_id]), encoding="utf-8")
+            _ADMIN_BAT.format(app_id=app_id, display_name=names[app_id],
+                              pick_python=_pick_python("admin")), encoding="utf-8")
 
     if len(apps) == 1:
         (tools / "admin.bat").write_text(
@@ -917,6 +1079,17 @@ def build_into_store(request: BuildRequest, root: Path, *, version: str,
         _check_cancel(should_cancel)
         fingerprint, reused = ensure_runtime(root, request, pins, progress)
 
+        # THE GATE. Unconditional — built or reused. On the reuse path
+        # ensure_runtime() above wrote nothing at all, so this still runs before
+        # anything exists on disk; on the build path it runs against the runtime
+        # that was just installed. Either way it is BEFORE _build_version_dir(),
+        # so a failure here cannot leave a version directory behind, let alone a
+        # version directory wearing a .complete (which would be immutable, and
+        # shippable, and broken on the first render).
+        _check_cancel(should_cancel)
+        warnings.extend(check_app_imports(root, request, fingerprint,
+                                          reused=reused, progress=progress))
+
         _check_cancel(should_cancel)
         shell_fingerprint = ensure_shell(root, request.shell_exe, progress)
 
@@ -994,6 +1167,35 @@ def build_into_store(request: BuildRequest, root: Path, *, version: str,
 
 
 # ── exports ──────────────────────────────────────────────────────────────────
+
+def _copy_with_progress(src: Path, dst: Path, *, ignore, say: Progress,
+                        label: str) -> None:
+    """copytree, but it says something while it works.
+
+    A shared runtime is ~457 MB and a fat one is more; copying it is a minute or
+    more of a progress bar that cannot move and a console that says nothing. An
+    operator watching an export that has printed one line and then gone quiet for
+    ninety seconds does not conclude "it is copying", they conclude "it has hung"
+    — and they kill it, half-copied, which is the one state everything downstream
+    is built to distrust.
+    """
+    total = _directory_size(src) or 1
+    seen = {"bytes": 0, "next": 0.10}
+
+    def copy(source, target):
+        shutil.copy2(source, target)
+        try:
+            seen["bytes"] += Path(target).stat().st_size
+        except OSError:                       # a size we cannot read is not fatal
+            pass
+        fraction = seen["bytes"] / total
+        if fraction >= seen["next"]:
+            seen["next"] = fraction + 0.10
+            say(f"{label} {min(fraction, 1.0) * 100:.0f}%"
+                f"({seen['bytes'] / 1024 ** 2:.0f}/{total / 1024 ** 2:.0f} MB)")
+
+    shutil.copytree(src, dst, ignore=ignore, dirs_exist_ok=True, copy_function=copy)
+
 
 def _ignore_staging(_dir: str, names: list[str]) -> set[str]:
     return {n for n in names if n.startswith(".staging-")}
@@ -1105,8 +1307,9 @@ def export_full_tree(root: Path, out_dir: Path, *, app_id: str | None = None,
             raise StoreBuildError(
                 f"這棵樹缺共用 runtime {fingerprint},交付出去會啟動不了:{source}")
         say(f"複製共用 runtime {fingerprint}(數百 MB,只有第一次要傳)…")
-        shutil.copytree(source, out / "deps" / "runtimes" / fingerprint,
-                        ignore=_ignore_staging_and_sentinel, dirs_exist_ok=True)
+        _copy_with_progress(source, out / "deps" / "runtimes" / fingerprint,
+                            ignore=_ignore_staging_and_sentinel, say=say,
+                            label=f"  runtime {fingerprint}")
     for fingerprint in sorted(shell_fps):
         source = sstore.path_for(fingerprint)
         if not source.is_dir():
@@ -1162,6 +1365,49 @@ def _previous_manifest(paths: AppPaths, version: str) -> dict | None:
     return others[-1][2]
 
 
+def _runtime_changes(previous: dict, manifest: dict) -> list[str]:
+    """What a machine on `previous` would be missing if it only got the version."""
+    changed = []
+    if previous.get("runtime_fingerprint") != manifest.get("runtime_fingerprint"):
+        changed.append(f"Python 相依指紋:{previous.get('runtime_fingerprint')}"
+                       f" -> {manifest.get('runtime_fingerprint')}")
+    if previous.get("shell_fingerprint") != manifest.get("shell_fingerprint"):
+        changed.append(f"Tauri 殼:{previous.get('shell_fingerprint')}"
+                       f" -> {manifest.get('shell_fingerprint')}")
+    return changed
+
+
+def update_needs_runtime(root: Path, app_id: str, version: str) -> bool:
+    """Would this update package have to carry the ~457 MB shared runtime?
+
+    The polite question, asked BEFORE the export. export_update() also refuses an
+    incremental package whose runtime moved (that raise stays: it is the safety
+    net, and it fires no matter who calls), but an exception is a terrible way to
+    learn something the GUI could simply have ticked a box about — the operator
+    picks a destination folder, waits, and is then told the thing they chose was
+    never possible.
+
+    True  — send the runtime. Either the fingerprints really did move, or there
+            is nothing in this store to compare against and "include it" is the
+            answer that always works.
+    False — the previous version of this same app already carries a byte-identical
+            runtime AND shell, so the target machine has them: ~17 MB will do.
+
+    Never raises. A tree we cannot read answers True, because the cost of being
+    wrong that way is bandwidth, and the cost of being wrong the other way is a
+    machine that installs an update, fails to start, and rolls back — forever.
+    """
+    try:
+        paths = AppPaths(Path(root), app_id)
+        manifest = json.loads((paths.version_dir(version) / MANIFEST_NAME).read_text("utf-8"))
+        previous = _previous_manifest(paths, version)
+    except Exception:                      # noqa: BLE001 - a question, not a gate
+        return True
+    if previous is None:
+        return True
+    return bool(_runtime_changes(previous, manifest))
+
+
 def export_update(root: Path, app_id: str, version: str, out_dir: Path,
                   *, include_runtime: bool | None = None,
                   progress: Progress | None = None) -> ExportResult:
@@ -1188,18 +1434,14 @@ def export_update(root: Path, app_id: str, version: str, out_dir: Path,
     if include_runtime is False:
         previous = _previous_manifest(paths, version)
         if previous is not None:
-            changed = []
-            if previous.get("runtime_fingerprint") != fingerprint:
-                changed.append(f"Python 相依指紋:{previous.get('runtime_fingerprint')}"
-                               f" -> {fingerprint}")
-            if previous.get("shell_fingerprint") != shell_fp:
-                changed.append(f"Tauri 殼:{previous.get('shell_fingerprint')} -> {shell_fp}")
+            changed = _runtime_changes(previous, manifest)
             if changed:
                 raise StoreBuildError(
                     "這一版換了 Python 相依(或殼),增量包不夠,必須勾選「包含 runtime」。\n"
                     + f"  (跟上一版 {previous.get('version')} 相比)\n"
                     + "".join(f"  · {line}\n" for line in changed)
-                    + "  只送版本的話,目標機器會裝好、啟動失敗、然後自動退回舊版。")
+                    + "  只送版本的話,目標機器會裝好、啟動失敗、然後自動退回舊版。\n"
+                    + "  (要事先問而不是撞到這個錯誤,用 update_needs_runtime()。)")
 
     want_deps = include_runtime is None or include_runtime
     out_app = Path(out_dir) / app_id
@@ -1209,19 +1451,23 @@ def export_update(root: Path, app_id: str, version: str, out_dir: Path,
     # that files.json still declares, and every export then failed integrity on
     # the target with "重新複製" advice that could never work.
     say(f"複製版本 {version} …")
-    shutil.copytree(vdir, out_app / "versions" / version,
-                    ignore=_ignore_staging_and_sentinel, dirs_exist_ok=True)
+    _copy_with_progress(vdir, out_app / "versions" / version,
+                        ignore=_ignore_staging_and_sentinel, say=say,
+                        label=f"  版本 {version}")
     if want_deps:
-        say(f"複製共用 runtime {fingerprint} …")
+        say(f"複製共用 runtime {fingerprint}(數百 MB,請等它跑完)…")
         runtime_dir = RuntimeStore(paths.deps_dir).path_for(fingerprint)
-        shutil.copytree(runtime_dir, out_app / "runtimes" / fingerprint,
-                        ignore=_ignore_staging_and_sentinel, dirs_exist_ok=True)
+        _copy_with_progress(runtime_dir, out_app / "runtimes" / fingerprint,
+                            ignore=_ignore_staging_and_sentinel, say=say,
+                            label=f"  runtime {fingerprint}")
         # The shell is shared too: a target machine that has never seen this shell
         # would otherwise install the version and then fail to open a window.
         if shell_fp:
+            say(f"複製共用 Tauri 殼 {shell_fp} …")
             shell_dir = ShellStore(paths.deps_dir).path_for(shell_fp)
-            shutil.copytree(shell_dir, out_app / "shells" / shell_fp,
-                            ignore=_ignore_staging_and_sentinel, dirs_exist_ok=True)
+            _copy_with_progress(shell_dir, out_app / "shells" / shell_fp,
+                                ignore=_ignore_staging_and_sentinel, say=say,
+                                label=f"  殼 {shell_fp}")
 
     files_manifest = (vdir / integrity.FILES_NAME).read_bytes()
     revision = hashlib.sha256(files_manifest).hexdigest()[:12]

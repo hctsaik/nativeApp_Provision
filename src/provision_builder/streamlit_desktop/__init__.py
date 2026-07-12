@@ -12,6 +12,7 @@ from .store_builder import (
     build_into_store,
     export_full_tree,
     export_update,
+    update_needs_runtime,
 )
 from .discover import (
     Detected,
@@ -22,7 +23,7 @@ from .discover import (
     suggest_name,
 )
 from .models import BuildRequest, BuildResult, app_id_for, slugify
-from .validate import declared_packages, validate_request
+from .validate import declared_packages, validate_request, warnings_for
 
 __all__ = [
     "BuildRequest",
@@ -44,5 +45,7 @@ __all__ = [
     "slugify",
     "smoke_test",
     "suggest_name",
+    "update_needs_runtime",
     "validate_request",
+    "warnings_for",
 ]

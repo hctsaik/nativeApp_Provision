@@ -56,30 +56,42 @@ def _noop(_message: str) -> None:
 # was told 700 MB and got 640 MB, and neither number could be trusted. One rule,
 # one answer.
 
-def ignore_reason(name: str, is_dir: bool, extra: Sequence[str] = ()) -> str | None:
-    """Why this entry is excluded, as a label for the report — or None to keep it."""
+def ignore_reason(name: str, is_dir: bool, extra: Sequence[str] = (),
+                  rel: str | None = None) -> str | None:
+    """Why this entry is excluded, as a label for the report — or None to keep it.
+
+    `rel` is the entry's path relative to the project root (posix). Patterns that
+    contain a slash are matched against it; patterns without one are matched
+    against the bare name, at any depth. That is what gitignore does, and getting
+    it wrong here is not a cosmetic bug — see _matches_ignore.
+    """
     if is_dir and name in EXCLUDED_DIRS:
         return f"{name}/"
     for pattern in EXCLUDED_FILES:                 # `*.egg-info` is a DIRECTORY: match both
         if fnmatch(name, pattern):
             return pattern
     for pattern in extra:
-        if _matches_ignore(pattern, name, is_dir):
-            return f"{pattern}(.provisionignore)"
+        if _matches_ignore(pattern, name, is_dir, rel):
+            return f"{pattern}(排除樣式)"
     return None
 
 
-def should_ignore(name: str, is_dir: bool, extra: Sequence[str] = ()) -> bool:
+def should_ignore(name: str, is_dir: bool, extra: Sequence[str] = (),
+                  rel: str | None = None) -> bool:
     """The single source of truth for 'does this entry travel into the package'."""
-    return ignore_reason(name, is_dir, extra) is not None
+    return ignore_reason(name, is_dir, extra, rel) is not None
 
 
-def _matches_ignore(pattern: str, name: str, is_dir: bool) -> bool:
-    """gitignore-flavoured, fnmatch-powered: `wheels/`, `*.mp4`, `notes.txt`.
+def _matches_ignore(pattern: str, name: str, is_dir: bool, rel: str | None = None) -> bool:
+    """gitignore-flavoured, fnmatch-powered: `wheels/`, `*.mp4`, `data/*`, `notes.txt`.
 
-    Patterns are matched against the entry NAME, so a pattern with a path in it
-    (`data/raw/`) is honoured by its last segment. Negation (`!`) is not
-    supported — say so rather than pretend.
+    A pattern containing a slash is a PATH pattern and is matched against the
+    entry's path relative to the project root. It used to be collapsed to its last
+    segment — so `data/*` became `*`, `fnmatch(anything, "*")` was True, and one
+    exclude pattern silently excluded every file in the project. The build still
+    "succeeded": it shipped a package with no application code in it.
+
+    Negation (`!`) is not supported — we say so rather than pretend.
     """
     pattern = pattern.strip()
     if not pattern or pattern.startswith(("#", "!")):
@@ -88,11 +100,22 @@ def _matches_ignore(pattern: str, name: str, is_dir: bool) -> bool:
     pattern = pattern.rstrip("/")
     if pattern.startswith("./"):
         pattern = pattern[2:]
-    if "/" in pattern:
-        pattern = pattern.rsplit("/", 1)[-1]
     if not pattern or (dir_only and not is_dir):
         return False
-    return fnmatch(name, pattern)
+
+    if "/" not in pattern:                    # bare name: matches at any depth
+        return fnmatch(name, pattern)
+
+    # Path pattern. Without a relative path we cannot honestly evaluate it, and
+    # guessing (the old behaviour) is what deleted everything — so we keep the
+    # entry and let the caller that DOES know the path decide.
+    if rel is None:
+        return False
+    target = rel.replace("\\", "/").lstrip("./")
+    if fnmatch(target, pattern):
+        return True
+    # `data/*` should also drop everything beneath data/, not just its children.
+    return fnmatch(target, pattern.rstrip("*").rstrip("/") + "/*")
 
 
 def ignore_patterns_for(request: BuildRequest) -> tuple[str, ...]:
@@ -107,12 +130,26 @@ def ignore_patterns_for(request: BuildRequest) -> tuple[str, ...]:
     return tuple(patterns)
 
 
-def copytree_ignore(extra: Sequence[str] = ()):
-    """The `ignore=` callable for shutil.copytree, driven by should_ignore()."""
+def copytree_ignore(extra: Sequence[str] = (), root: Path | None = None):
+    """The `ignore=` callable for shutil.copytree, driven by should_ignore().
+
+    `root` is the project root, so a path pattern (`data/*`) can be evaluated
+    against where the entry actually sits rather than guessed from its name.
+    """
     def ignore(directory, names):
         base = Path(directory)
-        return {name for name in names
-                if should_ignore(name, (base / name).is_dir(), extra)}
+        dropped = set()
+        for name in names:
+            entry = base / name
+            rel = None
+            if root is not None:
+                try:
+                    rel = entry.relative_to(root).as_posix()
+                except ValueError:
+                    rel = None
+            if should_ignore(name, entry.is_dir(), extra, rel):
+                dropped.add(name)
+        return dropped
     return ignore
 
 
@@ -169,11 +206,17 @@ def scan_project(request: BuildRequest, big_file_mb: int = 10,
     big_files: list[tuple[str, int]] = []
     excluded: dict[str, int] = {}
 
+    def _rel(path: Path) -> str | None:
+        try:
+            return path.relative_to(root).as_posix()
+        except ValueError:
+            return None
+
     for dirpath, dirnames, filenames in os.walk(root):
         here = Path(dirpath)
         keep_dirs = []
         for name in dirnames:
-            reason = ignore_reason(name, True, extra)
+            reason = ignore_reason(name, True, extra, _rel(here / name))
             if reason is None:
                 keep_dirs.append(name)
             else:
@@ -186,7 +229,7 @@ def scan_project(request: BuildRequest, big_file_mb: int = 10,
                 size = path.stat().st_size
             except OSError:
                 continue
-            reason = ignore_reason(name, False, extra)
+            reason = ignore_reason(name, False, extra, _rel(path))
             if reason is not None:
                 excluded[reason] = excluded.get(reason, 0) + size
                 continue
@@ -344,7 +387,7 @@ def build(request: BuildRequest, progress: Progress = _noop,
         progress("複製 Streamlit 專案…")
         shutil.copytree(
             request.project_dir, staging / "application",
-            ignore=copytree_ignore(ignore_patterns_for(request)),
+            ignore=copytree_ignore(ignore_patterns_for(request), request.project_dir),
             dirs_exist_ok=True,
         )
 

@@ -115,6 +115,56 @@ def _searchable_py(project: Path, max_depth: int = 3):
         yield path
 
 
+# The GUI's two tabs, named exactly as the operator reads them. A rescue hint that
+# says "the other tab" and makes them go looking for it is half a rescue.
+CIM_TAB = "CIM 平台模組（需 plugin.yaml）"
+STREAMLIT_TAB = "Streamlit 專案 → 桌面 App"
+
+PLUGIN_MANIFEST = "plugin.yaml"
+# ANnoTation keeps its 18 plugin.yaml files at modules/module_XXX/plugin.yaml, so
+# a top-level-only look finds nothing and the operator is told, with total
+# confidence, to pick one of 18 CIM module scripts as a Streamlit entry point.
+_PLUGIN_GLOBS = (PLUGIN_MANIFEST, f"*/{PLUGIN_MANIFEST}", f"*/*/{PLUGIN_MANIFEST}",
+                 f"*/*/*/{PLUGIN_MANIFEST}")
+
+
+def find_plugin_manifests(project: Path, limit: int = 50) -> list[Path]:
+    """The plugin.yaml files under `project`: the signature of a CIM module
+    collection. Bounded (globs, a few levels, a cap) because this runs on every
+    folder the operator picks, including a 40 GB one they picked by mistake."""
+    project = Path(project)
+    if not project.is_dir():
+        return []
+    found: list[Path] = []
+    for pattern in _PLUGIN_GLOBS:
+        try:
+            for hit in sorted(project.glob(pattern)):
+                if any(part in SKIPPED_DIRS or part.startswith(".")
+                       for part in hit.relative_to(project).parts[:-1]):
+                    continue
+                found.append(hit)
+                if len(found) >= limit:
+                    return found
+        except OSError:
+            break
+    return found
+
+
+def wrong_tab_hint(project: Path) -> str:
+    """"這裡沒有 Streamlit 入口" is true and useless when the operator has pointed
+    a CIM module collection at the Streamlit tab. Say what the folder IS, and name
+    the tab that wants it — the CIM tab has done this for Streamlit projects since
+    day one, and the courtesy was never returned."""
+    hits = find_plugin_manifests(project)
+    if not hits:
+        return ""
+    example = hits[0].relative_to(Path(project)).as_posix()
+    count = f"{len(hits)} 個" if len(hits) < 50 else "很多"
+    return (f"\n這個資料夾底下有 {count} plugin.yaml(例:{example}),"
+            f"看起來是 CIM 平台模組集合,不是 Streamlit 專案。\n"
+            f"請改用「{CIM_TAB}」分頁,把「平台專案」指到這裡。")
+
+
 def _is_streamlit_app(path: Path) -> bool:
     """Imports streamlit AND looks like a page, not a helper module: a Streamlit
     entry script calls st.<something> at module level (title/write/set_page_config…)."""
@@ -151,7 +201,8 @@ def find_entrypoint(project: Path) -> Detected:
         if len(rivals) > 1:
             names = "、".join(p.relative_to(project).as_posix() for p in rivals[:4])
             return Detected(None, "有多個候選",
-                            hint=f"找到多個同名入口({names}…),請自行指定。")
+                            hint=f"找到多個同名入口({names}…),請自行指定。"
+                                 + wrong_tab_hint(project))
         return Detected(best, f"自動偵測:{best.relative_to(project).as_posix()}")
 
     apps = [p for p in candidates if _is_streamlit_app(p)]
@@ -159,10 +210,18 @@ def find_entrypoint(project: Path) -> Detected:
         rel = apps[0].relative_to(project).as_posix()
         return Detected(apps[0], f"自動偵測:{rel}(唯一會算繪畫面的 Streamlit 檔案)")
     if len(apps) > 1:
+        # ANnoTation lands HERE, not in the "no streamlit at all" branch below: its
+        # 18 CIM modules each import streamlit, so we confidently offered the
+        # operator four of them to choose an entry point from — on the wrong tab,
+        # for a project that has no single app to build. Both dead ends need the
+        # way out, not just the empty one.
         names = "、".join(p.relative_to(project).as_posix() for p in apps[:4])
         return Detected(None, "有多個候選",
-                        hint=f"找到多個可能的入口({names}…),請用「瀏覽…」自行指定。")
-    return Detected(None, "找不到", hint="這個資料夾裡沒有 import streamlit 的 .py,請確認選對專案。")
+                        hint=f"找到多個可能的入口({names}…),請用「瀏覽…」自行指定。"
+                             + wrong_tab_hint(project))
+    return Detected(None, "找不到",
+                    hint="這個資料夾裡沒有 import streamlit 的 .py,請確認選對專案。"
+                         + wrong_tab_hint(project))
 
 
 def suggest_name(project: Path) -> str:

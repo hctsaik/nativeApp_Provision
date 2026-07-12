@@ -119,6 +119,48 @@ def test_editable_and_local_path_lines_never_reach_pip(tmp_path):
     assert any("不能在別台機器安裝" in line for line in dropped)   # and we said so
 
 
+def test_a_vcs_dependency_is_not_dropped_as_if_it_were_the_project_itself(tmp_path):
+    """`-e .` and `-e git+https://…/internal-lib.git` were dropped by the same
+    branch, under the same message: 「專案自己的原始碼會直接打包進去」. For `-e .`
+    that is true. For the git one it is a lie — internal-lib is somebody else's
+    package, it is now simply ABSENT from the delivery, and the operator was told
+    the opposite. Name the line, say why it cannot travel, say what to do."""
+    lock = tmp_path / "requirements.txt"
+    lock.write_text(
+        "streamlit==1.40.0\n"
+        "-e .\n"
+        "-e git+https://github.com/acme/internal-lib.git#egg=internal-lib\n",
+        encoding="utf-8")
+
+    said: list[str] = []
+    for_pip = req_mod.sanitize_for_pip(lock, tmp_path / "staging", progress=said.append)
+    body = for_pip.read_text("utf-8")
+    assert "git+" not in body and "-e ." not in body       # pip never sees either
+    assert "streamlit==1.40.0" in body
+
+    message = "\n".join(said)
+    assert "internal-lib.git" in message                    # WHICH line
+    assert "git" in message and "連網" in message           # WHY it cannot travel
+    assert "pip wheel" in message and "==" in message       # WHAT to do instead
+    # and the honest line about the project's own source is not claimed for it
+    project_note = [s for s in said if "專案自己的原始碼" in s]
+    assert project_note and "internal-lib" not in "".join(project_note)
+    message.encode("cp950")
+
+
+def test_a_project_with_no_declarations_is_pointed_at_the_lock_file_field(tmp_path):
+    """"需要 requirements.txt" leaves an operator who HAS a lock file — just not in
+    this folder — with nowhere to put it. The GUI grew a 「進階設定 → 相依 lock 檔」
+    field for exactly this; the error that sends them looking must name it."""
+    with pytest.raises(req_mod.RequirementsError) as exc:
+        req_mod.resolve(tmp_path)
+
+    message = str(exc.value)
+    assert "進階設定" in message and "相依 lock 檔" in message
+    assert "pip freeze" in message
+    message.encode("cp950")
+
+
 def test_optional_dependency_groups_can_be_opted_in(tmp_path):
     """AI4BI's real shape: `anthropic` sits in an `llm` extra and is imported
     lazily. An admin who wants the LLM path must be able to ask for it."""
