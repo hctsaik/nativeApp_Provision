@@ -164,9 +164,16 @@ def main() -> int:
     out = subprocess.run([sys.executable, str(tree / "bootstrap" / "gc.py")],
                          capture_output=True, text=True, encoding="cp950",
                          errors="replace", env=env)
-    print(f"    exit={out.returncode}  輸出 {len(out.stdout.splitlines())} 行"
+    # 0 = 有東西可回收(dry-run 列出來了);6 = 這棵樹是乾淨的,沒有可回收的項目。
+    # 這兩件事必須分得開——以前它們都是 0,於是「一個位元組都沒回收」也會印出
+    # 「回收完成。上面列出的項目都已經刪掉了。」
+    meaning = {0: "有可回收的項目", 6: "沒有可回收的項目(乾淨的樹)"}
+    print(f"    exit={out.returncode}({meaning.get(out.returncode, '未預期')})"
+          f"  輸出 {len(out.stdout.splitlines())} 行"
           f"  UnicodeEncodeError={'UnicodeEncodeError' in out.stderr}")
-    assert out.returncode == 0 and "UnicodeEncodeError" not in out.stderr
+    assert out.returncode in meaning, f"GC 回了未預期的碼 {out.returncode}"
+    assert "UnicodeEncodeError" not in out.stderr, "GC 在 cp950 主控台上崩潰了"
+    assert "都已經刪掉" not in out.stdout, "空計畫卻宣稱刪掉了東西"
 
     print("\n全部通過。交付樹:", tree)
     return 0

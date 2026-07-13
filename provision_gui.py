@@ -122,6 +122,7 @@ class ProvisionApp(tk.Tk):
         self.sd_lock_var = tk.StringVar()      # 指定 lock 檔（兩個 App 想共用 runtime 就靠它）
         self.sd_exclude_var = tk.StringVar()   # 額外排除樣式，分號分隔
         self.sd_extras_var = tk.StringVar()    # pyproject 的 optional-dependencies 群組
+        self.sd_app_id_var = tk.StringVar()    # 應用代號（中文名字推不出代號時必填）
         self.sd_webview2_var = tk.StringVar()  # WebView2 離線安裝檔（無網目標機必備）
         self.sd_deliver_version_var = tk.StringVar()   # 要交付/更新的是哪一版
         self.sd_store_var = tk.BooleanVar(value=False)
@@ -317,8 +318,19 @@ class ProvisionApp(tk.Tk):
                                     "也可以在專案根目錄放 .provisionignore）",
                   foreground="#666", wraplength=520, justify="left").pack(side="left", padx=(8, 0))
 
+        # 應用代號:同一棵 Store 樹上的身分證。兩個中文名字的 App 以前會推導出
+        # 同一個代號(都變成 app-streamlit-app),第二個建置會被誤診成「版本衝突」,
+        # 照著提示改版號 = 把產線上的 A 換成另一個程式。現在推不出來就直接要求填。
+        appid_row = ttk.Frame(self.sd_advanced)
+        appid_row.grid(row=len(advanced_rows) + 2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        ttk.Label(appid_row, text="應用代號").pack(side="left")
+        ttk.Entry(appid_row, textvariable=self.sd_app_id_var, width=30).pack(side="left", padx=(8, 0))
+        ttk.Label(appid_row, text="（同一棵 Store 樹上的唯一識別，例：image-viewer。"
+                                  "留空 = 依應用名稱自動產生；名稱沒有英數字時必填）",
+                  foreground="#666", wraplength=520, justify="left").pack(side="left", padx=(8, 0))
+
         extras_row = ttk.Frame(self.sd_advanced)
-        extras_row.grid(row=len(advanced_rows) + 2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        extras_row.grid(row=len(advanced_rows) + 3, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         ttk.Label(extras_row, text="選用相依群組").pack(side="left")
         ttk.Entry(extras_row, textvariable=self.sd_extras_var, width=30).pack(side="left", padx=(8, 0))
         ttk.Label(extras_row, text="（pyproject 的 [project.optional-dependencies]，逗號分隔，"
@@ -328,7 +340,7 @@ class ProvisionApp(tk.Tk):
         # WebView2 是這整個交付包裡「唯一」需要事先裝在目標機上的東西。無網工廠機
         # 沒有它就開不起來，而我們的自救 bat 需要這個離線安裝檔——不附，那條路是死的。
         wv_row = ttk.Frame(self.sd_advanced)
-        wv_row.grid(row=len(advanced_rows) + 3, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        wv_row.grid(row=len(advanced_rows) + 4, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         ttk.Label(wv_row, text="WebView2 離線安裝檔").pack(side="left")
         ttk.Entry(wv_row, textvariable=self.sd_webview2_var, width=30).pack(side="left", padx=(8, 0))
         ttk.Button(wv_row, text="瀏覽…", command=self._browse_webview2).pack(side="left", padx=(4, 0))
@@ -337,7 +349,7 @@ class ProvisionApp(tk.Tk):
                   foreground="#666", wraplength=460, justify="left").pack(side="left", padx=(8, 0))
 
         port_row = ttk.Frame(self.sd_advanced)
-        port_row.grid(row=len(advanced_rows) + 4, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        port_row.grid(row=len(advanced_rows) + 5, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         ttk.Label(port_row, text="偏好連接埠").pack(side="left")
         ttk.Entry(port_row, textvariable=self.sd_port_var, width=8).pack(side="left", padx=(8, 0))
         ttk.Label(port_row, text="（0 = 每次啟動隨機挑一個 8000–9000 之間、確認沒被占用的埠；"
@@ -688,7 +700,9 @@ class ProvisionApp(tk.Tk):
         extra = tuple(p.strip() for p in self.sd_exclude_var.get().split(";") if p.strip())
         extras = tuple(e.strip() for e in self.sd_extras_var.get().split(",") if e.strip())
         webview2 = self.sd_webview2_var.get().strip()
+        app_id = self.sd_app_id_var.get().strip()
         return BuildRequest(
+            app_id_override=app_id or None,
             project_dir=Path(project),
             entrypoint=Path(entry),
             display_name=self.sd_name_var.get().strip(),
@@ -815,6 +829,27 @@ class ProvisionApp(tk.Tk):
         沒有 start.bat、沒有 state/——目標機拿到一個永遠打不開的資料夾。"""
         if not (self._sd_last_store and self._sd_last_app):
             return
+
+        # 這棵樹上不只一個 App 時,「完整交付」要問清楚:只給這一個,還是整棵樹?
+        # export_full_tree(app_id=None) 一直做得對,只是 GUI 從來沒有地方能按到它。
+        whole_tree = False
+        if full:
+            try:
+                apps = list_store_apps(self._sd_last_store)
+            except Exception:
+                apps = []
+            if len(apps) > 1:
+                names = "、".join(a["app_id"] for a in apps)
+                answer = messagebox.askyesnocancel(
+                    "這棵樹上有多個 App",
+                    f"這棵 Store 樹上有 {len(apps)} 個 App：{names}\n\n"
+                    "【是】整棵樹一起交付（目標機一次拿到全部，共用同一份 runtime）\n"
+                    f"【否】只交付「{self._sd_last_app}」這一個\n"
+                    "【取消】不匯出")
+                if answer is None:
+                    return
+                whole_tree = bool(answer)
+
         # 使用者在下拉裡選的那一版才算數（預設是最新的完整版本，不是 state.current）。
         chosen = self.sd_deliver_version_var.get().strip() or self._sd_last_version
         if not chosen:
@@ -858,8 +893,16 @@ class ProvisionApp(tk.Tk):
         def work() -> None:
             try:
                 if full:
-                    result = export_streamlit_full(store, Path(out), app_id=app_id,
-                                                   progress=say)
+                    # version= 一定要傳。少了它,export_full_tree 會回頭去交付
+                    # state.current——也就是產線「已經在跑」的那一版。管理員在下拉裡
+                    # 選了 v1.1.0、按下匯出、走一趟工廠,裝上去的還是 v1.0.0。
+                    # (而且工具自己的警告會叫他「請改指定版本」,但 GUI 裡唯一能指定的
+                    #  地方,就是這個被忽略掉的下拉。)
+                    result = export_streamlit_full(
+                        store, Path(out),
+                        app_id=None if whole_tree else app_id,
+                        version=None if whole_tree else version,
+                        progress=say)
                 else:
                     # include_runtime 是上面問過使用者的答案。這裡曾經硬寫 False，
                     # 於是「這一版換了相依，要含 runtime 嗎？」問了、答了、然後被忽略——
@@ -886,16 +929,48 @@ class ProvisionApp(tk.Tk):
             return
         reclaimable = plan.reclaimable_mb()
         if reclaimable < 1:
-            messagebox.showinfo("沒有可回收的項目", "沒有任何未被引用的版本或 runtime。")
+            note = ""
+            if getattr(plan, "self_hosted", None):
+                # 「沒有東西可回收」跟「唯一能回收的那份,正是我腳下這一份」是兩件事。
+                note = ("\n\n不過:GC 正在用 " + str(plan.self_hosted) +
+                        " 這份 runtime 執行,\n所以它自己即使沒被引用也不會被刪除。\n"
+                        "要回收它,請改用另一份 runtime 的 python.exe 重跑一次。")
+            messagebox.showinfo("沒有可回收的項目",
+                                "沒有任何未被引用的版本或 runtime。" + note)
             return
         if not messagebox.askyesno(
                 "確認回收",
                 f"可回收 {reclaimable:.0f} MB（詳見紀錄區）。\n\n"
                 "只會刪除「沒有任何版本槽、也沒有執行中實例」引用的項目。\n確定要刪除嗎？"):
             return
-        streamlit_gc(self._sd_last_store, apply=True,
-                     log=lambda line: self._append_desktop_log(str(line)))
-        messagebox.showinfo("回收完成", f"已回收約 {reclaimable:.0f} MB。")
+
+        # 報「實際刪掉了什麼」,不是報「本來打算刪什麼」。上一版把 apply 的回傳值
+        # 直接丟掉,拿 dry-run 的預測值去跳「已回收約 480 MB」——即使一個檔案都沒刪掉
+        # (檔案被 App 佔用是最常見的情況,而那正是現場 IT 最需要知道的事)。
+        try:
+            done = streamlit_gc(self._sd_last_store, apply=True,
+                                log=lambda line: self._append_desktop_log(str(line)))
+        except Exception as exc:  # GUI 邊界
+            messagebox.showerror("回收失敗", str(exc))
+            return
+
+        freed = done.reclaimed_mb() if hasattr(done, "reclaimed_mb") else 0.0
+        failures = list(getattr(done, "failures", ()) or ())
+        if failures:
+            detail = "\n".join(f"　·　{f}" for f in failures[:5])
+            messagebox.showwarning(
+                "部分回收",
+                f"實際回收了 {freed:.0f} MB（本來預估 {reclaimable:.0f} MB）。\n\n"
+                f"這些刪不掉,空間沒有回收:\n{detail}\n\n"
+                "最常見的原因是 App 正在執行中佔住檔案。\n"
+                "請關掉所有用到這棵樹的 App,再回收一次。")
+        elif freed < 1:
+            messagebox.showwarning(
+                "沒有回收到空間",
+                "雖然列出了可回收的項目，但實際上一個位元組都沒有釋放。\n"
+                "請查看紀錄區的訊息。")
+        else:
+            messagebox.showinfo("回收完成", f"已回收 {freed:.0f} MB。")
 
     def _start_desktop_check(self) -> None:
         if self._worker and self._worker.is_alive():
@@ -937,6 +1012,15 @@ class ProvisionApp(tk.Tk):
             soft = streamlit_warnings_for(request)
         except Exception:                     # 檢查的附加資訊失敗，不該讓檢查失敗
             soft = []
+        # WebView2 是無網工廠機唯一「裝不起來就開不了」的相依,而離線產線正是這個
+        # 產品存在的理由。這件事要在「還來得及、還很便宜」的時候講——0 秒、建置前,
+        # 而不是等他建完 600MB、走到工廠、才發現自救的那條路是死的。
+        if not request.webview2_installer:
+            soft = list(soft) + [
+                "沒有指定 WebView2 離線安裝檔。目標機若不能上網、又沒裝過 WebView2,"
+                "App 會開不起來(而且當場沒辦法裝)。"
+                "請在「進階設定 → WebView2 離線安裝檔」指定它。"
+                "（已經建好的包也不必重建:把安裝檔複製到包裡的 prereq\\ 底下就行。）"]
         for warning in soft:
             self._append_desktop_log("⚠ " + warning)
 

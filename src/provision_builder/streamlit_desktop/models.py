@@ -6,6 +6,7 @@ tests all speak the same vocabulary.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -81,10 +82,67 @@ EXCLUDED_FILES = (
 PROVISIONIGNORE = ".provisionignore"
 
 
+# The slug of a name with no latin characters at all. It used to be this constant
+# and nothing else, which made it a COLLISION: slugify('影像檢視器') and
+# slugify('報表分析') both returned "streamlit-app", so two different programs got
+# the same app_id (`app-streamlit-app`), the same store folder, the same start bat
+# and the same manifest. The second build then looked like a version collision in
+# the FIRST app — and the operator, following that message, bumped the version and
+# replaced the production line's App A with a completely different program, under
+# App A's name and entry point.
+#
+# The suffix is a digest of the display name, so it is deterministic (the same
+# name always builds into the same app), and two different names practically never
+# meet. It is not pretty — `app-streamlit-app-4f8c1e2a` is not a name anybody wants
+# on a factory PC's start bat — which is exactly why store builds REFUSE it and ask
+# for BuildRequest.app_id_override instead (store_builder._resolve_app_id). Here it
+# is the floor: whatever else happens, two different apps never silently become one.
+SLUG_FALLBACK = "streamlit-app"
+_SLUG_HASH_LEN = 8
+
+# An explicit app id: what store_builder/the GUI accept in BuildRequest.app_id_override.
+# Same shape device/identifiers.py enforces on every path component, plus the `app-`
+# prefix the portal keys its full-height-iframe rendering off.
+APP_ID_RE = re.compile(r"^app-[a-z0-9][a-z0-9._-]{0,90}$")
+
+
+def slug_is_derived(name: str) -> bool:
+    """True when `name` carries no latin character we can build a slug out of, so
+    slugify() had to fall back to a digest. Store builds refuse these (an opaque
+    app_id ends up in folder names, in start-<app_id>.bat and in the operator's
+    hands); fat builds accept them (one package, one folder, no shared namespace)."""
+    return not re.search(r"[a-zA-Z0-9]", name or "")
+
+
 def slugify(name: str) -> str:
-    """A display name -> a filesystem- and tool_id-safe slug."""
-    slug = re.sub(r"[^a-zA-Z0-9]+", "-", name.strip().lower()).strip("-")
-    return slug or "streamlit-app"
+    """A display name -> a filesystem- and tool_id-safe slug.
+
+    A name with no latin characters gets `streamlit-app-<8 hex of the name>`, NOT a
+    shared constant — see SLUG_FALLBACK.
+    """
+    name = (name or "").strip()
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", name.lower()).strip("-")
+    if slug:
+        return slug
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:_SLUG_HASH_LEN]
+    return f"{SLUG_FALLBACK}-{digest}"
+
+
+def normalize_app_id(value: str | None) -> str | None:
+    """An operator-typed app id -> the canonical form, or None when blank.
+
+    Accepts 'image-viewer' as well as 'app-image-viewer': the `app-` prefix is a
+    rendering contract, not something a person should have to remember. Anything
+    that is still not a legal identifier is returned as-is, lowercased — the caller
+    (store_builder._resolve_app_id) validates and reports it in the operator's terms
+    rather than raising out of a dataclass constructor.
+    """
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    return text if text.startswith("app-") else f"app-{text}"
 
 
 def app_id_for(name: str) -> str:
@@ -122,8 +180,17 @@ class BuildRequest:
     # of shipping a folder instead of a URL. Nothing else in the tree ever
     # CREATES prereq/: the store builder only copies one if it already exists.
     webview2_installer: Path | None = None
+    # The app's identity in a store tree, when the display name cannot carry it.
+    # `apps\<app_id>\`, `start-<app_id>.bat`, `tools\admin-<app_id>.bat` and the
+    # manifest's app_id all come from here, and a store keeps versions of an app
+    # under ONE id forever — so for a name like 「影像檢視器」 (no latin characters
+    # to slugify) the operator must name the app themselves rather than get a
+    # digest. None = derive it from display_name (app_id_for).
+    # Blank/prefix-less input is normalized: "image-viewer" -> "app-image-viewer".
+    app_id_override: str | None = None
 
     def __post_init__(self) -> None:
+        self.app_id_override = normalize_app_id(self.app_id_override)
         self.project_dir = Path(self.project_dir).expanduser().resolve()
         self.entrypoint = Path(self.entrypoint).expanduser().resolve()
         self.output_dir = Path(self.output_dir).expanduser().resolve()
@@ -142,10 +209,27 @@ class BuildRequest:
 
     @property
     def app_id(self) -> str:
-        return app_id_for(self.display_name)
+        """The id everything downstream keys off. An explicit one wins: it is the
+        only way two apps whose names share a slug can stay two apps."""
+        return self.app_id_override or app_id_for(self.display_name)
+
+    @property
+    def has_explicit_app_id(self) -> bool:
+        return self.app_id_override is not None
+
+    @property
+    def app_id_is_derived_from_a_nameless_slug(self) -> bool:
+        """No explicit id AND nothing latin in the display name to derive one from:
+        the id is a digest. Legal, unique — and unreadable, so a store refuses it."""
+        return not self.has_explicit_app_id and slug_is_derived(self.display_name)
 
     @property
     def package_dir(self) -> Path:
+        # Fat mode: the folder is named after the app, so an explicit app id names
+        # it too (minus the `app-` prefix, which is a portal rendering contract and
+        # means nothing to a folder on a USB stick).
+        if self.app_id_override:
+            return self.output_dir / self.app_id_override[len("app-"):]
         return self.output_dir / slugify(self.display_name)
 
 

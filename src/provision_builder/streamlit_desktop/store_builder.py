@@ -39,6 +39,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import imports as imports_mod
+from . import pages as pages_mod
 from . import requirements as requirements_mod
 from . import runtime as runtime_mod
 from . import builder
@@ -95,6 +96,33 @@ GC_EXIT_OK = gc_mod.EXIT_OK                    # 0: the plan went away (or was e
 GC_EXIT_PARTIAL = gc_mod.EXIT_PARTIAL          # 2: some trees went, some would not
 GC_EXIT_NOTHING = gc_mod.EXIT_NOTHING_DELETED  # 3: zero bytes reclaimed
 GC_EXIT_LOCKED = gc_mod.EXIT_STORE_LOCKED      # 4: an update holds the store lock
+# 6: THERE IS NOTHING TO RECLAIM. A dry run whose plan is empty. Without it the
+# console walked the operator through a deletion that had nothing to delete: it
+# printed the plan (which listed nothing), asked 「以上列出的項目要真的刪除嗎? [y/N]」
+# over a blank list, and then said 「回收完成。上面列出的項目都已經刪掉了。」 — a
+# success message for a run that deleted nothing, on a disk that is just as full.
+# The operator's next move is to go looking for the space they think they freed.
+#
+# getattr, not gc_mod.EXIT_EMPTY_PLAN: the gc.py half of this contract is landing
+# separately. Until it does, gc.py returns 0 for an empty dry run and the :empty
+# branch below is simply never taken (the old behaviour) — but the moment gc.py
+# returns this code, every bat we have already written into a store obeys it.
+GC_EXIT_EMPTY = getattr(gc_mod, "EXIT_EMPTY_PLAN", 6)
+
+# The store's own WebView2 warning. builder.WEBVIEW2_MISSING_WARNING says 「請在建置
+# 時指定」, which in the fat path is the only remedy there is — but in a store the
+# remedy it implies (rebuild) is FORBIDDEN: a completed version directory is
+# immutable, so the operator who follows that advice is told 「版本 v1.0.0 已經在這棵
+# Store 樹裡建過了」 and has nowhere left to go. The real remedy costs nothing and
+# needs no rebuild: drop the .exe into prereq\ — tools\安裝WebView2.bat takes the
+# canonical name OR any .exe it finds there.
+STORE_WEBVIEW2_MISSING_WARNING = (
+    "未附 WebView2 離線安裝檔。目標機若沒有 Microsoft Edge WebView2 Runtime、"
+    f"又不能上網,App 會開不起來(exit {EXIT_SHELL_ENVIRONMENT}),而且當場裝不了。"
+    "不必重建(版本目錄一旦完成就不可變,重建只會被擋下來):"
+    "把 MicrosoftEdgeWebview2Setup.exe 複製到這棵樹的 prereq\\ 底下就行,"
+    f"tools\\{WEBVIEW2_BAT_NAME} 認得那裡的任何 .exe。下載:{WEBVIEW2_DOWNLOAD}"
+)
 
 
 def _noop(_msg: str) -> None:
@@ -143,8 +171,13 @@ class ExportResult:
     generic start.bat is DELETED in favour of start-<app>.bat, and with no field
     to carry that fact the GUI's completion dialog fell back to a hardcoded
     「雙擊 start.bat」. The operator handed the folder to the line and told them to
-    double-click a file that does not exist in it. What is in this list is what
-    was really written into `out_dir`.
+    double-click a file that does not exist in it.
+
+    It is EVERY entry bat the delivered folder ends up with — not just the ones this
+    export wrote. Exporting App B into a folder that already holds App A leaves App A
+    installed and startable, so App A's bat is in this list too (see
+    _export_entry_bats). `apps` stays what THIS export delivered; when the folder
+    holds more than that, `warnings` says so.
     """
     out_dir: Path
     total_mb: float = 0.0
@@ -450,6 +483,14 @@ def _build_version_dir(paths: AppPaths, request: BuildRequest, version: str,
         (staging / "launcher").mkdir()
         for name in ("launch.py", "engine_shim.py"):
             shutil.copy2(TEMPLATES / name, staging / "launcher" / name)
+        # The shared page rules — 「what does Streamlit actually LOAD」 — travel INSIDE
+        # the version, next to launch.py. The device has no provision_builder to
+        # import them from, so launch.py loads this file by path; without it the
+        # launcher refuses to start (LauncherIncomplete, exit 4) rather than run a
+        # preflight that is silently blind to pages\. It lives in the version dir and
+        # not in deps\, so every export (full tree AND update payload) carries it for
+        # free — a version is the unit that has to be self-contained.
+        shutil.copy2(pages_mod.SOURCE, staging / "launcher" / pages_mod.DELIVERED_NAME)
         # No shell/ here: it is shared via deps/shells/<fp>/.
         manifest = build_version_manifest(request, version, fingerprint, shell_fingerprint)
         (staging / MANIFEST_NAME).write_text(
@@ -532,6 +573,16 @@ _MESSAGES: dict[str, str] = {
     "gc-cancelled.txt": "已取消,沒有刪除任何東西。\n",
     "gc-start.txt": "\n=== 開始回收 ===\n",
     "gc-done.txt": "回收完成。上面列出的項目都已經刪掉了。\n",
+    # An EMPTY plan. The console used to run straight past this: it asked
+    # 「以上列出的項目要真的刪除嗎?」 with nothing listed above it, and then printed
+    # 「回收完成。上面列出的項目都已經刪掉了。」 — success, for a run that deleted
+    # nothing. The operator believes they have freed space that was never freed.
+    "gc-empty.txt":
+        "沒有可回收的項目:這棵樹裡的每一個版本、每一份共用 runtime 與 Tauri 殼,"
+        "都還有人在用。\n"
+        "這次「沒有」刪除任何東西,磁碟空間也不會變多,而這是正常的,不用做任何事。\n"
+        "如果上面提到「有一份沒人在用的 runtime 這次回收不掉」,請照那幾行的指示做:\n"
+        "那一份要用另一個 python.exe 重跑才收得掉。\n",
     # The four outcomes gc.py now distinguishes. Each says ONLY what its exit code
     # proves — 「回收失敗,沒有刪掉任何東西,大概是 store 鎖被佔用」 used to be printed
     # over a run that had just reclaimed 400 MB and merely tripped on one folder.
@@ -628,7 +679,11 @@ def _write_messages(root: Path, apps: list[str], *, source: Path) -> None:
 
     bodies = dict(_MESSAGES)
     for app_id in apps:
-        display = _display_name_of(source, app_id)
+        # `source` first (the store we are generating FROM), then the tree itself:
+        # an export writes messages for the apps ALREADY in the destination too, and
+        # those need not exist in the source store at all. Falling straight through
+        # to the app_id would print a machine id where the operator expects a name.
+        display = _stored_display_name(source, app_id) or _display_name_of(root, app_id)
         # A title is expanded into `title %TITLE%`, so it IS parsed by cmd once —
         # strip the characters cmd treats as syntax. The menus are only ever
         # `type`d, so they keep the real name, parens and all.
@@ -853,6 +908,11 @@ rem Capture RC immediately. %errorlevel% inside a ( ) block is expanded when the
 rem block is PARSED, i.e. before the command ran, so it reads the previous value.
 set "RC=%errorlevel%"
 if "%RC%"=="{locked}" goto locked
+rem Nothing to reclaim. Do NOT ask the operator to confirm a deletion of nothing,
+rem and above all do not tell them afterwards that "the items listed above have all
+rem been deleted" - nothing was listed, nothing was deleted, and the disk is exactly
+rem as full as it was.
+if "%RC%"=="{empty}" goto empty
 if not "%RC%"=="0" goto planfailed
 type "messages\gc-confirm.txt" 2>nul
 set "YES="
@@ -867,6 +927,7 @@ rem just reclaimed 400 MB and merely tripped over one folder Explorer had open
 rem reported the same thing as a GC that never started, and blamed a lock that was
 rem not held. gc.py distinguishes them now; this consumes that.
 if "%RC%"=="0" goto done
+if "%RC%"=="{empty}" goto empty
 if "%RC%"=="{partial}" goto partial
 if "%RC%"=="{nothing}" goto nothing
 if "%RC%"=="{locked}" goto locked
@@ -876,6 +937,14 @@ goto failed
 echo.
 echo [gc] OK
 type "messages\gc-done.txt" 2>nul
+popd
+pause
+exit /b 0
+
+:empty
+echo.
+echo [gc] nothing to reclaim
+type "messages\gc-empty.txt" 2>nul
 popd
 pause
 exit /b 0
@@ -1013,6 +1082,9 @@ rem Capture RC immediately: %errorlevel% inside a ( ) block is expanded when the
 rem block is parsed, i.e. before the command ran, so it reads the previous value.
 set "RC=%errorlevel%"
 if "%RC%"=="{gc_locked}" goto rlocked
+rem An empty plan is not a deletion: no y/N prompt over a blank list, and no
+rem "reclaim complete" for a run that had nothing to delete. Chinese: messages\.
+if "%RC%"=="{gc_empty}" goto rempty
 if not "%RC%"=="0" goto rplanfailed
 type "messages\gc-confirm.txt" 2>nul
 set "YES="
@@ -1024,6 +1096,7 @@ set "RC=%errorlevel%"
 rem One code, one outcome: deleted some, deleted none, and lock-held are three
 rem different things, and all three used to print the same sentence.
 if "%RC%"=="0" goto rdone
+if "%RC%"=="{gc_empty}" goto rempty
 if "%RC%"=="{gc_partial}" goto rpartial
 if "%RC%"=="{gc_nothing}" goto rnothing
 if "%RC%"=="{gc_locked}" goto rlocked
@@ -1033,6 +1106,13 @@ goto runknown
 echo.
 echo [admin] OK
 type "messages\gc-done.txt" 2>nul
+pause
+goto menu
+
+:rempty
+echo.
+echo [admin] nothing to reclaim
+type "messages\gc-empty.txt" 2>nul
 pause
 goto menu
 
@@ -1202,9 +1282,14 @@ def _bat_safe(text: str) -> str:
     return " ".join(cleaned.split()) or "App"
 
 
-def _display_name_of(root: Path, app_id: str, default: str | None = None) -> str:
-    """The name to print on THAT app's own bat — read from that app's own manifest,
-    not from whatever build happens to be running right now."""
+def _stored_display_name(root: Path, app_id: str) -> str | None:
+    """What THIS tree already calls `app_id` — the display_name in its own
+    versions\\*\\app-package.json — or None if the tree has never heard of it.
+
+    None and 「叫做 app_id」 are not the same answer, and build_into_store's
+    same-app_id guard turns on the difference: it must be able to tell 「這棵樹裡還
+    沒有這個 app」 from 「這棵樹裡的這個 app 叫別的名字」.
+    """
     paths = AppPaths(Path(root), app_id)
     candidates: list[Path] = []
     try:
@@ -1224,7 +1309,13 @@ def _display_name_of(root: Path, app_id: str, default: str | None = None) -> str
         name = manifest.get("display_name")
         if name:
             return str(name)
-    return default or app_id
+    return None
+
+
+def _display_name_of(root: Path, app_id: str, default: str | None = None) -> str:
+    """The name to print on THAT app's own bat — read from that app's own manifest,
+    not from whatever build happens to be running right now."""
+    return _stored_display_name(root, app_id) or default or app_id
 
 
 def _preferred_port_of(root: Path, apps: list[str]) -> int:
@@ -1241,12 +1332,54 @@ def _preferred_port_of(root: Path, apps: list[str]) -> int:
     return 0
 
 
+def _entry_bat_app(path: Path) -> str | None:
+    """Which app does this start bat start? Read it out of the bat — `--app <id>` is
+    the one thing in there that cannot lie. The FILE NAME cannot answer this:
+    `start.bat` carries no id, and it is exactly the bat a second delivery into the
+    same folder has to reason about."""
+    try:
+        text = Path(path).read_text("utf-8", errors="replace")
+    except OSError:
+        return None
+    match = re.search(r"--app\s+([A-Za-z0-9][A-Za-z0-9._-]*)", text)
+    return match.group(1) if match else None
+
+
+def _entry_map(root: Path, apps: list[str], bats: list[str], *,
+               source: Path | None = None) -> list[tuple[str, str, str]]:
+    """(app_id, display name, the bat that starts THAT app) for every app in the tree.
+
+    With two apps, 「雙擊 start-app-a.bat、start-app-b.bat」 tells a factory operator
+    to double-click both files to start one program. Which bat belongs to which app
+    is knowable, so it gets said.
+    """
+    names = Path(source) if source else Path(root)
+    by_app: dict[str, str] = {}
+    for name in bats:
+        owner = _entry_bat_app(Path(root) / name)
+        if owner is None and len(bats) == 1 and len(apps) == 1:
+            owner = apps[0]              # a one-app tree: start.bat is that app's
+        if owner:
+            by_app[owner] = name
+    return [(a, _stored_display_name(names, a) or _display_name_of(root, a),
+             by_app.get(a, ""))
+            for a in apps]
+
+
 def _write_store_readme(root: Path, apps: list[str], bats: list[str], *,
-                        preferred_port: int = 0) -> None:
+                        preferred_port: int = 0, source: Path | None = None) -> None:
     """The delivered root is otherwise apps\\ deps\\ bootstrap\\ and some .bat files —
     not one word telling the user what to double-click or that a Start button is
     waiting for them. Everything here must be TRUE on the machine that reads it."""
-    entry = bats[0] if len(bats) == 1 else "、".join(bats) if bats else "start.bat"
+    entries = _entry_map(root, apps, bats, source=source)
+    if len(bats) == 1:
+        entry = bats[0]
+    elif bats:
+        # Two apps = two programs = two entry points. Naming them in a list, with no
+        # app beside them, is how an operator ends up double-clicking the wrong one.
+        entry = "「你要開的那個應用」自己的啟動檔(下面有對應表)"
+    else:
+        entry = "start.bat"
     if preferred_port:
         port_lines = [
             f"* 這個應用預設使用 {preferred_port} 埠。",
@@ -1257,15 +1390,30 @@ def _write_store_readme(root: Path, apps: list[str], bats: list[str], *,
         # old README literally read 「若 0 埠被其他程式占用」.
         port_lines = ["* 啟動程式每次會自動挑一個沒被占用的埠,不需手動處理。"]
 
+    # WHICH bat starts WHICH app. In a multi-app folder this is the difference
+    # between an operator starting the app they were sent for and an operator
+    # starting the other one. A one-app folder needs no table: there is one file.
+    if len(entries) > 1:
+        entry_lines = ["", "這個資料夾裡的應用,以及各自的啟動檔", "----------------------------------"]
+        entry_lines += [f"* {display}({app_id}) → 雙擊 {bat or '(這個應用沒有啟動檔,請向提供者反映)'}"
+                        for app_id, display, bat in entries]
+        entry_lines.append("每個應用是各自獨立的程式,啟動檔也各自獨立;共用的 runtime 只是省磁碟,")
+        entry_lines.append("不代表它們是同一支程式。")
+    else:
+        entry_lines = []
+
     lines = [
         "使用方式",
         "========",
         "",
         f"1. 雙擊 {entry}。",
+        *([f"   ({display}=雙擊 {bat})" for _a, display, bat in entries if bat]
+          if len(entries) > 1 else []),
         "   (第一次啟動會先檢查共用元件的完整性,可能要幾分鐘,黑色視窗不要關。)",
         "2. 應用視窗出現後,在上方的「工作流程」下拉選單選好要跑的項目,",
         "   再按旁邊那個寫著 Start 的按鈕(按鈕上是英文 Start,不是中文)。",
         "3. 應用就會顯示在視窗裡。",
+        *entry_lines,
         "",
         "開始之前:WebView2",
         "-----------------",
@@ -1303,7 +1451,7 @@ def _write_store_readme(root: Path, apps: list[str], bats: list[str], *,
         "* 應用視窗一開就關閉,或視窗一片空白:多半是缺 WebView2,見上面那一節。",
         "* 不要直接執行 deps\\shells\\ 底下的 .exe —— 那是元件,不是應用程式入口。",
         "",
-        f"這個資料夾包含的應用:{'、'.join(apps) if apps else '(無)'}",
+        f"這個資料夾包含的應用:{'、'.join(f'{d}({a})' for a, d, _b in entries) or '(無)'}",
         "",
     ]
     (Path(root) / README_NAME).write_text("\n".join(lines), encoding="utf-8")
@@ -1341,7 +1489,8 @@ def _write_tools(root: Path, apps: list[str] | None = None, *,
 
     _write_bat(tools / "gc.bat",
                _GC_BAT.format(pick_python=_pick_python("gc"), partial=GC_EXIT_PARTIAL,
-                              nothing=GC_EXIT_NOTHING, locked=GC_EXIT_LOCKED))
+                              nothing=GC_EXIT_NOTHING, locked=GC_EXIT_LOCKED,
+                              empty=GC_EXIT_EMPTY))
     _write_bat(tools / WEBVIEW2_BAT_NAME,
                _WEBVIEW2_BAT.format(webview2_check=_webview2_check(),
                                     installer=WEBVIEW2_INSTALLER.replace("/", "\\")))
@@ -1355,7 +1504,8 @@ def _write_tools(root: Path, apps: list[str] | None = None, *,
                    _ADMIN_BAT.format(app_id=app_id, pick_python=_pick_python("admin"),
                                      gc_partial=GC_EXIT_PARTIAL,
                                      gc_nothing=GC_EXIT_NOTHING,
-                                     gc_locked=GC_EXIT_LOCKED))
+                                     gc_locked=GC_EXIT_LOCKED,
+                                     gc_empty=GC_EXIT_EMPTY))
 
     if len(apps) == 1:
         _write_bat(tools / "admin.bat", _ADMIN_ONE_BAT.format(app_id=apps[0]))
@@ -1404,6 +1554,11 @@ def _write_entry_bats(root: Path, display_name: str = "App") -> tuple[list[str],
     removed = single.exists()
     if removed:
         single.unlink()          # ambiguous now — force the explicit per-app entry
+    for stale in root.glob("start-*.bat"):
+        # An app that is no longer installed here keeps no entry point — the same
+        # rule _write_tools applies to its console. Only the apps in the tree.
+        if stale.name[len("start-"):-len(".bat")] not in apps:
+            stale.unlink()
     bats = []
     for app_id in apps:
         name = f"start-{app_id}.bat"
@@ -1417,6 +1572,90 @@ def _write_entry_bats(root: Path, display_name: str = "App") -> tuple[list[str],
 
 def _directory_size(path: Path) -> int:
     return sum(f.stat().st_size for f in Path(path).rglob("*") if f.is_file())
+
+
+def _resolve_app_id(request: BuildRequest) -> str:
+    """The app_id this build claims, or a refusal the operator can act on.
+
+    A store is a NAMESPACE: `apps\\<app_id>\\` is the app's identity for as long as
+    the machine lives, and every version of it lands under that one id. So an id
+    that two different apps can share is not a cosmetic problem — it is the S8
+    disaster. slugify() strips everything that is not [a-zA-Z0-9], so a name with no
+    latin characters at all had nothing left, and 「影像檢視器」 and 「報表分析」 both
+    came out as `app-streamlit-app`: same folder, same start bat, same manifest.
+    The second build then hit 「版本 v1.0.0 已經建過了」 — a VERSION collision — and
+    the operator did what that message says, bumped the version, and shipped a
+    completely different program to the production line under App A's name.
+
+    models.slugify() no longer hands out a shared constant (it digests the name), so
+    the collision is gone even in fat mode. But a digest is not an identity anybody
+    can read: `start-app-streamlit-app-4f8c1e2a.bat` on a factory desktop is not a
+    name, it is a barcode. In a store — where the id is permanent, is a folder, is a
+    bat name and is what an admin console rolls back — we ask for a real one instead.
+    """
+    if request.has_explicit_app_id:
+        app_id = request.app_id
+        try:
+            validate_identifier(app_id, "app_id")
+        except Exception as exc:                      # noqa: BLE001 - it is a message
+            raise StoreBuildError(
+                f"應用代號(app id)不合法:{app_id!r}({exc})\n"
+                "  只能用英文字母、數字、`.`、`-`、`_`,而且要以英數字開頭,例如 image-viewer。"
+            ) from exc
+        return app_id
+
+    if request.app_id_is_derived_from_a_nameless_slug:
+        raise StoreBuildError(
+            f"「{request.display_name}」這個名字裡沒有任何英數字,推不出可讀的應用代號(app id)。\n"
+            "  Store 用 app id 當資料夾名、啟動檔名(start-<app id>.bat)與管理主控台的名字,\n"
+            "  而且它一旦定了就是這個 App 在這台機器上的永久身分,不能只靠顯示名稱推。\n"
+            "  請二選一:\n"
+            "  · 在「應用代號」欄位自己指定一個英數字代號,例如 image-viewer、report-analyzer;\n"
+            "  · 或把顯示名稱改成含有英數字的名字(例如「影像檢視器 Viewer」)。\n"
+            "  (顯示名稱可以留著中文 — 使用者看到的還是中文,代號只是機器用的。)")
+    return request.app_id
+
+
+def _guard_same_app_id(root: Path, request: BuildRequest, app_id: str) -> None:
+    """Refuse to build App B on top of App A. Before anything is written.
+
+    This is the guard that must never be misread as a version collision. When two
+    display names produce one app_id, the FIRST symptom the operator meets is
+    _build_version_dir()'s 「版本 v1.0.0 已經建過了 → 把版本號改成 v1.0.1」 — advice
+    that, followed, overwrites the app that is running on the line. So we look at
+    the display_name the tree's own manifests carry for this app_id and stop here,
+    where the truth is still knowable and nothing has been touched.
+    """
+    existing = _stored_display_name(root, app_id)
+    if existing is None or existing == request.display_name:
+        return
+    if request.has_explicit_app_id:
+        # The id was TYPED. Either it is a rename of this app, or (the dangerous one)
+        # a sticky field from the previous build carried App A's id onto App B.
+        raise StoreBuildError(
+            f"這棵 Store 樹裡的 {app_id} 目前是「{existing}」,這次要建的是「{request.display_name}」。\n"
+            f"  同一個應用代號 = 同一個 App。照這樣建下去,「{existing}」會被換成另一支程式,\n"
+            "  而資料夾名、啟動檔名、管理主控台都不會變 —— 現場看不出來換過。\n"
+            "  這不是版本衝突,改版本號沒有用,也絕對不要改。\n"
+            "  · 這是「另一個」App → 給它自己的應用代號(不要沿用上一次建置的代號)。\n"
+            f"  · 這是「同一個」App,只是改名字 → 把顯示名稱改回「{existing}」;\n"
+            f"    真的要改名,請先把 {AppPaths(root, app_id).app_dir} 移走再建(等於重新交付一支 App)。")
+    raise StoreBuildError(
+        f"「{existing}」和「{request.display_name}」這兩個名字在這棵 Store 樹裡是同一個應用代號"
+        f"({app_id}),所以是同一個 App。\n"
+        f"  這棵樹裡的 {app_id} 已經是「{existing}」了;再建下去就是把它換成「{request.display_name}」,\n"
+        "  名字、資料夾、啟動檔都不會變,現場的人不會知道程式被換掉了。\n"
+        "  這不是版本衝突。改版本號 = 直接覆蓋掉線上那支 App,千萬不要那樣做。\n"
+        "  請在「應用代號」欄位給這兩個 App 各自的代號(例如 image-viewer / report-analyzer),\n"
+        "  或把顯示名稱改成不會撞在一起的名字。")
+
+
+def _has_prereq_installer(root: Path) -> bool:
+    """Any .exe under <ROOT>\\prereq\\ — tools\\安裝WebView2.bat runs the canonical
+    name OR whatever .exe it finds there, so ANY of them means the offline machine
+    can install WebView2."""
+    prereq = Path(root) / "prereq"
+    return prereq.is_dir() and any(prereq.glob("*.exe"))
 
 
 def _webview2_installer_of(request: BuildRequest) -> Path | None:
@@ -1439,6 +1678,13 @@ def build_into_store(request: BuildRequest, root: Path, *, version: str,
     paths: AppPaths | None = None
     try:
         validate_identifier(version, "version")
+        # FIRST, and before a single byte is written: who is this app? An app_id that
+        # collides with another app's is not recoverable once the version directory
+        # is complete (it is immutable), and its only symptom downstream is a message
+        # about VERSION numbers. See _resolve_app_id / _guard_same_app_id.
+        app_id = _resolve_app_id(request)
+        _guard_same_app_id(root, request, app_id)
+
         found = requirements_mod.resolve(request.project_dir, request.explicit_requirements)
         if found.generated:
             raise StoreBuildError(
@@ -1456,6 +1702,12 @@ def build_into_store(request: BuildRequest, root: Path, *, version: str,
         webview2 = _webview2_installer_of(request)
         if webview2 is not None and not webview2.is_file():
             raise StoreBuildError(f"找不到 WebView2 安裝檔:{webview2}")
+        if webview2 is None and not _has_prereq_installer(root):
+            # The fat path has said this since the beginning (builder's
+            # WEBVIEW2_MISSING_WARNING); the store path declared a `warnings` field
+            # and said nothing. Same offline factory machine, same blank window, same
+            # dead end — the only difference was that the store operator was not told.
+            warnings.append(STORE_WEBVIEW2_MISSING_WARNING)
 
         # Big files / auto-exclusions: the fat path has always reported these, the
         # store path declared a `warnings` field and then never filled it, so in
@@ -1483,7 +1735,7 @@ def build_into_store(request: BuildRequest, root: Path, *, version: str,
         shell_fingerprint = ensure_shell(root, request.shell_exe, progress)
 
         _check_cancel(should_cancel)
-        paths = AppPaths(root, request.app_id)
+        paths = AppPaths(root, app_id)
         _build_version_dir(paths, request, version, fingerprint, shell_fingerprint, progress)
 
         # The revision travels with the version from here to failed_versions: a
@@ -1495,7 +1747,7 @@ def build_into_store(request: BuildRequest, root: Path, *, version: str,
         store = StateStore(paths.state_dir)
         pending_set = False
         if not store.exists():
-            store.initialize(request.app_id, version)
+            store.initialize(app_id, version)
             progress(f"初始化 state:current={version}")
         else:
             current = store.load()
@@ -1543,7 +1795,7 @@ def build_into_store(request: BuildRequest, root: Path, *, version: str,
         progress(f"完成:{root}(本次新增 {added / 1024 ** 2:.0f} MB)")
 
         return StoreBuildResult(
-            ok=True, root=root, app_id=request.app_id, version=version,
+            ok=True, root=root, app_id=app_id, version=version,
             fingerprint=fingerprint, runtime_reused=reused,
             pending_set=pending_set, is_first_app=len(apps) <= 1,
             entry_bats=bats, removed_start_bat=removed_start_bat,
@@ -1790,6 +2042,69 @@ def _deliverable_versions(root: Path, app_id: str) -> str:
     return "、".join(listed) or "(一個完整的版本都沒有)"
 
 
+def _export_entry_bats(root: Path, out: Path, exported: list[str],
+                       installed: list[str]) -> list[str]:
+    """Every app installed in `out` ends up with exactly one entry point.
+
+    Three rules, and the middle one is the S8 blocker:
+
+      * the apps THIS export delivered get their bat from the source tree (the same
+        file the store root has, so the name the operator has been taught is the name
+        they get);
+      * an app that is ALREADY in `out` and that this export did not touch KEEPS its
+        entry bat. It is still installed, its versions and its runtime are still on
+        the disk, and deleting the one file that starts it is not a cleanup, it is
+        breaking a delivered app;
+      * a start bat belonging to no installed app goes (the true stale case: an app
+        that is not in this folder at all).
+
+    And `start.bat` is only unambiguous while the folder holds ONE app. When a second
+    app lands in it, start.bat becomes 「which one?」 and is replaced by its owner's
+    own start-<app_id>.bat — the same rule _write_entry_bats() applies to a store.
+    """
+    root, out = Path(root), Path(out)
+    entry_bats: list[str] = []
+
+    wanted = {"start.bat"} | {f"start-{a}.bat" for a in exported}
+    for bat in sorted(root.glob("start*.bat")):
+        if bat.name in wanted:
+            shutil.copy2(bat, out / bat.name)
+            entry_bats.append(bat.name)
+
+    for bat in sorted(out.glob("start*.bat")):
+        if bat.name in entry_bats:
+            continue
+        owner = _entry_bat_app(bat)
+        if owner is None or owner not in installed:
+            bat.unlink()          # belongs to no app in this folder: really stale
+        else:
+            entry_bats.append(bat.name)      # still installed: it keeps its entry
+
+    if len(installed) > 1:
+        generic = out / "start.bat"
+        if generic.is_file():
+            owner = _entry_bat_app(generic)
+            if owner:
+                named = f"start-{owner}.bat"
+                if not (out / named).is_file():
+                    shutil.copy2(generic, out / named)
+                    entry_bats.append(named)
+            generic.unlink()
+            if "start.bat" in entry_bats:
+                entry_bats.remove("start.bat")
+
+    missing = [a for a in installed
+               if not any(_entry_bat_app(out / b) == a for b in entry_bats)]
+    for app in missing:
+        # An app with no bat to copy (an old tree, a deleted bat, an app that only
+        # ever existed in the destination). Generate one rather than deliver a folder
+        # with an app nobody can start.
+        name = "start.bat" if len(installed) == 1 else f"start-{app}.bat"
+        _write_bat(out / name, _start_bat_text(out, app, _display_name_of(root, app)))
+        entry_bats.append(name)
+    return sorted(set(entry_bats))
+
+
 def export_full_tree(root: Path, out_dir: Path, *, app_id: str | None = None,
                      version: str | None = None,
                      progress: Progress | None = None) -> ExportResult:
@@ -1942,45 +2257,58 @@ def export_full_tree(root: Path, out_dir: Path, *, app_id: str | None = None,
     if prereq.is_dir():
         say("複製 prereq\\(WebView2 安裝檔)…")
         shutil.copytree(prereq, out / "prereq", ignore=_ignore_staging, dirs_exist_ok=True)
-    if not (out / WEBVIEW2_INSTALLER).is_file():
+    if not _has_prereq_installer(out):
         # The one dependency this delivery cannot satisfy by itself. Without
         # WebView2 the Tauri window opens blank, and a factory machine typically
         # has no way to reach go.microsoft.com to fix it. Say it HERE, while the
         # operator is still standing next to the build machine that could add it.
+        #
+        # And say something they can DO. 「請在建置時指定」 means rebuild, and a
+        # completed version directory is immutable — the rebuild is refused, and the
+        # operator is left with a delivery they cannot fix and no way forward. They
+        # do not need one: the bat takes any .exe in prereq\, so copying the
+        # installer into THIS folder is the whole remedy.
+        # Checked with _has_prereq_installer(), not `MicrosoftEdgeWebview2Setup.exe
+        # is a file`: an operator who dropped their own copy in under its own name
+        # did the right thing, and telling them they did not is how they stop reading
+        # our warnings.
         warnings.append(
-            "這份交付沒有附 WebView2 安裝檔(prereq\\MicrosoftEdgeWebview2Setup.exe)。"
+            "這份交付沒有附 WebView2 安裝檔(prereq\\ 底下沒有任何 .exe)。"
             "目標機如果沒有 Microsoft Edge WebView2 Runtime,而且不能上網,"
-            "這份交付就裝不起來、視窗會是空白的。"
-            "請在建置時指定 WebView2 安裝檔,或先確認目標機已經有 WebView2:"
-            + WEBVIEW2_DOWNLOAD)
+            "視窗會是一片空白,而且當場沒辦法補裝。"
+            "不必重新建置、也不必重新匯出:把 MicrosoftEdgeWebview2Setup.exe 複製到 "
+            f"{out / 'prereq'} 底下就行(tools\\{WEBVIEW2_BAT_NAME} 認得那裡的任何 .exe)。"
+            f"下載:{WEBVIEW2_DOWNLOAD}")
 
     say("寫入 start bat、tools\\ 與讀我-使用說明.txt…")
-    wanted_bats = {"start.bat"} | {f"start-{a}.bat" for a in apps}
-    entry_bats: list[str] = []
-    for bat in sorted(root.glob("start*.bat")):
-        if bat.name in wanted_bats:
-            shutil.copy2(bat, out / bat.name)
-            entry_bats.append(bat.name)
-    for stale in sorted(out.glob("start*.bat")):
-        # Exporting again into a folder that already held a different delivery:
-        # a leftover start bat points at an app (or a state) that is not here.
-        if stale.name not in entry_bats:
-            stale.unlink()
-    if not entry_bats:
-        # An old tree (or a tree whose bats were deleted): regenerate rather than
-        # deliver a folder with nothing to double-click.
-        entry_bats, _ = _write_entry_bats(out, _display_name_of(root, apps[0]))
+    # THE UNION RULE, the same one _write_tools() has always used: what belongs in
+    # this folder is decided by the apps INSTALLED IN IT, not by the apps this one
+    # export happened to write. The exporter used to unlink every start bat that was
+    # not part of THIS export — so exporting App B into the USB folder that already
+    # held App A deleted App A's start bat and left App A's 500 MB tree sitting there
+    # with no way to launch it. The console survived (tools\ already unioned); the
+    # only thing a user can double-click did not.
+    installed = sorted(set(apps) | set(list_app_ids(out)))
+    extra = [a for a in installed if a not in apps]
+    if extra:
+        warnings.append(
+            f"目的地資料夾裡本來就有其他 App({'、'.join(extra)}),這次沒有動它們:"
+            "它們的版本、啟動檔與管理主控台都原封不動留著。"
+            f"這個資料夾現在總共有 {len(installed)} 個 App。")
 
-    # Regenerated, not copied: tools\ must describe EXACTLY the apps in this
-    # export (a chooser offering an app that is not here is worse than useless).
+    entry_bats = _export_entry_bats(root, out, apps, installed)
+
+    # Regenerated, not copied: tools\ must describe exactly the apps this FOLDER has
+    # (a chooser offering an app that is not here is worse than useless — and one
+    # that drops an app that IS here leaves it unadministrable).
     _write_tools(out, apps, names_from=root)
 
-    readme = root / README_NAME
-    if readme.is_file() and len(apps) == len(all_apps):
-        shutil.copy2(readme, out / README_NAME)
-    else:
-        _write_store_readme(out, apps, entry_bats,
-                            preferred_port=_preferred_port_of(root, apps))
+    # Always regenerated, never copied from the source tree: the source's 讀我 names
+    # the source's apps and the source's bats, and this folder's app list is the
+    # union above. A delivery whose 讀我 tells the operator to double-click a file
+    # that is not in the folder is the S8 bug wearing a different hat.
+    _write_store_readme(out, installed, entry_bats,
+                        preferred_port=_preferred_port_of(root, apps), source=root)
 
     total = _directory_size(out)
     say(f"完成:{out}({total / 1024 ** 2:.0f} MB)")

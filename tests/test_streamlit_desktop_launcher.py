@@ -324,6 +324,7 @@ class StubSupervisor:
         self.url = None
         self.port = None
         self.fail = None
+        self.sessions = 0            # /control/start = the app was asked to RUN
 
     def status(self):
         return {"running": self.running, "url": self.url, "port": self.port}
@@ -333,6 +334,9 @@ class StubSupervisor:
             raise launch.StreamlitExited(self.fail)
         self.running, self.url, self.port = True, "http://127.0.0.1:9999", 9999
         return self.url
+
+    def note_session_start(self):
+        self.sessions += 1
 
     def stop(self):
         self.running, self.url, self.port = False, None, None
@@ -547,7 +551,8 @@ class FakeShell:
 
     It reports itself alive for `alive_polls` poll() calls (None = for as long as
     the window-creation watch cares to look), then survives `alive_waits` ticks of
-    the wait loop, then exits with `code`.
+    the wait loop, then exits with `code`. `terminated` records the launcher closing
+    the window itself — which it does when the app is dead on arrival.
     """
 
     def __init__(self, code: int = 0, alive_polls: int | None = 0, alive_waits: int = 0):
@@ -557,6 +562,7 @@ class FakeShell:
         self._waits = alive_waits
         self.returncode = None
         self.ticks = 0
+        self.terminated = False
 
     def poll(self):
         if self.returncode is not None or self._polls is None:
@@ -576,6 +582,11 @@ class FakeShell:
             raise subprocess.TimeoutExpired("cim-light.exe", timeout)
         self.returncode = self._code
         return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+        self._waits = 0
+        self.returncode = self._code
 
 
 class FakeControl:
@@ -724,12 +735,12 @@ def test_the_arrival_window_closes_on_a_tick_not_on_a_guess(tmp_path):
     """note_arrival_window() is what separates the two halves of the log, so it must
     freeze the offset only once the app has really had its chance to render."""
     supervisor = _supervisor(tmp_path, _STARTUP)
-    supervisor._healthy_at = time.monotonic()
+    supervisor.note_session_start()                         # the user pressed Start
 
     supervisor.note_arrival_window()
     assert supervisor._arrival_offset is None               # too early: still arriving
 
-    supervisor._healthy_at = time.monotonic() - launch.APP_ARRIVAL_SECONDS - 1
+    supervisor._session_at = time.monotonic() - launch.APP_ARRIVAL_SECONDS - 1
     supervisor.note_arrival_window()
     assert supervisor._arrival_offset == len(_STARTUP.encode("utf-8"))
 
@@ -738,6 +749,191 @@ def test_the_arrival_window_closes_on_a_tick_not_on_a_guess(tmp_path):
     assert supervisor._arrival_offset == len(_STARTUP.encode("utf-8"))
     assert supervisor.app_error_in_log() is None
     assert supervisor.late_app_error_in_log() is not None
+
+
+# ── the arrival window belongs to the APP, not to the server ─────────────────
+#
+# THE defect: _healthy_at was set the moment /_stcore/health answered 200 — the
+# SERVER being up. But this product's own documented limitation is that the app
+# script does not run until the user presses "Start" in the portal, which can be
+# minutes later. The 20s window therefore expired while the app had not executed a
+# single line; the app was then started, died on import, and its traceback landed
+# in the LATE half of the log — a warning (marker kept, exit 0). bootstrap
+# committed the broken version as last-known-good. The safety net stamped it good.
+
+def test_a_version_that_dies_after_a_slow_start_press_is_failed_not_committed(tmp_path):
+    """THE scenario, end to end: Streamlit is healthy, the operator takes 25 seconds
+    to press Start (a coffee, a phone call, reading the release note — the NORMAL
+    case), the app is then asked to run and dies on `import cv2`.
+
+    Before: the window had closed 5 seconds ago, so the death was 'late' → warning,
+    marker kept, exit 0, committed as last-known-good — the very version rollback
+    would later fall back to. Now: the window opens when the app is ASKED TO RUN, so
+    the death is an arrival failure → marker revoked, exit 3, bootstrap rolls back."""
+    supervisor = _supervisor(tmp_path, _STARTUP)
+    supervisor._healthy_at = time.monotonic() - 25.0        # server up for 25 seconds
+
+    for _ in range(50):                                     # 25s of half-second ticks
+        supervisor.note_arrival_window()
+    assert supervisor._arrival_offset is None, \
+        "the window must not close while the app has not been asked to run"
+
+    supervisor.note_session_start()                         # …NOW the user presses Start
+    (tmp_path / "streamlit.log").write_bytes(
+        (_STARTUP + "Traceback (most recent call last):\n"
+                    "ModuleNotFoundError: No module named 'cv2'\n").encode("utf-8"))
+    supervisor.note_arrival_window()                        # the very next tick
+
+    fatal = supervisor.app_error_in_log()
+    assert fatal and "ModuleNotFoundError" in fatal
+    assert supervisor.late_app_error_in_log() is None       # NOT excused as 'late'
+    assert launch.finish_session(supervisor, launch.EXIT_OK) == launch.EXIT_APP_BROKEN
+
+
+def test_the_arrival_window_never_closes_before_the_app_is_asked_to_run(tmp_path):
+    """The user opens the window at 09:00 and presses Start after lunch. Streamlit
+    has been healthy for four hours and the app has run nothing. There is no arrival
+    to have missed, so the window must still be open."""
+    supervisor = _supervisor(tmp_path, _STARTUP)
+    supervisor._healthy_at = time.monotonic() - 4 * 3600
+
+    supervisor.note_arrival_window()
+    assert supervisor.arriving and supervisor._arrival_offset is None
+    # …and an error at that point is still fatal, because the app never worked.
+    (tmp_path / "streamlit.log").write_bytes((_STARTUP + _TRACEBACK).encode("utf-8"))
+    assert supervisor.app_error_in_log() is not None
+    assert supervisor.late_app_error_in_log() is None
+
+
+def test_pressing_start_twice_does_not_rewind_the_arrival_window(tmp_path):
+    """start() short-circuits on `if self.running`, so a second /control/start hits a
+    live app. If that re-armed the clock, a user who pressed Start again 19 seconds
+    into a dying app would buy it another 20 seconds of amnesty — and eventually an
+    error that lands 'late'. The first Start is the one that counts."""
+    supervisor = _supervisor(tmp_path, _STARTUP)
+    supervisor.note_session_start()
+    first = supervisor._session_at
+
+    time.sleep(0.01)
+    supervisor.note_session_start()
+    assert supervisor._session_at == first
+
+    supervisor._session_at = time.monotonic() - launch.APP_ARRIVAL_SECONDS - 1
+    supervisor.note_arrival_window()
+    assert supervisor._arrival_offset is not None           # it did close, on time
+    supervisor.note_session_start()                         # and a late Start
+    assert supervisor._arrival_offset is not None           # cannot re-open it
+
+
+def test_a_restarted_app_gets_a_fresh_arrival_window(tmp_path):
+    """Stop, then Start again: a new process, a new log file — and therefore a new
+    arrival window. Leaking the old offset would file the new run's startup crash as
+    'late' and keep the marker on a version that just failed to start."""
+    supervisor = _supervisor(tmp_path, _STARTUP)
+    supervisor.note_session_start()
+    supervisor._session_at = time.monotonic() - launch.APP_ARRIVAL_SECONDS - 1
+    supervisor.note_arrival_window()
+    assert supervisor._arrival_offset is not None and not supervisor.arriving
+
+    # what _spawn_and_wait does for the new process (same three lines, one place)
+    supervisor._log_path = tmp_path / "streamlit-restart.log"
+    supervisor._log_path.write_bytes(b"")
+    supervisor._healthy_at = None
+    supervisor._session_at = None
+    supervisor._arrival_offset = None
+
+    assert supervisor.arriving
+    supervisor.note_arrival_window()
+    assert supervisor._arrival_offset is None               # no session yet: stays open
+
+
+def test_the_control_channel_start_is_what_opens_the_arrival_window(tmp_path):
+    """The wiring itself: /control/start is the moment the app is asked to run, and
+    it is the ONLY thing that may open the window. Asserted through the real HTTP
+    handler, because a supervisor method nobody calls protects nobody."""
+    class ReadySupervisor(launch.StreamlitSupervisor):
+        def start(self):
+            return "http://127.0.0.1:9999"
+
+        @property
+        def port(self):
+            return 9999
+
+    supervisor = ReadySupervisor(
+        {"_python": tmp_path / "python.exe", "_entrypoint": tmp_path / "app.py",
+         "host": "127.0.0.1", "preferred_port": 0}, tmp_path)
+    control = launch.ControlServer(supervisor)
+    control.start()
+    try:
+        assert supervisor._session_at is None               # healthy, but nobody asked
+        request = urllib.request.Request(f"{control.url}/control/start", method="POST",
+                                         headers={"X-CIM-Token": control.token})
+        with urllib.request.urlopen(request, timeout=5) as resp:
+            assert resp.status == 200
+        assert supervisor._session_at is not None           # THIS is the starting gun
+    finally:
+        control.shutdown()
+
+
+# ── a dying app must not wait for the user to close the window ───────────────
+
+def test_an_app_dying_on_arrival_closes_the_window_instead_of_waiting(tmp_path, monkeypatch):
+    """The tick already runs every 0.5s. If the app is dead on arrival, everything
+    after that is the operator staring at a red box until they give up and close the
+    window — and only THEN does the version get failed and rolled back. There is
+    nothing to wait for: close the shell, fail the candidate, let bootstrap roll back
+    now. That is the difference between the machine fixing itself and the operator
+    finding out tomorrow."""
+    shell = FakeShell(code=0, alive_polls=None, alive_waits=99)
+    monkeypatch.setattr(launch.subprocess, "Popen", lambda *_a, **_k: shell)
+    monkeypatch.setattr(launch, "_WINDOW_POLL_SECONDS", 0.001)
+    monkeypatch.setattr(launch, "SHELL_ALIVE_SECONDS", 0.01)
+    monkeypatch.setattr(launch, "_SHELL_TICK_SECONDS", 0.01)
+
+    supervisor = _supervisor(tmp_path, _STARTUP + "ModuleNotFoundError: No module named 'cv2'\n")
+    supervisor.note_session_start()
+
+    def tick() -> bool:
+        supervisor.note_arrival_window()
+        return supervisor.failing_on_arrival() is not None
+
+    code = launch.run_shell(_shell_manifest(tmp_path), FakeControl(), tmp_path,
+                            on_window_ready=lambda: None, on_tick=tick)
+
+    assert code == launch.EXIT_APP_BROKEN
+    assert shell.terminated, "the window was left open in front of a dead app"
+    # …and the session verdict still agrees: marker revoked, exit 3, bootstrap rolls back
+    assert launch.finish_session(supervisor, code) == launch.EXIT_APP_BROKEN
+
+
+def test_a_working_app_is_never_killed_by_the_watchdog(tmp_path, monkeypatch):
+    """The other half. An app that is quiet, or one that raised AFTER it had already
+    rendered, must be left alone: killing a window somebody is working in is worse
+    than any report we could file about it."""
+    shell = FakeShell(code=0, alive_polls=None, alive_waits=3)
+    monkeypatch.setattr(launch.subprocess, "Popen", lambda *_a, **_k: shell)
+    monkeypatch.setattr(launch, "_WINDOW_POLL_SECONDS", 0.001)
+    monkeypatch.setattr(launch, "SHELL_ALIVE_SECONDS", 0.01)
+    monkeypatch.setattr(launch, "_SHELL_TICK_SECONDS", 0.01)
+
+    supervisor = _supervisor(tmp_path, _STARTUP + _TRACEBACK,
+                             arrival_offset=len(_STARTUP.encode("utf-8")))
+    supervisor.note_session_start()
+
+    def tick() -> bool:
+        supervisor.note_arrival_window()
+        return supervisor.failing_on_arrival() is not None
+
+    code = launch.run_shell(_shell_manifest(tmp_path), FakeControl(), tmp_path,
+                            on_tick=tick)
+
+    assert code == launch.EXIT_OK
+    assert not shell.terminated
+    assert launch.finish_session(supervisor, code) == launch.EXIT_OK      # a warning only
+
+
+def test_the_window_closing_message_is_printable_on_a_zh_tw_console():
+    launch._ARRIVAL_FAILURE_HINT.encode("cp950")
 
 
 def test_an_app_that_was_never_started_by_the_user_is_not_a_failure(tmp_path):

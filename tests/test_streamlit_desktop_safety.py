@@ -6,11 +6,13 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shutil
 from pathlib import Path
 
 import pytest
 
 from provision_builder.streamlit_desktop import imports as imports_mod
+from provision_builder.streamlit_desktop import pages as pages_mod
 from provision_builder.streamlit_desktop import requirements as req_mod
 from provision_builder.streamlit_desktop import validate as validate_mod
 from provision_builder.streamlit_desktop.models import BuildRequest
@@ -552,3 +554,170 @@ def test_a_healthy_app_reports_no_render_error(tmp_path):
     supervisor = _supervisor_with_log(
         tmp_path, "You can now view your Streamlit app in your browser.\n")
     assert supervisor.app_error_in_log() is None
+
+
+# ── the BUILD gate must see the pages the user can click ─────────────────────
+#
+# The device-side launcher has seen them for a while (its own tests live in
+# test_streamlit_desktop_launcher.py). The build gate did not — and the build gate
+# is the one that decides whether a package is delivered at all.
+
+def _multipage_project(tmp_path: Path) -> tuple[Path, Path]:
+    project = tmp_path / "proj"
+    (project / "pages").mkdir(parents=True)
+    (project / "app.py").write_text("import streamlit as st\nst.title('home')\n",
+                                    encoding="utf-8")
+    return project, project / "app.py"
+
+
+def test_a_missing_import_in_a_page_does_not_pass_the_build_gate(tmp_path, monkeypatch):
+    """THE blocker. Streamlit loads `pages/*.py` BY CONVENTION — nothing imports
+    them — so a closure seeded with the entrypoint alone never opened the folder.
+    Measured before the fix: a module-level `import zzz_nope` in pages/2_report.py
+    produced blocking=[] warnings=[] from BOTH build-side gates. The broken build
+    passed 「檢查專案」, passed the build, was delivered, was committed as
+    last-known-good, and appeared as a red box the first time the operator clicked
+    that page."""
+    project, entry = _multipage_project(tmp_path)
+    (project / "pages" / "2_report.py").write_text(
+        "import streamlit as st\nimport zzz_nope\n", encoding="utf-8")
+
+    # gate 1: the lock comparison, before pip has run
+    report = imports_mod.missing_from_lock(entry, project, "streamlit==1.40.0\n")
+    assert report.blocking == ["zzz_nope"]
+    assert "2_report.py" in report.where("zzz_nope")          # and it says WHERE
+
+    # gate 2: the post-install probe against the staged interpreter
+    monkeypatch.setattr(imports_mod, "importable_in", lambda _py, wanted: {"streamlit"})
+    probe = imports_mod.missing_dependencies(entry, project, tmp_path / "python.exe")
+    assert probe.blocking == ["zzz_nope"]
+
+    assert project / "pages" / "2_report.py" in imports_mod.runtime_sources(project, entry)
+
+
+def test_a_lazy_import_in_a_page_is_still_only_a_warning(tmp_path):
+    """Following the pages must not make the gate trigger-happy: an import inside a
+    function body cannot break the first render of anything, page or not."""
+    project, entry = _multipage_project(tmp_path)
+    (project / "pages" / "2_report.py").write_text(
+        "import streamlit as st\n\n\ndef export():\n    import zzz_lazy\n    return zzz_lazy\n",
+        encoding="utf-8")
+
+    report = imports_mod.missing_from_lock(entry, project, "streamlit==1.40.0\n")
+    assert report.blocking == []
+    assert report.optional == ["zzz_lazy"]
+
+
+def test_a_helper_next_to_a_page_is_not_reported_as_a_missing_pypi_package(tmp_path):
+    """The other direction, and the reason the launcher added the pages folder to
+    its first-party roots: a `.py` sitting in `pages/` is the app's own code. Telling
+    the admin to `pip install shared_bits` refuses a build that works — and the
+    build gate must not now start doing what the launcher stopped doing."""
+    project, entry = _multipage_project(tmp_path)
+    (project / "pages" / "1_home.py").write_text(
+        "import streamlit as st\nimport shared_bits\n", encoding="utf-8")
+    (project / "pages" / "shared_bits.py").write_text("import zzz_deep\n", encoding="utf-8")
+
+    report = imports_mod.missing_from_lock(entry, project, "streamlit==1.40.0\n")
+    assert "shared_bits" not in report.blocking     # it is a page's helper, not PyPI
+    assert report.blocking == ["zzz_deep"]          # …and we followed it INTO the helper
+
+
+def test_a_page_declared_by_st_page_is_checked_by_the_build_gate(tmp_path):
+    """st.navigation's pages need not live in pages/ — but the path is a literal
+    string sitting in the entry script's AST, so there is no excuse for missing it."""
+    project = tmp_path / "proj"
+    (project / "screens").mkdir(parents=True)
+    (project / "app.py").write_text(
+        "import streamlit as st\n"
+        "pg = st.navigation([st.Page('screens/report.py')])\npg.run()\n", encoding="utf-8")
+    (project / "screens" / "report.py").write_text(
+        "import streamlit as st\nimport zzz_nope\n", encoding="utf-8")
+
+    report = imports_mod.missing_from_lock(project / "app.py", project, "streamlit==1.40.0\n")
+    assert report.blocking == ["zzz_nope"]
+
+
+def test_a_page_declared_in_pages_toml_is_checked_by_the_build_gate(tmp_path):
+    """st-pages' .streamlit/pages.toml: literal paths, tomllib reads them."""
+    project, entry = _multipage_project(tmp_path)
+    (project / "screens").mkdir()
+    (project / "screens" / "report.py").write_text("import zzz_nope\n", encoding="utf-8")
+    (project / ".streamlit").mkdir()
+    (project / ".streamlit" / "pages.toml").write_text(
+        '[[pages]]\npath = "app.py"\nname = "Home"\n\n'
+        '[[pages]]\npath = "screens/report.py"\nname = "Report"\n', encoding="utf-8")
+
+    report = imports_mod.missing_from_lock(entry, project, "streamlit==1.40.0\n")
+    assert report.blocking == ["zzz_nope"]
+
+
+def test_a_runtime_built_page_list_is_not_pretended_to_be_covered(tmp_path):
+    """The documented hole, kept honest. `st.Page(name)` where `name` is computed at
+    runtime has no path to follow until the app runs, so no static gate can see it.
+    We must neither crash on it nor invent a page — the log scan at the end of the
+    session (launch.py) is what has to catch that one."""
+    project, entry = _multipage_project(tmp_path)
+    (project / "app.py").write_text(
+        "import streamlit as st\n"
+        "for name in ['screens/a.py']:\n    st.Page(name)\n", encoding="utf-8")
+    (project / "screens").mkdir()
+    (project / "screens" / "a.py").write_text("import zzz_nope\n", encoding="utf-8")
+
+    assert pages_mod.declared_pages(entry, project) == []          # honestly blind
+    assert imports_mod.missing_from_lock(entry, project, "streamlit==1.40.0\n").blocking == []
+
+
+# ── one rulebook, both sides of the fence ────────────────────────────────────
+
+def test_the_build_gate_and_the_device_launcher_share_one_page_rulebook():
+    """Two implementations of "what does Streamlit actually load" is how the build
+    side went blind while the launcher had it right. There is now exactly one file,
+    and the launcher loads THAT file — not a copy of it."""
+    module = launch.shared_pages()
+    assert Path(module.__file__).resolve() == pages_mod.SOURCE
+    assert module.MODULE_MARK == pages_mod.MODULE_MARK
+
+
+def test_a_delivered_launcher_loads_the_page_rules_from_its_own_folder(tmp_path, monkeypatch):
+    """On the device there is no provision_builder: pages.py is COPIED next to
+    launch.py (launcher/pages.py) and loaded from there, by path. This is the load
+    that actually runs on the factory floor."""
+    launcher = tmp_path / "versions" / "1.0.0" / "launcher"
+    launcher.mkdir(parents=True)
+    shutil.copy2(pages_mod.SOURCE, launcher / "pages.py")
+    monkeypatch.setattr(launch, "__file__", str(launcher / "launch.py"))
+    monkeypatch.setattr(launch, "_PAGES_MODULE", None)
+
+    module = launch.shared_pages()
+    assert Path(module.__file__).resolve() == (launcher / "pages.py").resolve()
+    assert module.MODULE_MARK == pages_mod.MODULE_MARK
+
+
+def test_a_launcher_delivered_without_the_page_rules_refuses_to_run(tmp_path, monkeypatch):
+    """If a builder ships launch.py without pages.py, the page half of the preflight
+    would silently disappear — the exact blindness we just fixed, restored in the
+    dark. Fail the version out loud instead (exit 4: this version's tree is wrong)."""
+    launcher = tmp_path / "versions" / "1.0.0" / "launcher"
+    launcher.mkdir(parents=True)
+    monkeypatch.setattr(launch, "__file__", str(launcher / "launch.py"))
+    monkeypatch.setattr(launch, "_PAGES_MODULE", None)
+
+    with pytest.raises(launch.LauncherIncomplete) as excinfo:
+        launch.shared_pages()
+    message = str(excinfo.value)
+    assert "pages.py" in message and "重新建置" in message
+    message.encode("cp950")                       # a zh-TW console must be able to print it
+
+
+def test_a_stray_pages_py_is_not_mistaken_for_the_page_rules(tmp_path, monkeypatch):
+    """`pages.py` is a common file name. Loading whatever happens to carry it and
+    calling it "the rules" would be a very quiet way to be wrong."""
+    launcher = tmp_path / "launcher"
+    launcher.mkdir(parents=True)
+    (launcher / "pages.py").write_text("PAGES = ['a', 'b']\n", encoding="utf-8")
+    monkeypatch.setattr(launch, "__file__", str(launcher / "launch.py"))
+    monkeypatch.setattr(launch, "_PAGES_MODULE", None)
+
+    with pytest.raises(launch.LauncherIncomplete):
+        launch.shared_pages()

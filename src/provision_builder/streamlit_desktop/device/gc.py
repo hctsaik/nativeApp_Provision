@@ -31,6 +31,12 @@ lying to the person reading it:
   even take the store lock and did nothing at all" were indistinguishable to the
   caller — and gc.bat then printed 「沒有刪掉任何東西」 over a run that had just
   reclaimed 400 MB, and blamed the store lock for it.
+* An --apply run that deleted NOTHING is not an --apply run that deleted
+  EVERYTHING. Both used to exit 0, and gc.bat's exit-0 branch prints 「回收完成。
+  上面列出的項目都已經刪掉了。」 — over a run that listed nothing, deleted nothing
+  and freed exactly 0 bytes. "上面列出的項目" was the empty set. A plan is a
+  promise, and the operator is owed the outcome: EXIT_EMPTY_PLAN says the store was
+  already clean, and says it without calling a clean store a failure.
 
 
 GC EXIT-CODE CONTRACT (gc.py <-> tools\\gc.bat and anything else wrapping it)
@@ -39,22 +45,44 @@ These numbers are a CONTRACT with store_builder.GC_EXIT_* (which generates the b
 that reads them). Change one side and the console starts telling the other side's
 story — which is the very bug this table exists to end.
 
-    0   Did everything it set out to do. (A dry run always ends here; so does an
-        --apply run with nothing to reclaim, and one that deleted every tree.)
+    0   THERE IS SOMETHING TO DO, AND IT WENT. Either a DRY RUN whose plan is not
+        empty (gc.bat then asks 「真的要刪除嗎?」), or an --apply that deleted every
+        tree in the plan. Only this code may be answered with 「回收完成…上面列出的
+        項目都已經刪掉了」, because only here was something listed and something went.
     2   PARTIAL. Some trees went, some would not. The survivors' space is NOT
         reclaimed; they are listed by name with the reason (檔案使用中 → close the
         App and run it again). Saying 「沒有刪掉任何東西」 here is a lie — and it
         was printed over runs that had just reclaimed 400 MB.
-    3   NOTHING DELETED. Zero bytes came back, for one of two reasons, and the
-        console says WHICH: GC refused before touching anything (a broken
+    3   NOTHING DELETED. GC tried, or refused to try, and zero bytes came back —
+        and the console says WHICH: GC refused before touching anything (a broken
         state.json, a manifest with no runtime_fingerprint, a disk error in the
         scan), or it tried every tree and every single one refused (the App is
-        open, antivirus/Explorer is holding the folder).
+        open, antivirus/Explorer is holding the folder). Something IS wrong here.
     4   STORE LOCKED. An update is downloading or installing right now, so GC never
         even scanned. Nothing was deleted; nothing is wrong. Try again later.
+    6   EMPTY PLAN — there is nothing to reclaim. Returned by the DRY RUN and by
+        --apply alike, and it is not a failure (gc.bat's :empty branch exits 0).
+        On the dry run it is what stops the bat asking 「以上列出的項目要真的刪除
+        嗎?」 over a blank list; on --apply it is what stops it answering 「都已經
+        刪掉了」. It is NOT 3: an already-clean store is not a failed GC, and 3's
+        message is 「回收失敗」.
 
-Before this, all four exited 2, so "I deleted 3 of the 5 trees" and "I could not
-take the lock and did nothing" were the same event to anything reading the code.
+Before this, all four failures exited 2 — and 0 covered both "deleted every tree"
+and "there was nothing to delete", which is how 「上面列出的項目都已經刪掉了」 came
+to be printed over a run that listed nothing and freed 0 bytes.
+
+WHAT A GUI SHOULD READ (never re-derive any of this from the plan's forecast):
+    plan.applied            did --apply actually run?
+    plan.deleted            [(label, mb)] — what ACTUALLY went away
+    plan.reclaimed_mb()     MEASURED total. reclaimable_mb() is a FORECAST: it is
+                            only ever valid before --apply.
+    plan.survivors          [GcSurvivor] — what stayed, .reason why, .in_use
+                            (→ .hint(): 關掉 App 再跑一次), .label, .path
+    plan.failures           the same survivors, pre-rendered as console lines
+    plan.nothing_to_reclaim()   True (== is_empty()) → say 「沒有可回收的項目」,
+                            never 「已刪除」 and never a reclaimed total
+    plan.headline()         one honest cp950-safe line, safe to show verbatim
+    plan.exit_code()        the table above
 """
 
 from __future__ import annotations
@@ -91,6 +119,23 @@ EXIT_PARTIAL = 2            # some trees deleted, some still in use
 EXIT_NOTHING_DELETED = 3    # zero bytes reclaimed: refused up front, or every tree refused
 EXIT_ABORTED = EXIT_NOTHING_DELETED   # refusing IS a nothing-deleted run; the text says which
 EXIT_STORE_LOCKED = 4       # never even scanned: an update holds the store lock
+# THE PLAN IS EMPTY: there is nothing to reclaim. Returned by BOTH the dry run and
+# --apply, and it is not a failure (tools\gc.bat's :empty branch exits 0).
+#
+# It used to be EXIT_OK — the same code as "deleted all 5 trees, freed 480 MB" — so
+# the bat asked 「以上列出的項目要真的刪除嗎?」 over a blank list and then answered
+# itself with 「回收完成。上面列出的項目都已經刪掉了。」 Nothing was listed, nothing
+# was deleted, and the operator went looking for space that was never freed.
+#
+# Not EXIT_NOTHING_DELETED either: that one means something WENT WRONG (every tree
+# refused, or GC refused up front) and its message is 「回收失敗」. An already-clean
+# store is not a failed GC.
+#
+# The NAME and the VALUE are the contract: store_builder reads them as
+# GC_EXIT_EMPTY = getattr(gc_mod, "EXIT_EMPTY_PLAN", 6) and bakes the number into
+# every tools\gc.bat and tools\admin-*.bat it writes.
+EXIT_EMPTY_PLAN = 6
+EXIT_NOTHING_TO_RECLAIM = EXIT_EMPTY_PLAN   # what it MEANS, for anyone reading a caller
 
 # Why a version is in the keep-set. The operator's first question when GC reclaims
 # less than they expected is "why is THAT one still here?", and until now the
@@ -105,17 +150,55 @@ KEEP_LABELS = (
 KEEP_LEASE = "正在執行中(lease)"
 
 
+IN_USE_HINT = "檔案使用中:請把 App 完全關掉(所有視窗),再重跑一次回收。"
+OTHER_HINT = "請先排除上面的錯誤,再重跑一次回收。"
+
+
 class GcError(Exception):
     pass
 
 
+def _in_use(exc: OSError) -> bool:
+    """Is this the one failure the operator can actually fix by closing the App?
+
+    Everything Windows says when a handle is still open on the tree: ACCESS_DENIED
+    (5), SHARING_VIOLATION (32), LOCK_VIOLATION (33). Telling the operator to close
+    the App for a disk error would be as useless as telling them nothing.
+    """
+    winerror = getattr(exc, "winerror", None)
+    return bool(isinstance(exc, PermissionError) or winerror in (5, 32, 33)
+                or exc.errno in (errno.EACCES, errno.EPERM, errno.EBUSY))
+
+
 def _why(exc: OSError) -> str:
     """The operator-actionable half of an OSError, in the terms of the machine."""
-    winerror = getattr(exc, "winerror", None)
-    if isinstance(exc, PermissionError) or winerror in (5, 32, 33) \
-            or exc.errno in (errno.EACCES, errno.EPERM, errno.EBUSY):
+    if _in_use(exc):
         return f"檔案使用中或沒有權限({exc})"
     return str(exc)
+
+
+@dataclass
+class GcSurvivor:
+    """A tree --apply could NOT delete.
+
+    The GUI needs the parts, not a sentence: WHAT it was (label), WHERE it is
+    (path), WHY it stayed (reason) and whether that reason is the fixable one
+    (in_use → 關掉 App 再跑一次). This used to be a bare f-string in a list, so the
+    only way to show it was to print it, and the only way to act on it was to read
+    it.
+    """
+    label: str
+    path: str
+    reason: str
+    in_use: bool = False
+
+    def hint(self) -> str:
+        return IN_USE_HINT if self.in_use else OTHER_HINT
+
+    def line(self) -> str:
+        """The console form. The path leads, because that is what the operator has
+        to go and close."""
+        return f"{self.path}:{self.reason}"
 
 
 def _emit(log, message: str) -> None:
@@ -173,8 +256,15 @@ class GcPlan:
     # never from the plan — a plan is a promise, and the operator is owed the
     # outcome.
     applied: bool = False
-    deleted: list = field(default_factory=list)          # (label, mb)
-    failures: list = field(default_factory=list)         # str
+    deleted: list = field(default_factory=list)          # (label, mb) — MEASURED
+    survivors: list = field(default_factory=list)        # GcSurvivor
+
+    @property
+    def failures(self) -> list:
+        """The survivors, pre-rendered for a console. Kept as a view over the one
+        source of truth: two lists that could disagree about whether 480 MB came
+        back is exactly the bug this module exists to not have."""
+        return [survivor.line() for survivor in self.survivors]
 
     def _mb(self, path: Path) -> float:
         try:
@@ -203,15 +293,63 @@ class GcPlan:
                 + [(f"shell {fp}", p) for fp, p in self.delete_shells]
                 + [(f"建置殘留 {w}", p) for w, p in self.delete_staging])
 
+    def nothing_to_reclaim(self) -> bool:
+        """There is nothing to delete — before --apply and after it alike. NOT a
+        failure, and NOT a reclaim: the disk is exactly as full as it was."""
+        return self.is_empty()
+
     def exit_code(self) -> int:
-        """What the caller (tools\\gc.bat) is told. Four different failures used to
-        exit 2, so the bat could only ever print one story — 「沒有刪掉任何東西」 —
-        and it was false for every partial run."""
-        if not self.applied or not self.failures:
-            return EXIT_OK
-        return EXIT_PARTIAL if self.deleted else EXIT_NOTHING_DELETED
+        """What the caller (tools\\gc.bat) is told. See the contract table.
+
+        Four different failures used to exit 2, so the bat could only ever print one
+        story — 「沒有刪掉任何東西」 — and it was false for every partial run. And
+        two opposite OUTCOMES used to exit 0 — "deleted every tree" and "deleted
+        nothing at all" — so the bat printed 「回收完成。上面列出的項目都已經刪掉
+        了。」 over a run that listed nothing and freed 0 bytes.
+        """
+        if self.is_empty():
+            # Nothing to reclaim, whether or not --apply ran. On the DRY run this is
+            # what stops the bat asking 「以上列出的項目要真的刪除嗎?」 about a blank
+            # list; on --apply it is what stops it answering 「都已經刪掉了」.
+            return EXIT_EMPTY_PLAN
+        if not self.applied:
+            return EXIT_OK                  # a plan with something in it: proceed
+        if self.survivors:
+            return EXIT_PARTIAL if self.deleted else EXIT_NOTHING_DELETED
+        return EXIT_OK                      # every tree in the plan actually went
 
     # ── operator-facing text (plain, cp950-encodable: no emoji, no box-drawing) ──
+
+    def headline(self) -> str:
+        """ONE line, true, safe to show verbatim (a GUI status bar, a console tail).
+
+        Every number in it after --apply is MEASURED from the trees that actually
+        went away. reclaimable_mb() may never appear here: it is a forecast, and
+        printing a forecast in the past tense is how operators came to believe they
+        had reclaimed space that rmtree never managed to take.
+        """
+        if not self.applied:                                   # a plan, not an outcome
+            if not self.is_empty():
+                return (f"試算:可回收 {len(self.items())} 項、"
+                        f"約 {self.reclaimable_mb():.0f} MB(還沒有刪除任何東西)。")
+            if self.self_hosted:
+                return (f"沒有其他可回收的項目;還有一份沒人在用的 runtime "
+                        f"{self.self_hosted},但 GC 正在用它執行,這次回收不掉。")
+            return "沒有可回收的項目。"
+        if self.deleted and self.survivors:
+            return (f"部分回收:刪掉 {len(self.deleted)} 項,"
+                    f"實際回收 {self.reclaimed_mb():.0f} MB;"
+                    f"還有 {len(self.survivors)} 項刪不掉,那些空間沒有回收。")
+        if self.deleted:
+            return (f"回收完成:刪掉 {len(self.deleted)} 項,"
+                    f"實際回收 {self.reclaimed_mb():.0f} MB。")
+        if self.survivors:
+            return (f"一項都沒有刪掉:{len(self.survivors)} 項全部刪不掉,"
+                    "磁碟空間完全沒有回收。")
+        if self.self_hosted:
+            return ("沒有刪掉任何東西:除了 GC 自己正在執行的那份 runtime 之外,"
+                    "沒有可回收的項目。")
+        return "沒有可回收的項目:這次沒有刪掉任何東西,磁碟空間沒有變化。"
 
     def scope_lines(self) -> list[str]:
         """Which apps this run even looked at. On a two-app store, a reclaim that
@@ -318,20 +456,25 @@ class GcPlan:
         """
         lines = self.scope_lines() + self.keep_lines()
         lines += [f"已刪除 {label}({mb:.0f} MB)" for label, mb in self.deleted]
-        if self.deleted and not self.failures:
+        if self.deleted and not self.survivors:
             lines.append(f"實際回收合計:{self.reclaimed_mb():.0f} MB(計畫中的項目全部刪除完成)")
         elif self.deleted:
             lines.append(f"實際回收合計:{self.reclaimed_mb():.0f} MB")
             lines.append(f"部分回收:成功刪除 {len(self.deleted)} 項,"
-                         f"還有 {len(self.failures)} 項刪不掉(見下)。")
-        elif not self.failures and not self.self_hosted:
+                         f"還有 {len(self.survivors)} 項刪不掉(見下)。")
+        elif not self.survivors and not self.self_hosted:
+            # The empty plan, applied. There is no 「實際回收合計」 line here and
+            # there must never be one: 0 MB came back. gc.bat used to be handed
+            # EXIT_OK for this and answered 「上面列出的項目都已經刪掉了。」 about a
+            # list with nothing in it.
             lines.append("沒有可回收的項目,沒有刪除任何東西。")
-        elif self.failures:
-            lines.append(f"一項都沒有刪掉:{len(self.failures)} 項全部刪不掉,"
+            lines.append("磁碟空間沒有變化(這不是錯誤:store 裡本來就沒有可回收的東西)。")
+        elif self.survivors:
+            lines.append(f"一項都沒有刪掉:{len(self.survivors)} 項全部刪不掉,"
                          f"磁碟空間完全沒有回收。")
-        if self.failures:
+        if self.survivors:
             lines.append("下列項目刪不掉,空間「沒有」回收:")
-            lines += [f"  · {problem}" for problem in self.failures]
+            lines += [f"  · {survivor.line()}" for survivor in self.survivors]
             lines.append("  最常見的原因:App 還開著,或檔案總管/防毒正在讀那個資料夾。")
             lines.append("  請把 App 完全關掉(所有視窗),再重跑一次。")
             if self.deleted:
@@ -516,8 +659,8 @@ def collect_plan(root: Path, *, apps: list | None = None) -> GcPlan:
     return plan
 
 
-def _delete_tree(path: Path) -> list[str]:
-    """Delete a tree; return what stopped us, if anything.
+def _delete_tree(label: str, path: Path) -> list:
+    """Delete a tree; return the GcSurvivor that stopped us, if any.
 
     This used to be shutil.rmtree(ignore_errors=True), which turns "the App is
     still running / an antivirus has the folder open / Explorer is sitting in it"
@@ -528,13 +671,17 @@ def _delete_tree(path: Path) -> list[str]:
     try:
         integrity.remove_complete(path)  # first: make it invisible (fail closed)
     except OSError as exc:
-        return [f"{path}:連 .complete 都刪不掉({_why(exc)})"]
+        return [GcSurvivor(label, str(path), f"連 .complete 都刪不掉({_why(exc)})",
+                           _in_use(exc))]
     try:
         shutil.rmtree(path)
     except OSError as exc:
-        return [f"{path}:{_why(exc)}"]
+        return [GcSurvivor(label, str(path), _why(exc), _in_use(exc))]
     if path.exists():
-        return [f"{path}:資料夾還在"]
+        # rmtree said nothing and the folder is still there: on Windows that is a
+        # delete pending behind somebody's open handle. Treat it as in-use — that
+        # is both the usual cause and the only advice that can help.
+        return [GcSurvivor(label, str(path), "資料夾還在(可能有程式正開著它)", True)]
     return []
 
 
@@ -557,10 +704,11 @@ def run_gc(root: Path, *, apps: list | None = None, apply: bool = False,
         for label, path in plan.items():
             size = plan._mb(path)        # measure it while it still exists
             _emit(log, f"刪除 {label} …")
-            problems = _delete_tree(path)
-            if problems:
-                plan.failures.extend(problems)
+            survivors = _delete_tree(label, path)
+            if survivors:
+                plan.survivors.extend(survivors)
             else:
+                # Only a tree that actually went away counts towards reclaimed_mb().
                 plan.deleted.append((label, size))
         # Past tense, from what actually happened — not the forecast we printed
         # before touching anything.
@@ -613,18 +761,33 @@ def main(argv: list | None = None) -> int:
 
     code = plan.exit_code()
     # plan.report() has already listed every survivor and why. The headline here is
-    # what a wrapper (tools\gc.bat) echoes, so it must not contradict it.
+    # what a wrapper (tools\gc.bat) echoes, so it must not contradict it — and every
+    # number in it is MEASURED (reclaimed_mb()), never the plan's forecast.
     if code == EXIT_PARTIAL:
         print(f"\n[gc][注意] 部分回收:已經刪掉 {len(plan.deleted)} 項"
               f"(實際回收 {plan.reclaimed_mb():.0f} MB),"
-              f"另外 {len(plan.failures)} 項刪不掉,那些空間沒有回收。\n"
+              f"另外 {len(plan.survivors)} 項刪不掉,那些空間沒有回收。\n"
               "  上面列出了刪不掉的是哪幾個、為什麼。最常見的是「檔案使用中」:"
               "請把 App 完全關掉(所有視窗)再重跑一次。", file=sys.stderr)
     elif code == EXIT_NOTHING_DELETED:
-        print(f"\n[gc][ERROR] 一項都沒有刪掉:{len(plan.failures)} 項全部刪不掉,"
+        print(f"\n[gc][ERROR] 一項都沒有刪掉:{len(plan.survivors)} 項全部刪不掉,"
               "磁碟空間完全沒有回收。\n"
               "  最常見的原因:App 還開著,或檔案總管/防毒正在讀那個資料夾。\n"
               "  請把 App 完全關掉(所有視窗),再重跑一次。", file=sys.stderr)
+    elif code == EXIT_EMPTY_PLAN:
+        # Not stderr: nothing went wrong. But it must not be silent either — an
+        # operator who ran GC to get disk space back is owed a plain statement that
+        # they are not going to get any, and why that is fine.
+        if plan.self_hosted:
+            because = "  上面說明了那份 runtime 為什麼這次回收不掉,以及要怎麼把它收掉。"
+        elif plan.applied:
+            because = ("  這不是錯誤:store 裡沒有任何沒被引用的版本或 runtime,"
+                       "所以這次沒有刪掉任何東西,磁碟空間也沒有變化。")
+        else:
+            because = "  這不是錯誤:store 裡沒有任何沒被引用的版本或 runtime。"
+        print(f"\n[gc] {plan.headline()}\n{because}")
+    elif code == EXIT_OK and plan.applied:
+        print(f"\n[gc] {plan.headline()}")
     return code
 
 

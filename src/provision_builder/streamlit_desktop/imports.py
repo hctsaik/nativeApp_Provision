@@ -41,6 +41,15 @@ So the gate also has a SOURCE:
     MAY still arrive transitively → warning, and the build goes on. The proof is
     `missing_dependencies()` against the staged interpreter after the install:
     that one knows, and it is still there to fail on.
+
+The third trap is WHERE WE LOOK. Reachability is "what does the entry script
+import, and what do those import" — and Streamlit's `pages/*.py` are imported by
+NOBODY: Streamlit loads them itself, by convention. Seeding the closure with the
+entrypoint alone made this gate blind to every multipage app's pages, so an
+`import zzz_nope` in `pages/2_report.py` produced blocking=[] warnings=[] and the
+build shipped. `pages.py` — shared with the device-side launcher, which had the
+rule right — is the ONE answer to "what does Streamlit actually load", and both
+sides now seed from it.
 """
 
 from __future__ import annotations
@@ -55,6 +64,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
+from . import pages as pages_mod
 from .models import EXCLUDED_DIRS
 
 # import name -> the distribution(s) that provide it, where they differ. A tuple,
@@ -320,23 +330,43 @@ def _parse_import_sites(path: Path) -> list[ImportSite]:
 
 
 @lru_cache(maxsize=8192)
-def _module_file_cached(project_dir: str, entry_dir: str, dotted: str) -> Path | None:
+def _module_file_cached(roots: tuple[str, ...], dotted: str) -> Path | None:
     parts = dotted.split(".")
-    for base in (Path(entry_dir), Path(project_dir), Path(project_dir) / "src"):
-        candidate = base.joinpath(*parts)
+    for base in roots:
+        candidate = Path(base).joinpath(*parts)
         for path in (candidate.with_suffix(".py"), candidate / "__init__.py"):
             if path.is_file():
                 return path
     return None
 
 
-def _module_file(project_dir: Path, entry_dir: Path, dotted: str) -> Path | None:
+def _module_file(roots: tuple[str, ...], dotted: str) -> Path | None:
     """Where a project-local module name actually lives, if it does.
 
     Memoized: this is asked once per import statement per pass, six stat() calls
     a time, and the answer cannot change during one check.
     """
-    return _module_file_cached(str(project_dir), str(entry_dir), dotted)
+    return _module_file_cached(roots, dotted)
+
+
+def _module_roots(project_dir: Path, entrypoint: Path) -> tuple[str, ...]:
+    """Every directory a first-party module name may resolve in.
+
+    The entry script's own folder (that is what `streamlit run` puts on sys.path),
+    the project root, its `src/` — and the `pages/` folder, because a `.py` next
+    to a page is a page's helper, not a package to pip install. Without it,
+    `import shared_bits` inside pages/1_home.py is reported as a missing PyPI
+    distribution; launch.py hit exactly that and the fix now lives in pages.py,
+    once, for both sides.
+    """
+    roots = [Path(entrypoint).parent, Path(project_dir), Path(project_dir) / "src"]
+    roots += pages_mod.first_party_roots(entrypoint, project_dir)
+    ordered: list[str] = []
+    for root in roots:
+        text = str(root)
+        if text not in ordered:
+            ordered.append(text)
+    return tuple(ordered)
 
 
 def runtime_sources(project_dir: Path, entrypoint: Path) -> list[Path]:
@@ -347,11 +377,17 @@ def runtime_sources(project_dir: Path, entrypoint: Path) -> list[Path]:
     playwright helper inside its own package. No blacklist survives the next
     project's naming — but "what does the entry script import, and what do those
     import" is exactly the question, and it has an exact answer.
+
+    …as long as you start in the right place. The walk is seeded with the
+    entrypoint AND with every page Streamlit runs on its own (pages.seed_scripts):
+    nothing imports `pages/2_report.py`, so an import walk that starts at the entry
+    script alone never opens the file — and the operator meets its missing
+    dependency as a red box, after the build said 「檢查通過」.
     """
     project_dir, entrypoint = Path(project_dir), Path(entrypoint)
-    entry_dir = entrypoint.parent
+    roots = _module_roots(project_dir, entrypoint)
     seen: set[Path] = set()
-    queue = [entrypoint]
+    queue = list(pages_mod.seed_scripts(entrypoint, project_dir))
     while queue:
         path = queue.pop()
         if path in seen or not path.is_file():
@@ -364,7 +400,7 @@ def runtime_sources(project_dir: Path, entrypoint: Path) -> list[Path]:
             # skipped. Following the package alone is how a gate goes quiet.
             dotted = [site.module] + [f"{site.module}.{name}" for name in site.names]
             for name in dotted:
-                local = _module_file(project_dir, entry_dir, name)
+                local = _module_file(roots, name)
                 if local is not None and local not in seen:
                     queue.append(local)
     return sorted(seen)
@@ -375,14 +411,15 @@ def classify(project_dir: Path, entrypoint: Path) -> tuple[dict[str, list[Import
     """(required, optional): third-party top-level import name -> where it is imported.
 
     A name is REQUIRED as soon as one reachable file imports it at module level;
-    the same name imported lazily somewhere else does not soften that.
+    the same name imported lazily somewhere else does not soften that. "Reachable"
+    includes the app's pages — see runtime_sources.
     """
     # Fresh view of the filesystem for every check: _module_file also caches
     # "this is NOT a project module", and a GUI that lives for days must not keep
     # calling a file the operator has just added a third-party dependency.
     _module_file_cached.cache_clear()
     project_dir, entrypoint = Path(project_dir), Path(entrypoint)
-    entry_dir = entrypoint.parent
+    roots = _module_roots(project_dir, entrypoint)
     local = local_module_names(project_dir)
     stdlib = set(sys.stdlib_module_names) | {"__future__"}
 
@@ -393,7 +430,7 @@ def classify(project_dir: Path, entrypoint: Path) -> tuple[dict[str, list[Import
             top = site.top
             if top in stdlib or top in local:
                 continue
-            if _module_file(project_dir, entry_dir, site.module) is not None:
+            if _module_file(roots, site.module) is not None:
                 continue                     # the project provides it itself
             bucket = required if site.required else optional
             bucket.setdefault(top, []).append(site)

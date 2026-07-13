@@ -599,6 +599,92 @@ def test_cancel_stops_the_build_cleans_up_and_says_so(request_, stub_pip):
     assert not request_.package_dir.exists()                 # and nothing half-written
 
 
+def test_a_cancel_that_could_not_delete_the_staging_dir_does_not_say_it_did(
+        request_, stub_pip, monkeypatch):
+    """S1. We reach this cleanup moments after taskkill'ing pip's whole process tree,
+    and Windows keeps a dying process's handles open a little longer — Defender, which
+    just watched us write 500 MB, is holding the tree too. rmtree(ignore_errors=True)
+    swallowed all of that, and the operator was told 「暫存目錄已清乾淨」 while 600 MB
+    of it sat in their output folder. Verify before you claim."""
+    real_rmtree = builder_mod.shutil.rmtree
+
+    def locked(path, *args, **kwargs):
+        if Path(path).name.startswith(".staging-"):
+            raise PermissionError(32, "The process cannot access the file")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(builder_mod.shutil, "rmtree", locked)
+    monkeypatch.setattr(builder_mod.time, "sleep", lambda _s: None)
+
+    lines: list[str] = []
+    result = build(request_, progress=lines.append, should_cancel=lambda: True)
+
+    assert result.cancelled and not result.ok
+    leftover = list(request_.output_dir.glob(".staging-*"))
+    assert leftover                                        # the truth on disk
+    assert "已清乾淨" not in result.message                # …and the lie we used to tell
+    assert str(leftover[0]) in result.message              # WHICH folder is still there
+    assert "刪不掉" in result.message
+    assert "下次建置會自動清掉" in result.message          # and what happens about it
+    assert result.message in lines                         # the operator saw it, not just the caller
+    result.message.encode("cp950")                         # a zh-TW console can print it
+
+
+def test_the_next_build_really_does_clean_up_the_staging_dir_a_cancel_left_behind(
+        request_, stub_pip, monkeypatch):
+    """The cancel message promises 「下次建置會自動清掉」. A promise is only worth
+    making if the sweep at the top of build() exists AND is reached AND retries
+    through the lock that beat the cancel."""
+    locked = {"on": True}
+    real_rmtree = builder_mod.shutil.rmtree
+
+    def maybe_locked(path, *args, **kwargs):
+        if locked["on"] and Path(path).name.startswith(".staging-"):
+            raise PermissionError(32, "The process cannot access the file")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(builder_mod.shutil, "rmtree", maybe_locked)
+    monkeypatch.setattr(builder_mod.time, "sleep", lambda _s: None)
+
+    cancelled = build(request_, should_cancel=lambda: True)
+    assert cancelled.cancelled
+    assert list(request_.output_dir.glob(".staging-*"))    # left behind, and it said so
+
+    locked["on"] = False                                   # Defender lets go of it
+    lines: list[str] = []
+    result = build(request_, progress=lines.append)
+
+    assert result.ok
+    assert not any(request_.output_dir.glob(".staging-*"))       # swept, as promised
+    assert any("清掉上次沒收乾淨的暫存目錄" in line for line in lines)
+
+
+def test_clean_orphan_staging_does_not_count_bytes_it_never_freed(tmp_path, monkeypatch):
+    """It added the folder's size to the freed total whatever
+    rmtree(ignore_errors=True) had done with it — reporting reclaimed space it had
+    not reclaimed. That is the same lie as the cancel message, one level down, and
+    it is the sweep the cancel message points at."""
+    out = tmp_path / "out"
+    out.mkdir()
+    junk = out / ".staging-app-deadbeef"
+    junk.mkdir()
+    (junk / "runtime.bin").write_bytes(b"x" * (3 * 1024 ** 2))
+
+    def in_use(*_args, **_kwargs):
+        raise PermissionError(32, "The process cannot access the file")
+
+    monkeypatch.setattr(builder_mod.shutil, "rmtree", in_use)
+    monkeypatch.setattr(builder_mod.time, "sleep", lambda _s: None)
+
+    lines: list[str] = []
+    freed = builder_mod.clean_orphan_staging(out, lines.append)
+
+    assert freed == 0                       # nothing came back…
+    assert junk.is_dir()                    # …because it is still sitting there
+    assert any("刪不掉" in line for line in lines)
+    "\n".join(lines).encode("cp950")
+
+
 def test_cancel_between_stages_never_swaps_a_partial_package_into_place(request_, stub_pip):
     """Cancel arriving during pip must not produce a package folder."""
     fire = {"n": 0}
@@ -630,6 +716,90 @@ def test_build_passes_should_cancel_down_into_pip(request_, stub_pip):
     build(request_, should_cancel=lambda: False)
     assert "should_cancel" in stub_pip["install_kwargs"]
     assert callable(stub_pip["install_kwargs"]["should_cancel"])
+
+
+def fat_template(root: Path, files: int = 60, size: int = 32 * 1024) -> Path:
+    """A runtime template big enough to be worth cancelling out of."""
+    (root / "Lib").mkdir(parents=True)
+    (root / "python.exe").write_bytes(b"MZ" + b"\0" * size)
+    for index in range(files):
+        (root / "Lib" / f"mod{index:03d}.py").write_bytes(b"x" * size)
+    return root
+
+
+def test_cancel_during_the_runtime_copy_stops_inside_it_not_after_it(tmp_path):
+    """S1. shutil.copytree has no cancellation hook, so 取消 pressed during the
+    500 MB runtime copy did nothing at all for tens of seconds: the button greyed
+    out, the status sat on 「正在取消…」, and Defender ground through every last file
+    before anyone looked at the flag. It is the longest step in the build and it was
+    the only one with no way out and no feedback."""
+    template = fat_template(tmp_path / "template")
+    calls = {"n": 0}
+
+    def cancel_midway() -> bool:
+        calls["n"] += 1
+        return calls["n"] > 6          # the operator presses 取消 partway through
+
+    dest = tmp_path / "runtime"
+    with pytest.raises(runtime_mod.BuildCancelled):
+        runtime_mod.copy_runtime(template, dest, should_cancel=cancel_midway)
+
+    copied = list(dest.rglob("mod*.py"))
+    assert copied                                       # it had started…
+    assert len(copied) < 60                             # …and it stopped without finishing
+    assert not (dest / "Lib" / "mod059.py").exists()    # it did NOT run to the end
+
+
+def test_the_runtime_copy_says_where_it_is_instead_of_freezing(tmp_path):
+    """500 MB with Defender in the loop is the single longest step of the build, and
+    the only one that reported nothing at all while it ran."""
+    template = fat_template(tmp_path / "template", files=40, size=64 * 1024)
+    lines: list[str] = []
+
+    python = runtime_mod.copy_runtime(template, tmp_path / "runtime",
+                                      progress=lines.append)
+
+    assert python.is_file()
+    assert any("runtime" in line and "MB" in line for line in lines)
+    "\n".join(lines).encode("cp950")
+
+
+def test_the_runtime_copy_still_copies_everything_it_used_to(tmp_path):
+    """We hand-rolled the copy to make it cancellable; it must still produce exactly
+    the tree shutil.copytree did — no .pyc, no __pycache__, empty dirs kept."""
+    template = tmp_path / "template"
+    (template / "Lib" / "__pycache__").mkdir(parents=True)
+    (template / "Lib" / "__pycache__" / "os.cpython-311.pyc").write_bytes(b"junk")
+    (template / "DLLs").mkdir()                            # an empty dir travels too
+    (template / "python.exe").write_bytes(b"MZ fake")
+    (template / "Lib" / "os.py").write_text("# stdlib", encoding="utf-8")
+    (template / "Lib" / "os.pyc").write_bytes(b"junk")     # loose .pyc beside its source
+
+    dest = tmp_path / "runtime"
+    runtime_mod.copy_runtime(template, dest)
+
+    assert (dest / "python.exe").is_file()
+    assert (dest / "Lib" / "os.py").is_file()
+    assert (dest / "DLLs").is_dir()
+    assert not list(dest.rglob("*.pyc"))
+    assert not list(dest.rglob("__pycache__"))
+
+
+def test_build_passes_should_cancel_down_into_the_runtime_copy(request_, stub_pip, monkeypatch):
+    """If the cancel flag stops at the builder's door, the operator waits out the
+    whole 500 MB copy anyway — which is precisely what they were doing."""
+    seen = {}
+    real_copy = runtime_mod.copy_runtime
+
+    def spy(template, dest, **kwargs):
+        seen.update(kwargs)
+        return real_copy(template, dest)
+
+    monkeypatch.setattr(runtime_mod, "copy_runtime", spy)
+    build(request_, should_cancel=lambda: False)
+
+    assert callable(seen.get("should_cancel"))
+    assert callable(seen.get("progress"))
 
 
 def test_cancelling_pip_kills_the_whole_child_tree_not_just_pip(monkeypatch, tmp_path):
@@ -665,6 +835,45 @@ def test_cancelling_pip_kills_the_whole_child_tree_not_just_pip(monkeypatch, tmp
                                          should_cancel=lambda: True)
 
     assert killed == [["taskkill", "/PID", "4242", "/T", "/F"]]
+
+
+# ── the delivered launcher is self-contained ─────────────────────────────────
+
+def test_the_delivered_launcher_carries_the_shared_page_rules(request_, stub_pip):
+    """launch.py loads pages.py BY PATH on the target machine — there is no
+    provision_builder there to import it from. Ship the package without it and the
+    App does not start at all: LauncherIncomplete, exit 4, 「launcher 資料夾不完整…
+    請重新建置」 about a build we had just called 完成.
+
+    The module exists because the build gate and the device used two different
+    rulebooks for 「what does Streamlit actually load」 — and the build gate could not
+    see pages\\ at all, so a missing import in pages\\2_report.py passed 100% of the
+    build checks and went to the factory floor. One rulebook is only one rulebook if
+    it travels with the package.
+    """
+    from provision_builder.streamlit_desktop import pages as pages_mod
+
+    package = build(request_).package_dir
+    delivered = package / "launcher" / pages_mod.DELIVERED_NAME
+
+    assert delivered.is_file()
+    # …and it is the real thing, not a name collision: launch.py checks this mark
+    # before it will trust the file it just loaded.
+    assert pages_mod.MODULE_MARK in delivered.read_text("utf-8")
+
+
+def test_a_package_without_the_page_rules_fails_its_own_smoke_test(request_, stub_pip):
+    """Catch it here, on the build machine, where it can still be fixed — not on the
+    user's desk as exit 4."""
+    from provision_builder.streamlit_desktop import pages as pages_mod
+
+    package = build(request_).package_dir
+    manifest = json.loads((package / "app-package.json").read_text("utf-8"))
+    assert smoke_test(package, manifest) == []
+
+    (package / "launcher" / pages_mod.DELIVERED_NAME).unlink()
+    problems = smoke_test(package, manifest)
+    assert any(pages_mod.DELIVERED_NAME in problem for problem in problems)
 
 
 # ── package self-check ───────────────────────────────────────────────────────

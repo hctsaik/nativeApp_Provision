@@ -23,6 +23,7 @@ from fnmatch import fnmatch
 from pathlib import Path
 
 from . import imports as imports_mod
+from . import pages as pages_mod
 from . import requirements as requirements_mod
 from . import runtime as runtime_mod
 from .models import (
@@ -343,18 +344,76 @@ def _excluded_summary(excluded: dict[str, int]) -> str:
     return f"已自動排除:{'、'.join(shown)}(共 {total:.0f} MB,不會進交付包)"
 
 
+def _rmtree_with_retry(path: Path, attempts: int = 8,
+                       progress: Progress = _noop) -> bool:
+    """Delete a tree, backing off exactly like _rename_with_retry does — and then
+    CHECK. Returns True only if the directory is really gone.
+
+    `shutil.rmtree(ignore_errors=True)` is not a delete, it is a wish. We call this
+    immediately after taskkill'ing a pip process tree, and Windows keeps the handles
+    of a dying process open for a moment; Defender, having just watched us write
+    500 MB, is holding the tree open too. rmtree then fails, ignore_errors swallows
+    it, and 600 MB stays on the disk under a message that says it is gone.
+    """
+    path = Path(path)
+    delay = 0.5
+    for attempt in range(1, attempts + 1):
+        try:
+            shutil.rmtree(path)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            pass                      # in use: back off and try again
+        if not path.exists():
+            return True
+        if attempt == attempts:
+            return False
+        if attempt == 2:              # the first couple usually win; do not chatter
+            progress("暫存目錄還被系統鎖住(防毒或剛結束的 pip),等它放行…")
+        time.sleep(delay)
+        delay = min(delay * 2, 5.0)
+    return not path.exists()
+
+
+def _remove_staging(staging: Path, progress: Progress = _noop) -> tuple[bool, str]:
+    """Delete the staging directory and report WHAT ACTUALLY HAPPENED.
+
+    Never claim a cleanup you did not verify. This is the whole bug: the cancel
+    path said 「暫存目錄已清乾淨」 unconditionally while doing an ignore_errors
+    rmtree on a tree we had just killed a pip process inside of — so the operator
+    was told the 600 MB was gone while it sat there in the output folder.
+    """
+    if not Path(staging).exists():
+        return True, ""
+    if _rmtree_with_retry(staging, progress=progress):
+        return True, ""
+    return False, (f"暫存目錄 {staging} 有檔案被系統鎖住,暫時刪不掉"
+                   "(下次建置會自動清掉)")
+
+
 def clean_orphan_staging(output_dir: Path, progress: Progress = _noop) -> int:
     """A crashed or killed build leaves a `.staging-*` directory holding a whole
     copied runtime — hundreds of MB of invisible garbage in the operator's output
-    folder. Sweep them before we add one more, and say how much we got back."""
+    folder. Sweep them before we add one more, and say how much we got back.
+
+    This is also the promise the cancel path makes when it cannot delete its own
+    staging directory (「下次建置會自動清掉」), so it has to be a real sweep: retry
+    through the transient lock, and only count the bytes that actually went away.
+    It used to add `size` to the total whatever rmtree(ignore_errors=True) did with
+    it, i.e. it reported reclaiming space it had not reclaimed — the same lie one
+    level down.
+    """
     freed = 0
     for path in sorted(Path(output_dir).glob(".staging-*")):
         if not path.is_dir():
             continue
         size = directory_size(path)
         progress(f"清掉上次沒收乾淨的暫存目錄:{path.name}({size / MB:.0f} MB)")
-        shutil.rmtree(path, ignore_errors=True)
-        freed += size
+        if _rmtree_with_retry(path, progress=progress):
+            freed += size
+        else:
+            progress(f"注意:{path.name} 現在刪不掉(有檔案被鎖住),"
+                     "它還留在輸出資料夾裡,下次建置會再試一次。")
     return freed
 
 
@@ -464,7 +523,12 @@ def build(request: BuildRequest, progress: Progress = _noop,
 
         check_cancel()
         progress("複製可攜 Python runtime…")
-        python = runtime_mod.copy_runtime(request.runtime_template, staging / "runtime")
+        # The 500 MB step. It gets the cancel flag AND a progress hook: a check at
+        # the stage boundary only tells the operator "your 取消 will be honoured
+        # once this finishes", which for this stage is half a minute of a frozen
+        # button and no output at all.
+        python = runtime_mod.copy_runtime(request.runtime_template, staging / "runtime",
+                                          should_cancel=should_cancel, progress=progress)
 
         found = requirements_mod.resolve(request.project_dir, request.explicit_requirements,
                                          staging=staging, extras=request.extras)
@@ -496,6 +560,14 @@ def build(request: BuildRequest, progress: Progress = _noop,
         (staging / "launcher").mkdir()
         for name in ("launch.py", "engine_shim.py"):
             shutil.copy2(TEMPLATES / name, staging / "launcher" / name)
+        # The shared page rules — 「what does Streamlit actually LOAD」 — travel next
+        # to launch.py. The delivered machine has no provision_builder to import them
+        # from, so launch.py loads this file BY PATH; ship the package without it and
+        # the launcher refuses to start (LauncherIncomplete, exit 4) rather than run a
+        # preflight that is silently blind to pages\. One rulebook, both sides: the
+        # build gate could not see pages\ at all, so a missing import in
+        # pages\2_report.py passed every check here and failed on the factory floor.
+        shutil.copy2(pages_mod.SOURCE, staging / "launcher" / pages_mod.DELIVERED_NAME)
         shutil.copy2(TEMPLATES / "start.bat", staging / "start.bat")
         _write_messages(staging)          # the Chinese start.bat `type`s; see _write_bat
 
@@ -539,10 +611,18 @@ def build(request: BuildRequest, progress: Progress = _noop,
     except BuildCancelled:
         # Not a failure: nothing is broken, nothing is half-written, and the
         # caller must not be able to mistake this for success.
-        shutil.rmtree(staging, ignore_errors=True)
-        message = "已取消建置,暫存目錄已清乾淨"
+        #
+        # But do not TELL them the staging directory is gone until it is. We reach
+        # here moments after taskkill'ing pip's whole process tree, and on Windows
+        # its handles outlive it; ignore_errors=True then swallowed the failure and
+        # we announced 「暫存目錄已清乾淨」 over 600 MB that was still sitting in the
+        # operator's output folder. Retry, verify, and say which of the two happened.
+        removed, note = _remove_staging(staging, progress)
+        message = ("已取消建置,暫存目錄已清乾淨" if removed
+                   else f"已取消建置。{note}")
         progress(message)
         return BuildResult(ok=False, cancelled=True, message=message,
+                           warnings=warnings if removed else warnings + [note],
                            duration_seconds=time.monotonic() - started)
     except (runtime_mod.RuntimeError_, imports_mod.ImportGateError,
             imports_mod.ImportProbeError, requirements_mod.RequirementsError,
@@ -550,15 +630,17 @@ def build(request: BuildRequest, progress: Progress = _noop,
         # Rescue the log BEFORE deleting staging — the old code pointed the
         # operator at a path it had just removed.
         saved_log = _rescue_log(build_log, request.output_dir, final.name)
-        shutil.rmtree(staging, ignore_errors=True)   # previous output untouched
+        removed, note = _remove_staging(staging, progress)   # previous output untouched
         # ...and the exception text ITSELF names that staging path (pip's error
         # carries "log:<staging>\data\logs\build.log"). Rescuing the file while
         # still printing the old address just moves the dead end one line down.
         message = str(exc)
         if saved_log is not None:
             message = message.replace(str(build_log), str(saved_log))
+        if not removed:
+            progress(note)
         return BuildResult(ok=False, errors=[message], log_path=saved_log,
-                           warnings=warnings,
+                           warnings=warnings if removed else warnings + [note],
                            duration_seconds=time.monotonic() - started)
 
 
@@ -578,6 +660,13 @@ def smoke_test(package: Path, manifest: dict) -> list[str]:
             problems.append(f"manifest.{key} 指向不存在的檔案:{relative}")
     if not (package / "start.bat").is_file():
         problems.append("缺少 start.bat")
+    # launch.py loads this by path on a machine that has no provision_builder. Without
+    # it the delivered App does not start at all (LauncherIncomplete → exit 4), and
+    # the operator reads 「launcher 資料夾不完整…請重新建置」 about a build that this
+    # very function had just declared complete.
+    if not (package / "launcher" / pages_mod.DELIVERED_NAME).is_file():
+        problems.append(f"缺少 launcher\\{pages_mod.DELIVERED_NAME}"
+                        "(launch.py 靠它判斷 Streamlit 會載入哪些頁面)")
     # start.bat is ASCII and `type`s its Chinese out of messages\. Ship it without
     # them and every error the user can actually hit prints an English tag and then
     # silence — which is how they learn nothing at the one moment they need to.

@@ -12,9 +12,12 @@ import pytest
 from provision_builder.streamlit_desktop import imports as imports_mod
 from provision_builder.streamlit_desktop import runtime as runtime_mod
 from provision_builder.streamlit_desktop import store_builder
+from provision_builder.streamlit_desktop import models
+from provision_builder.streamlit_desktop import pages as pages_mod
 from provision_builder.streamlit_desktop.device import (
     bootstrap,
     gc as gc_mod,
+    identifiers,
     integrity,
     leases,
     paths as paths_mod,
@@ -411,8 +414,12 @@ def test_gc_dry_run_deletes_nothing(tree):
 
 # ── store builder ────────────────────────────────────────────────────────────
 
-def make_store_project(tmp_path: Path, name: str = "Demo App") -> BuildRequest:
-    """A buildable project + the shared (fake) shell and runtime template."""
+def make_store_project(tmp_path: Path, name: str = "Demo App",
+                       app_id: str | None = None) -> BuildRequest:
+    """A buildable project + the shared (fake) shell and runtime template.
+
+    `app_id` is BuildRequest.app_id_override — the GUI's 「應用代號」 field.
+    """
     project = tmp_path / f"proj-{store_builder.slugify(name)}"
     project.mkdir(exist_ok=True)
     (project / "app.py").write_text("import streamlit as st\nst.write('READY')\n",
@@ -428,7 +435,8 @@ def make_store_project(tmp_path: Path, name: str = "Demo App") -> BuildRequest:
         (template / "Scripts").mkdir()
     return BuildRequest(project_dir=project, entrypoint=project / "app.py",
                         display_name=name, output_dir=tmp_path / "unused",
-                        shell_exe=shell, runtime_template=template)
+                        shell_exe=shell, runtime_template=template,
+                        app_id_override=app_id)
 
 
 @pytest.fixture
@@ -541,6 +549,140 @@ def test_gc_keeps_the_shell_a_version_still_needs(tree):
     assert (tree / "deps" / "shells" / "shell-keepme").exists()
 
 
+# ── S8:一台機器、兩個 App —— 兩個 App 必須真的是兩個 App ─────────────────────
+#
+# 這一節全部在講同一件事:app_id 就是這個 App 在這台機器上的「身分」。身分撞在一起,
+# 第二個 App 就會蓋掉第一個,而現場看不出來 —— 資料夾名、啟動檔名、管理主控台全都不變,
+# 只有程式換了。
+
+def test_two_chinese_named_apps_do_not_collide_into_one_app(stub_toolchain, tmp_path):
+    """S8, THE BLOCKER。slugify() 把非英數字全部丟掉,所以「影像檢視器」和「報表分析」
+    以前都得到同一個 app_id(app-streamlit-app):同一個資料夾、同一個 start bat、
+    同一份 manifest。第二次建置看起來像「版本已經建過了」,而操作員照著那句話把版本號
+    往上加 —— 產線上的 App A 就這樣被換成另一支程式,名字和入口都沒變。
+    """
+    root = tmp_path / "ROOT"
+    viewer = make_store_project(tmp_path, "影像檢視器", app_id="image-viewer")
+    report = make_store_project(tmp_path, "報表分析", app_id="report-analyzer")
+
+    assert viewer.app_id != report.app_id                     # 兩個身分,不是一個
+    first = store_builder.build_into_store(viewer, root, version="v1.0.0")
+    second = store_builder.build_into_store(report, root, version="v1.0.0")
+    assert first.ok, first.errors
+    assert second.ok, second.errors                            # 不再是「版本衝突」
+    assert (first.app_id, second.app_id) == ("app-image-viewer", "app-report-analyzer")
+
+    # 兩棵版本樹、兩份 manifest、兩個顯示名稱,誰也沒有蓋掉誰
+    assert sorted(paths_mod.list_app_ids(root)) == ["app-image-viewer",
+                                                    "app-report-analyzer"]
+    for app_id, request in ((first.app_id, viewer), (second.app_id, report)):
+        vdir = root / "apps" / app_id / "versions" / "v1.0.0"
+        assert integrity.is_complete(vdir)
+        manifest = json.loads((vdir / "app-package.json").read_text("utf-8"))
+        assert manifest["app_id"] == app_id
+        assert manifest["display_name"] == request.display_name
+        # 各自的入口與各自的主控台(共用的只有 runtime)
+        assert (root / f"start-{app_id}.bat").is_file()
+        assert (root / "tools" / f"admin-{app_id}.bat").is_file()
+
+    # 500 MB 的 runtime 還是只有一份 —— 「共用 runtime」和「同一個 App」是兩件事
+    assert second.runtime_reused
+    assert len([p for p in (root / "deps" / "runtimes").iterdir() if p.is_dir()]) == 1
+    assert first.fingerprint == second.fingerprint
+
+
+def test_a_second_app_under_an_existing_app_id_is_refused_and_never_called_a_version_collision(
+        stub_toolchain, tmp_path):
+    """The sticky-field disaster: the operator gives App B the app id they typed for
+    App A last time. That must STOP, and the message must never say 「改版本號」 — the
+    old one did, and following it overwrites App A with App B."""
+    root = tmp_path / "ROOT"
+    viewer = make_store_project(tmp_path, "影像檢視器", app_id="image-viewer")
+    report = make_store_project(tmp_path, "報表分析", app_id="image-viewer")  # 同一個代號
+    assert store_builder.build_into_store(viewer, root, version="v1.0.0").ok
+
+    result = store_builder.build_into_store(report, root, version="v1.0.0")
+    assert not result.ok
+    message = "\n".join(result.errors)
+    assert "影像檢視器" in message and "報表分析" in message   # 兩個名字都要講出來
+    assert "app-image-viewer" in message                       # 撞在一起的那個身分
+    assert "這不是版本衝突" in message
+    for bad_advice in ("改成 v1.0.1", "把版本號改成", "要發新版"):
+        assert bad_advice not in message, "叫操作員改版本號 = 叫他覆蓋掉線上那支 App"
+
+    # 而且什麼都沒有動:App A 的版本、manifest、狀態原封不動
+    vdir = root / "apps" / "app-image-viewer" / "versions" / "v1.0.0"
+    manifest = json.loads((vdir / "app-package.json").read_text("utf-8"))
+    assert manifest["display_name"] == "影像檢視器"
+    assert paths_mod.list_app_ids(root) == ["app-image-viewer"]
+
+
+def test_a_name_with_no_latin_characters_is_refused_before_anything_is_written(
+        stub_toolchain, tmp_path):
+    """A store id is a folder name, a start-<id>.bat and a console name, forever. A
+    name with nothing to slugify cannot produce one, so the build stops and asks —
+    it does not invent `app-streamlit-app` (a collision) or a digest (a barcode)."""
+    root = tmp_path / "ROOT"
+    request = make_store_project(tmp_path, "影像檢視器")        # no explicit app id
+    result = store_builder.build_into_store(request, root, version="v1.0.0")
+
+    assert not result.ok
+    message = "\n".join(result.errors)
+    assert "影像檢視器" in message
+    assert "應用代號" in message and "app id" in message
+    assert not (root / "apps").exists()                        # 什麼都沒寫進去
+    assert not (root / "deps").exists()
+
+
+def test_an_explicit_app_id_does_not_need_the_app_prefix(stub_toolchain, tmp_path):
+    """`app-` is a portal rendering contract (engine.py::_derive_category), not
+    something a person should have to remember."""
+    request = make_store_project(tmp_path, "影像檢視器", app_id="image-viewer")
+    assert request.app_id == "app-image-viewer"
+    assert make_store_project(tmp_path, "報表分析",
+                              app_id="app-report").app_id == "app-report"
+    root = tmp_path / "ROOT"
+    result = store_builder.build_into_store(request, root, version="v1.0.0")
+    assert result.ok and result.app_id == "app-image-viewer"
+    assert (root / "apps" / "app-image-viewer").is_dir()
+
+
+def test_an_illegal_app_id_is_a_message_not_a_traceback(stub_toolchain, tmp_path):
+    request = make_store_project(tmp_path, "影像檢視器", app_id="../../etc")
+    result = store_builder.build_into_store(request, tmp_path / "ROOT", version="v1.0.0")
+    assert not result.ok
+    assert "應用代號" in "\n".join(result.errors)
+
+
+def test_rebuilding_the_same_app_with_the_same_name_is_not_a_collision(build_request,
+                                                                       stub_toolchain,
+                                                                       tmp_path):
+    """The guard must not fire on the ordinary case it sits in front of: the same app,
+    a new version."""
+    root = tmp_path / "ROOT"
+    assert store_builder.build_into_store(build_request, root, version="v1.0.0").ok
+    assert store_builder.build_into_store(build_request, root, version="v1.1.0").ok
+
+
+def test_slugify_never_hands_two_different_names_the_same_id():
+    """The floor under all of the above, and it holds in FAT mode too, where there is
+    no store to refuse anything: a name with no latin characters used to slug to the
+    constant "streamlit-app", so EVERY pair of Chinese-named apps was one app."""
+    names = ["影像檢視器", "報表分析", "產線 檢視器", "看板", "報表分析 "]
+    ids = {models.app_id_for(n) for n in names}
+    assert len(ids) == len({n.strip() for n in names})       # 每個名字一個身分
+    assert "app-streamlit-app" not in ids                    # 共用的那個常數,不存在了
+
+    # 決定性:同一個名字永遠是同一個 id(否則同一個 App 每次建置都變成新的 App)
+    assert models.app_id_for("影像檢視器") == models.app_id_for("影像檢視器")
+    assert models.slugify("影像檢視器").startswith("streamlit-app-")
+    # 而有英數字可用時,slug 還是那個看得懂的 slug(既有行為不能動)
+    assert models.slugify("Alpha Viewer") == "alpha-viewer"
+    assert models.app_id_for("Report 2") == "app-report-2"
+    # 這種 id 是合法的路徑元件 —— 撞不到別人,也逃不出 root
+    identifiers.validate_identifier(models.slugify("影像檢視器"), "app_id")
+
+
 def test_store_build_creates_the_whole_tree(build_request, stub_toolchain, tmp_path):
     root = tmp_path / "ROOT"
     result = store_builder.build_into_store(build_request, root, version="v1.0.0")
@@ -556,6 +698,40 @@ def test_store_build_creates_the_whole_tree(build_request, stub_toolchain, tmp_p
     assert (root / "bootstrap" / "bootstrap.py").is_file()
     assert (root / "start.bat").is_file()
     assert state_mod.StateStore(root / "apps" / build_request.app_id / "state").load().current == "v1.0.0"
+
+
+def test_a_delivered_version_carries_the_shared_page_rules(build_request, stub_toolchain,
+                                                           tmp_path):
+    """launch.py loads `launcher/pages.py` BY PATH on the device (there is no
+    provision_builder inside a delivered package) and refuses to start without it —
+    LauncherIncomplete, exit 4, 「launcher 資料夾不完整」. It is one file; forgetting to
+    ship it turns every new version into a version that cannot start.
+
+    It has to survive the ROUND TRIP too: it lives inside the version directory, so
+    both exports carry it — a 完整交付 the factory boots from, and an update payload
+    that becomes the next `current`.
+    """
+    root = tmp_path / "ROOT"
+    assert store_builder.build_into_store(build_request, root, version="v1.0.0").ok
+    app = build_request.app_id
+
+    delivered = pages_mod.DELIVERED_NAME
+    built = root / "apps" / app / "versions" / "v1.0.0" / "launcher" / delivered
+    assert built.is_file(), "版本裡沒有 pages.py — 這個版本在裝置上啟動不了"
+    assert built.read_bytes() == pages_mod.SOURCE.read_bytes()
+    # the device refuses a pages.py that is not THE pages.py, so the mark must travel
+    assert pages_mod.MODULE_MARK in built.read_text("utf-8")
+    # and it is covered by files.json, so a corrupted copy fails the integrity check
+    # instead of being loaded
+    assert integrity.verify_tree(built.parent.parent) == []
+
+    out = tmp_path / "deliver"
+    store_builder.export_full_tree(root, out)
+    assert (out / "apps" / app / "versions" / "v1.0.0" / "launcher" / delivered).is_file()
+
+    payload = tmp_path / "update"
+    store_builder.export_update(root, app, "v1.0.0", payload)
+    assert (payload / app / "versions" / "v1.0.0" / "launcher" / delivered).is_file()
 
 
 def test_second_version_with_same_lock_reuses_the_runtime(build_request, stub_toolchain, tmp_path):

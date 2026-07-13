@@ -20,9 +20,28 @@ from collections.abc import Callable
 from pathlib import Path
 
 ShouldCancel = Callable[[], bool]
+Progress = Callable[[str], None]
 
 # How often we look up from pip's output to ask "has the operator given up?".
 CANCEL_POLL_SECONDS = 0.2
+
+# The runtime copy is 500 MB of small files with Defender inspecting every one of
+# them. shutil.copytree has no cancellation hook and no progress hook, so 取消
+# pressed here did nothing at all until the whole tree had been copied — tens of
+# seconds of a greyed-out button under 「正在取消…」. We copy it ourselves: the
+# cancel flag is read between files (and between chunks of a big one), and the
+# operator gets a percentage instead of a frozen window.
+MB = 1024 ** 2
+COPY_CHUNK = 4 * MB                 # bytes copied between two cancel checks
+PROGRESS_STEP = 50 * MB             # how often to say where we are
+
+# The template ships stdlib .pyc files. The __pycache__ directories are skipped
+# wholesale; the loose .pyc/.pyo beside their sources are not, and any left behind
+# gets declared in files.json and then dropped on export — which is exactly the
+# mismatch that made every exported runtime fail verification. (strip_bytecode()
+# runs afterwards as the belt to this pair of braces.)
+COPY_SKIP_DIRS = ("__pycache__",)
+COPY_SKIP_SUFFIXES = (".pyc", ".pyo")
 
 
 class RuntimeError_(Exception):
@@ -34,16 +53,85 @@ class BuildCancelled(Exception):
     caller is expected to clean the staging directory and say so plainly."""
 
 
-def copy_runtime(template: Path, dest: Path) -> Path:
+def _plan_copy(template: Path) -> tuple[list, int]:
+    """Every file that will travel, and how many bytes that is — a stat-only walk,
+    so the percentage we show is measured rather than guessed."""
+    entries: list = []
+    total = 0
+    for dirpath, dirnames, filenames in os.walk(template):
+        dirnames[:] = [d for d in dirnames if d not in COPY_SKIP_DIRS]
+        here = Path(dirpath)
+        for name in filenames:
+            if name.endswith(COPY_SKIP_SUFFIXES):
+                continue
+            source = here / name
+            try:
+                size = source.stat().st_size
+            except OSError:
+                continue
+            entries.append((source, source.relative_to(template), size))
+            total += size
+    return entries, total
+
+
+def _copy_file(source: Path, target: Path, should_cancel: ShouldCancel | None) -> None:
+    """copy2, but interruptible. A single 200 MB .pyd inside a 取消 is still a
+    ten-second wall if we hand it to shutil and look away."""
+    with open(source, "rb") as reader, open(target, "wb") as writer:
+        while True:
+            if should_cancel is not None and should_cancel():
+                raise BuildCancelled("複製 runtime 已被使用者中止")
+            chunk = reader.read(COPY_CHUNK)
+            if not chunk:
+                break
+            writer.write(chunk)
+    shutil.copystat(source, target)
+
+
+def copy_runtime(template: Path, dest: Path, *,
+                 should_cancel: ShouldCancel | None = None,
+                 progress: Progress | None = None) -> Path:
+    """Stage the portable interpreter, cancellably.
+
+    This is the longest single step of a build and it used to be the only one with
+    no feedback and no way out: `shutil.copytree` cannot be cancelled, so 取消
+    pressed during the runtime copy left the GUI sitting on 「正在取消…」 until the
+    last of 500 MB had been written — and only then noticed the flag.
+    """
+    template, dest = Path(template), Path(dest)
     python = template / "python.exe"
     if not python.is_file():
         raise RuntimeError_(f"runtime 範本沒有 python.exe:{template}")
-    # The template itself ships stdlib .pyc files; ignore_patterns skips the
-    # __pycache__ directories but not the loose ones, and any .pyc left behind
-    # gets declared in files.json and then dropped on export — which is exactly
-    # the mismatch that made every exported runtime fail verification.
-    shutil.copytree(template, dest, dirs_exist_ok=True,
-                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"))
+
+    entries, total = _plan_copy(template)
+    dest.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    next_tick = PROGRESS_STEP
+    # Below a megabyte the copy is instant and a progress line is just noise (and
+    # 「共 0 MB」 at that). The step that needs narrating is the 500 MB one.
+    talk = progress is not None and total >= MB
+    if talk:
+        progress(f"    runtime 共 {total / MB:.0f} MB,開始複製…")
+
+    for source, relative, size in entries:
+        if should_cancel is not None and should_cancel():
+            raise BuildCancelled("複製 runtime 已被使用者中止")
+        target = dest / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _copy_file(source, target, should_cancel)
+        copied += size
+        if talk and copied >= next_tick:
+            progress(f"    複製 runtime… {copied * 100 / total:.0f}% "
+                     f"({copied / MB:.0f}/{total / MB:.0f} MB)")
+            next_tick = copied + PROGRESS_STEP
+
+    # Empty directories travel too: copytree created them, and a runtime that is
+    # missing one it expects (Lib\site-packages on a bare template) is a runtime
+    # that fails on the target machine, not here.
+    for dirpath, dirnames, _files in os.walk(template):
+        dirnames[:] = [d for d in dirnames if d not in COPY_SKIP_DIRS]
+        (dest / Path(dirpath).relative_to(template)).mkdir(parents=True, exist_ok=True)
+
     strip_bytecode(dest)
     staged = dest / "python.exe"
     if not staged.is_file():

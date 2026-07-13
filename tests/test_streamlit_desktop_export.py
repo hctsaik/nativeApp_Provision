@@ -29,7 +29,16 @@ LOCK = "streamlit==1.40.0\n"
 PANDAS_LOCK = "streamlit==1.40.0\npandas==2.2.0\n"
 
 
-def make_project(tmp_path: Path, name: str, *, lock: str = LOCK) -> BuildRequest:
+def make_project(tmp_path: Path, name: str, *, lock: str = LOCK,
+                 app_id: str | None = None) -> BuildRequest:
+    """`app_id` = BuildRequest.app_id_override, i.e. the GUI's 「應用代號」 field.
+
+    A name with no latin characters (「產線 檢視器」) has no slug to derive an id
+    from, and a store REFUSES a derived id — so these tests pass one, exactly as the
+    operator now has to. The display name stays Chinese: that is the half that has to
+    keep reaching the user, and it does (messages\\*.txt), which is what most of the
+    tests below are about.
+    """
     project = tmp_path / f"proj-{store_builder.slugify(name)}"
     (project).mkdir(parents=True)
     (project / "app.py").write_text("import streamlit as st\nst.write('READY')\n",
@@ -45,7 +54,8 @@ def make_project(tmp_path: Path, name: str, *, lock: str = LOCK) -> BuildRequest
         (template / "Scripts").mkdir()
     return BuildRequest(project_dir=project, entrypoint=project / "app.py",
                         display_name=name, output_dir=tmp_path / "unused",
-                        shell_exe=shell, runtime_template=template)
+                        shell_exe=shell, runtime_template=template,
+                        app_id_override=app_id)
 
 
 @pytest.fixture
@@ -425,24 +435,128 @@ def test_a_two_app_delivery_delivers_both_apps_and_names_both_entries(stub_toolc
     assert f"start-{alpha.app_id}.bat" in readme
 
 
-def test_exporting_again_into_the_same_folder_leaves_no_stale_entry_bat(stub_toolchain,
-                                                                        tmp_path):
-    """The operator reuses the USB folder. A start bat left over from the previous
-    delivery points at an app this delivery does not contain."""
+def test_exporting_one_app_does_not_delete_the_other_apps_only_entry_point(stub_toolchain,
+                                                                           tmp_path):
+    """S8, BLOCKER. The operator reuses the USB folder: it already holds a delivery of
+    App A. They export App B into it — and the exporter unlinked every start bat that
+    was not part of THIS export, so App A's start bat was deleted while App A's entire
+    500 MB tree stayed exactly where it was. The folder still contains App A. There is
+    just no longer any way for a human being to start it.
+
+    tools\\ had the right rule all along (the union of「this export」and「what is
+    installed in the destination」). The entry bats and the 讀我 now use the same one.
+    """
     root = tmp_path / "ROOT"
     alpha = make_project(tmp_path, "Alpha Viewer")
     beta = make_project(tmp_path, "Beta Viewer")
     build_history(alpha, root, "v1")
     build_history(beta, root, "v1")
 
-    out = tmp_path / "usb"
-    both = store_builder.export_full_tree(root, out)
-    assert len(both.entry_bats) == 2
+    usb = tmp_path / "usb"
+    store_builder.export_full_tree(root, usb, app_id=alpha.app_id)
+    assert (usb / f"start-{alpha.app_id}.bat").is_file()
 
-    only_alpha = store_builder.export_full_tree(root, out, app_id=alpha.app_id)
-    assert only_alpha.entry_bats == [f"start-{alpha.app_id}.bat"]
-    assert not (out / f"start-{beta.app_id}.bat").exists()
-    assert sorted(p.name for p in out.glob("start*.bat")) == only_alpha.entry_bats
+    second = store_builder.export_full_tree(root, usb, app_id=beta.app_id)
+
+    # Alpha is STILL INSTALLED in this folder, so alpha still has its entry point.
+    assert (usb / "apps" / alpha.app_id / "versions" / "v1").is_dir()
+    assert (usb / f"start-{alpha.app_id}.bat").is_file(), "把還裝在這裡的 App 的唯一入口刪掉了"
+    assert (usb / f"start-{beta.app_id}.bat").is_file()
+    # ...and it is still administrable, and the report names both entries
+    assert (usb / "tools" / f"admin-{alpha.app_id}.bat").is_file()
+    assert sorted(second.entry_bats) == sorted([f"start-{alpha.app_id}.bat",
+                                                f"start-{beta.app_id}.bat"])
+    # the operator is TOLD the folder now holds an app this export did not deliver
+    assert any(alpha.app_id in w for w in second.warnings), second.warnings
+    # and the 讀我 in that folder names both apps and both bats
+    readme = (usb / store_builder.README_NAME).read_text("utf-8")
+    for app, request in ((alpha.app_id, alpha), (beta.app_id, beta)):
+        assert f"start-{app}.bat" in readme
+        assert request.display_name in readme
+
+
+def test_exporting_the_whole_tree_delivers_every_app_coherently(stub_toolchain, tmp_path):
+    """S8, the 「整棵樹(全部 N 個 App)」 path — export_full_tree(app_id=None). It has
+    always worked and nothing could reach it; now that the GUI can, every part of the
+    delivered folder has to be about ALL the apps, not the first one:
+
+      * one state.json per app, each pointing at its own version;
+      * one entry bat per app, each starting ITS app;
+      * tools\\ listing every app, and a chooser to pick between them;
+      * a 讀我 that says WHICH bat starts WHICH app (「雙擊 a.bat、b.bat」 tells a line
+        worker to double-click both files to start one program);
+      * and only the runtimes/shells those apps really reference.
+    """
+    root = tmp_path / "ROOT"
+    # different locks = different runtime fingerprints: the delivery must carry BOTH,
+    # and nothing else.
+    alpha = make_project(tmp_path, "Alpha Viewer")
+    beta = make_project(tmp_path, "報表分析", lock=PANDAS_LOCK, app_id="report-analyzer")
+    build_history(alpha, root, "v1.0.0")
+    build_history(beta, root, "v2.0.0")
+
+    out = tmp_path / "deliver-all"
+    export = store_builder.export_full_tree(root, out)          # app_id=None: 整棵樹
+
+    assert export.apps == sorted([alpha.app_id, beta.app_id])
+    assert sorted(export.versions) == sorted([f"{alpha.app_id}/v1.0.0",
+                                              f"{beta.app_id}/v2.0.0"])
+    for app, version, request in ((alpha.app_id, "v1.0.0", alpha),
+                                  (beta.app_id, "v2.0.0", beta)):
+        assert state_of(out, app)["current"] == version         # per-app state
+        assert state_of(out, app)["pending"] is None
+        assert integrity.is_complete(out / "apps" / app / "versions" / version)
+        bat = out / f"start-{app}.bat"
+        assert bat.is_file() and f"--app {app}" in bat.read_text("utf-8")
+        assert (out / "tools" / f"admin-{app}.bat").is_file()
+        # each app's own Chinese/plain name reaches its own console, and no other's
+        assert request.display_name in message(out, f"admin-menu-{app}.txt")
+        assert request.display_name in message(out, f"starting-{app}.txt")
+    assert not (out / "start.bat").exists()      # ambiguous with two apps: it must go
+
+    # the chooser knows both apps
+    chooser = (out / "tools" / "admin.bat").read_text("utf-8")
+    assert all(f"admin-{a}.bat" in chooser for a in export.apps)
+    assert alpha.display_name in message(out, "admin-chooser.txt")
+    assert beta.display_name in message(out, "admin-chooser.txt")
+
+    # 讀我: which bat starts which app, by name
+    readme = (out / store_builder.README_NAME).read_text("utf-8")
+    for app, request in ((alpha.app_id, alpha), (beta.app_id, beta)):
+        assert re.search(rf"{re.escape(request.display_name)}.*start-{re.escape(app)}\.bat",
+                         readme), readme
+    readme.encode("cp950")
+
+    # exactly the runtimes/shells those two versions name — a store that has built
+    # other things must not ship them.
+    manifests = [json.loads((out / "apps" / a / "versions" / v / "app-package.json")
+                            .read_text("utf-8"))
+                 for a, v in ((alpha.app_id, "v1.0.0"), (beta.app_id, "v2.0.0"))]
+    wanted_runtimes = {m["runtime_fingerprint"] for m in manifests}
+    wanted_shells = {m["shell_fingerprint"] for m in manifests}
+    assert len(wanted_runtimes) == 2                    # the locks really do differ
+    assert {p.name for p in (out / "deps" / "runtimes").iterdir()} == wanted_runtimes
+    assert {p.name for p in (out / "deps" / "shells").iterdir()} == wanted_shells
+    assert export.includes_runtime is True
+
+
+def test_a_start_bat_of_an_app_that_is_not_in_the_folder_is_removed(build_request,
+                                                                    stub_toolchain,
+                                                                    tmp_path):
+    """The other side of the union rule. A leftover bat for an app that is NOT in the
+    destination starts nothing: it must go."""
+    root = tmp_path / "ROOT"
+    build_history(build_request, root, "v1.0.0")
+    out = tmp_path / "usb"
+    out.mkdir()
+    ghost = out / "start-app-ghost.bat"
+    ghost.write_text('@echo off\r\n"%PY%" "bootstrap\\bootstrap.py" --app app-ghost %*\r\n',
+                     encoding="ascii")
+
+    export = store_builder.export_full_tree(root, out)
+    assert not ghost.exists()
+    assert export.entry_bats == ["start.bat"]
+    assert sorted(p.name for p in out.glob("start*.bat")) == ["start.bat"]
 
 
 # ── S2:「發最新的那一版」 ──────────────────────────────────────────────────
@@ -757,7 +871,7 @@ def test_no_generated_bat_contains_an_em_dash(stub_toolchain, tmp_path):
     em-dash reaches a .bat, ever. 讀我-使用說明.txt is a text file and may keep it.
     """
     root = tmp_path / "ROOT"
-    request = make_project(tmp_path, "產線 檢視器")
+    request = make_project(tmp_path, "產線 檢視器", app_id="line-viewer")
     assert store_builder.build_into_store(request, root, version="v1.0.0").ok
 
     bats = sorted(root.glob("*.bat")) + sorted((root / "tools").glob("*.bat"))
@@ -786,7 +900,7 @@ def test_every_generated_bat_is_pure_ascii(stub_toolchain, tmp_path):
     copy of the rule — plus the on-disk bytes, because that is what cmd reads.
     """
     root = tmp_path / "ROOT"
-    request = make_project(tmp_path, "產線 檢視器")           # a name full of landmines
+    request = make_project(tmp_path, "產線 檢視器", app_id="line-viewer")           # a name full of landmines
     assert store_builder.build_into_store(request, root, version="v1.0.0").ok
 
     bats = generated_bats(root)
@@ -821,7 +935,7 @@ def test_no_bat_echoes_a_paren_inside_a_block(stub_toolchain, tmp_path):
     rule: no message inside a block may carry ( or ). 全形（）or a comma instead.
     """
     root = tmp_path / "ROOT"
-    request = make_project(tmp_path, "產線 檢視器")
+    request = make_project(tmp_path, "產線 檢視器", app_id="line-viewer")
     assert store_builder.build_into_store(request, root, version="v1.0.0").ok
 
     bats = sorted(root.glob("*.bat")) + sorted((root / "tools").glob("*.bat"))
@@ -899,7 +1013,7 @@ def test_every_bat_survives_being_run_over_and_over_by_a_real_cmd(stub_toolchain
     {CMD_RUNS} times and every single run must come back with clean stderr.
     """
     root = tmp_path / "ROOT"
-    alpha = make_project(tmp_path, "產線 檢視器")             # Chinese display names:
+    alpha = make_project(tmp_path, "產線 檢視器", app_id="line-viewer")             # Chinese display names:
     beta = make_project(tmp_path, "Beta 檢視器")             # the old landmine source
     assert store_builder.build_into_store(alpha, root, version="v1.0.0").ok
     assert store_builder.build_into_store(beta, root, version="v1.0.0").ok
@@ -937,7 +1051,7 @@ def test_the_picker_chooses_the_referenced_runtime_not_the_orphan(stub_toolchain
     loop would have landed on, and precisely the runtime GC then refuses to
     delete because it is executing from inside it)."""
     root = tmp_path / "ROOT"
-    request = make_project(tmp_path, "產線 檢視器")
+    request = make_project(tmp_path, "產線 檢視器", app_id="line-viewer")
     result = store_builder.build_into_store(request, root, version="v1.0.0")
     assert result.ok, result.errors
 
@@ -968,7 +1082,7 @@ def test_a_failed_gc_does_not_look_like_a_successful_one(stub_toolchain, tmp_pat
     a disk that was never reclaimed. This also proves cmd could parse every line
     it executed (an em-dash would surface right here)."""
     root = tmp_path / "ROOT"
-    request = make_project(tmp_path, "產線 檢視器")
+    request = make_project(tmp_path, "產線 檢視器", app_id="line-viewer")
     assert store_builder.build_into_store(request, root, version="v1.0.0").ok
 
     proc = run_bat(root / "tools" / "gc.bat")
@@ -1015,6 +1129,41 @@ def test_gc_bat_does_not_blame_the_store_lock_for_every_failure(build_request,
     assert store_builder.GC_EXIT_PARTIAL == gc_mod.EXIT_PARTIAL
     assert store_builder.GC_EXIT_NOTHING == gc_mod.EXIT_NOTHING_DELETED
     assert store_builder.GC_EXIT_LOCKED == gc_mod.EXIT_STORE_LOCKED
+
+
+def test_gc_bat_does_not_announce_success_for_a_plan_that_deletes_nothing(
+        build_request, stub_toolchain, tmp_path):
+    """An EMPTY plan. The dry run listed nothing, and the console then asked
+    「以上列出的項目要真的刪除嗎? [y/N]」 over that blank list and finished with
+    「回收完成。上面列出的項目都已經刪掉了。」 — a success message for a run that
+    deleted nothing, printed at an operator who came looking for disk space and now
+    believes they found some.
+
+    The empty plan gets its own exit code and its own branch: no prompt, no 「完成」.
+    """
+    root = tmp_path / "ROOT"
+    assert store_builder.build_into_store(build_request, root, version="v1.0.0").ok
+    empty = store_builder.GC_EXIT_EMPTY
+    assert empty not in (store_builder.GC_EXIT_OK, store_builder.GC_EXIT_PARTIAL,
+                         store_builder.GC_EXIT_NOTHING, store_builder.GC_EXIT_LOCKED)
+
+    for name in ("gc.bat", f"admin-{build_request.app_id}.bat"):
+        bat = (root / "tools" / name).read_text("utf-8")
+        assert bat.isascii(), name
+        head, _, tail = bat.partition('"bootstrap\\gc.py" --apply')
+        # BEFORE the confirmation prompt: an empty plan never reaches the [y/N]
+        prompt = head.index("set /p YES=")
+        assert head.index(f'"%RC%"=="{empty}"') < prompt, "空計畫還是被問了 y/N"
+        assert f'"%RC%"=="{empty}"' in tail                # and after --apply too
+        assert 'type "messages\\gc-empty.txt"' in bat
+        # and the branch must not fall into the one that claims the listed items are gone
+        empty_branch = bat[bat.index(":empty" if name == "gc.bat" else ":rempty"):]
+        assert "gc-done.txt" not in empty_branch.split("goto menu")[0].split("exit /b")[0]
+
+    body = message(root, "gc-empty.txt")
+    assert "沒有可回收的項目" in body
+    assert "刪掉了" not in body                            # nothing was deleted, so say so
+    body.encode("cp950")
 
 
 @pytest.mark.skipif(os.name != "nt", reason="需要真的 cmd.exe 來剖析 .bat")
@@ -1064,7 +1213,7 @@ def test_a_tree_with_no_runtime_says_so_instead_of_running_nothing(stub_toolchai
     """PY unset used to mean `"" "bootstrap\\gc.py"` — a console that flashes and
     closes, having done nothing, with no idea why."""
     root = tmp_path / "ROOT"
-    request = make_project(tmp_path, "產線 檢視器")
+    request = make_project(tmp_path, "產線 檢視器", app_id="line-viewer")
     assert store_builder.build_into_store(request, root, version="v1.0.0").ok
     shutil.rmtree(root / "deps" / "runtimes")
 
@@ -1087,11 +1236,14 @@ def test_a_chinese_display_name_reaches_the_operator_without_entering_the_bat(
     still checked: writing it must not blow the build up.)
     """
     root = tmp_path / "ROOT"
-    request = make_project(tmp_path, "產線 檢視器")
+    request = make_project(tmp_path, "產線 檢視器", app_id="line-viewer")
     result = store_builder.build_into_store(request, root, version="v1.0.0")
 
     assert result.ok, result.errors
-    assert not any("tools" in w for w in result.warnings), result.warnings
+    # 「tools\ 與說明檔沒有全部寫成功」 is what a Chinese name used to cause (an
+    # ascii-only .bat + a UnicodeEncodeError). Match the failure, not the word
+    # "tools" — the WebView2 warning legitimately names tools\安裝WebView2.bat.
+    assert not any("沒有全部寫成功" in w for w in result.warnings), result.warnings
 
     app = request.app_id
     assert "產線 檢視器" in message(root, f"title-{app}.txt")
@@ -1181,6 +1333,44 @@ def test_build_bundles_the_webview2_installer_into_prereq(build_request, stub_to
     assert not any("WebView2" in w for w in export.warnings), export.warnings
 
 
+def test_a_store_build_with_no_webview2_installer_says_so_at_build_time(build_request,
+                                                                        stub_toolchain,
+                                                                        tmp_path):
+    """The fat path has warned about this since the beginning (builder's
+    WEBVIEW2_MISSING_WARNING). The store path declared a `warnings` field and then put
+    NOTHING in it — same offline factory machine, same blank window, same dead end,
+    and the store operator was the only one not told.
+
+    And the remedy has to be one that WORKS. 「請在建置時指定」 means "rebuild", and a
+    completed version directory is immutable, so the operator who follows that advice
+    is refused by _build_version_dir and has nowhere left to go. They do not need a
+    rebuild: 安裝WebView2.bat takes any .exe in prereq\\.
+    """
+    root = tmp_path / "ROOT"
+    result = store_builder.build_into_store(build_request, root, version="v1.0.0")
+    assert result.ok, result.errors
+
+    warning = [w for w in result.warnings if "WebView2" in w]
+    assert warning, result.warnings
+    assert "prereq" in warning[0]
+    assert "不必重建" in warning[0]                       # the remedy that works
+    assert "請在建置時指定" not in warning[0]              # the remedy that is refused
+    assert store_builder.WEBVIEW2_DOWNLOAD in warning[0]
+    warning[0].encode("cp950")                            # a zh-TW console must print it
+
+    # ...and the operator can act on it WITHOUT rebuilding: drop the .exe in prereq\
+    # under any name, and both the warning and the delivery's warning stop.
+    (root / "prereq").mkdir(parents=True, exist_ok=True)
+    (root / "prereq" / "webview2 (offline).exe").write_bytes(b"MZ setup")
+    again = store_builder.build_into_store(build_request, root, version="v1.1.0")
+    assert again.ok, again.errors
+    assert not [w for w in again.warnings if "WebView2" in w], again.warnings
+
+    export = store_builder.export_full_tree(root, tmp_path / "deliver", version="v1.1.0")
+    assert (Path(export.out_dir) / "prereq" / "webview2 (offline).exe").is_file()
+    assert not [w for w in export.warnings if "WebView2" in w], export.warnings
+
+
 def test_a_delivery_that_cannot_install_webview2_offline_says_so(build_request,
                                                                  stub_toolchain, tmp_path):
     """No installer = a target machine with no WebView2 and no internet gets a blank
@@ -1195,6 +1385,10 @@ def test_a_delivery_that_cannot_install_webview2_offline_says_so(build_request,
     assert warning, export.warnings
     assert store_builder.WEBVIEW2_DOWNLOAD in warning[0]
     assert "WebView2" in export.summary()
+    # the remedy names THIS folder and does not ask for a rebuild (which the
+    # immutable-version rule then refuses)
+    assert str(Path(export.out_dir) / "prereq") in warning[0]
+    assert "不必重新建置" in warning[0]
     for line in export.warnings:
         line.encode("cp950")
 

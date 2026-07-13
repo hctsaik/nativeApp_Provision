@@ -1320,6 +1320,126 @@ def test_gc_that_could_not_delete_a_single_tree_has_its_own_exit_code(
     err.encode("cp950")
 
 
+def test_applying_an_empty_gc_plan_never_claims_it_reclaimed_anything(
+        tree, monkeypatch, capsys):
+    """S9. The store is already clean, so --apply deletes nothing and frees 0 bytes.
+
+    That used to exit EXIT_OK — the very same code as 「deleted all five trees, freed
+    480 MB」 — and tools\\gc.bat's exit-0 branch prints 「回收完成。上面列出的項目都
+    已經刪掉了。」 The list was empty. Nothing was listed, nothing was deleted, and
+    nothing was reclaimed, and the operator was congratulated for it.
+    """
+    before = sorted(p.name for p in (tree / "deps" / "runtimes").iterdir())
+
+    code = gc_main(tree, monkeypatch, ["--apply"])
+
+    assert code == gc_mod.EXIT_EMPTY_PLAN
+    assert code != gc_mod.EXIT_OK          # …which is the code the bat calls 「回收完成」
+    assert code != gc_mod.EXIT_NOTHING_DELETED     # nor is it a failure: nothing broke
+    assert sorted(p.name for p in (tree / "deps" / "runtimes").iterdir()) == before
+
+    out = capsys.readouterr().out
+    assert "沒有可回收的項目" in out and "沒有刪除任何東西" in out
+    assert "已刪除" not in out              # because nothing was
+    assert "實際回收合計" not in out         # 0 MB came back: do not print a total
+    assert "都已經刪掉了" not in out         # the sentence this test exists to prevent
+    out.encode("cp950")
+
+
+def test_an_apply_that_reclaimed_everything_and_one_that_reclaimed_nothing_differ(
+        tree):
+    """The two opposite outcomes of --apply must be distinguishable by the one thing
+    a .bat can branch on. They both exited 0."""
+    build_runtime(tree, FP2)                              # something to reclaim
+
+    reclaimed = gc_mod.run_gc(tree, apply=True, log=lambda *_a: None)
+    assert reclaimed.deleted and reclaimed.exit_code() == gc_mod.EXIT_OK
+    assert not reclaimed.nothing_to_reclaim()
+
+    empty = gc_mod.run_gc(tree, apply=True, log=lambda *_a: None)   # now clean
+    assert empty.applied and empty.is_empty() and empty.nothing_to_reclaim()
+    assert empty.deleted == [] and empty.reclaimed_mb() == 0
+    assert empty.exit_code() == gc_mod.EXIT_EMPTY_PLAN
+    assert empty.exit_code() != reclaimed.exit_code()
+
+    assert "沒有可回收的項目" in empty.headline()
+    assert "回收完成" in reclaimed.headline()
+    empty.headline().encode("cp950")
+
+
+def test_the_headline_after_apply_is_measured_never_the_plans_forecast(tree, monkeypatch):
+    """reclaimable_mb() is a promise; reclaimed_mb() is the outcome. Printing the
+    promise in the past tense is exactly how operators came to believe they had
+    freed space that rmtree never managed to take."""
+    orphan = build_runtime(tree, FP2)
+    assert gc_mod.collect_plan(tree).reclaimable_mb() > 0        # the forecast
+
+    def in_use(_path, *_a, **_kw):
+        raise PermissionError(32, "the file is in use by another process")
+
+    monkeypatch.setattr(gc_mod.shutil, "rmtree", in_use)
+    plan = gc_mod.run_gc(tree, apply=True, log=lambda *_a: None)
+
+    assert plan.reclaimed_mb() == 0 and orphan.is_dir()
+    headline = plan.headline()
+    assert "一項都沒有刪掉" in headline and "完全沒有回收" in headline
+    assert "實際回收" not in headline           # there was none to report
+    headline.encode("cp950")
+
+
+def test_an_applied_plan_tells_a_gui_what_survived_and_why(tree, monkeypatch):
+    """「刪不掉」 has to be actionable. A pre-rendered sentence in a list of strings
+    is neither queryable nor clickable: a GUI needs WHAT stayed, WHERE it is, WHY,
+    and whether closing the App is the thing that fixes it."""
+    orphan = build_runtime(tree, FP2)
+
+    def in_use(_path, *_a, **_kw):
+        raise PermissionError(32, "the file is in use by another process")
+
+    monkeypatch.setattr(gc_mod.shutil, "rmtree", in_use)
+    plan = gc_mod.run_gc(tree, apply=True, log=lambda *_a: None)
+
+    assert plan.applied and plan.deleted == []
+    [survivor] = plan.survivors
+    assert survivor.label == f"runtime {FP2}"          # WHAT
+    assert Path(survivor.path) == orphan               # WHERE
+    assert "檔案使用中" in survivor.reason             # WHY
+    assert survivor.in_use is True                     # …and it is the fixable why
+    assert "關掉" in survivor.hint()                   # 關掉 App 再跑一次
+    assert plan.failures == [survivor.line()]          # the console view of one fact
+    survivor.hint().encode("cp950")
+
+
+def test_a_dry_run_with_nothing_to_reclaim_does_not_send_the_operator_to_a_y_n_prompt(
+        tree, monkeypatch, capsys):
+    """The empty plan has to be visible on the DRY RUN too, not just after --apply.
+
+    tools\\gc.bat asks 「以上列出的項目要真的刪除嗎? [y/N]」 whenever the dry run
+    exits 0 — so on a clean store it asked that about a blank list, the operator
+    typed y, and the bat then congratulated them: 「回收完成。上面列出的項目都已經
+    刪掉了。」 EXIT_EMPTY_PLAN is what lets the bat skip straight to 「沒有可回收的
+    項目」. It is not an error (:empty exits 0), so it must not be EXIT_OK and must
+    not be a failure code either."""
+    code = gc_main(tree, monkeypatch, [])
+
+    assert code == gc_mod.EXIT_EMPTY_PLAN
+    assert code != gc_mod.EXIT_OK              # …which is what opens the y/N prompt
+    assert code not in (gc_mod.EXIT_PARTIAL, gc_mod.EXIT_NOTHING_DELETED,
+                        gc_mod.EXIT_STORE_LOCKED, gc_mod.EXIT_ABORTED)
+
+    out = capsys.readouterr().out
+    assert "沒有可回收的項目" in out and "dry-run" in out
+    assert "已刪除" not in out                 # a dry run deletes nothing, and says so
+
+
+def test_a_dry_run_that_has_something_to_reclaim_still_exits_zero(tree, monkeypatch):
+    """…and the y/N prompt must still be reached when there IS something to delete.
+    EXIT_EMPTY_PLAN is about the plan being empty, not about it being a dry run."""
+    build_runtime(tree, FP2)
+    assert gc_main(tree, monkeypatch, []) == gc_mod.EXIT_OK
+    assert (tree / "deps" / "runtimes" / FP2).is_dir()      # and it deleted nothing
+
+
 def test_a_gc_that_never_took_the_store_lock_is_not_a_failed_delete(
         tree, monkeypatch, capsys):
     """An update is downloading: GC did not scan, did not try, did not fail to
@@ -1372,9 +1492,29 @@ def test_gc_exit_codes_are_the_ones_the_generated_bat_actually_branches_on():
     assert gc_mod.EXIT_PARTIAL == store_builder.GC_EXIT_PARTIAL
     assert gc_mod.EXIT_NOTHING_DELETED == store_builder.GC_EXIT_NOTHING
     assert gc_mod.EXIT_STORE_LOCKED == store_builder.GC_EXIT_LOCKED
+    assert gc_mod.EXIT_EMPTY_PLAN == store_builder.GC_EXIT_EMPTY
     # …and they must stay distinguishable from each other, which was the whole point.
     assert len({gc_mod.EXIT_OK, gc_mod.EXIT_PARTIAL, gc_mod.EXIT_NOTHING_DELETED,
-                gc_mod.EXIT_STORE_LOCKED}) == 4
+                gc_mod.EXIT_STORE_LOCKED, gc_mod.EXIT_EMPTY_PLAN}) == 5
+
+
+def test_the_empty_plan_code_is_the_one_the_generated_bat_branches_on():
+    """A CONTRACT ACROSS TWO MODULES, and the fragile kind: store_builder reads this
+    code by NAME (getattr(gc_mod, "EXIT_EMPTY_PLAN", 6)) and bakes the NUMBER into
+    every tools\\gc.bat it writes. Rename the constant here and the bat silently
+    falls back to 6 while gc.py returns something else — the :empty branch is then
+    never taken, gc.bat drops through to `goto failed`, and a perfectly healthy GC
+    of an already-clean store is reported as 「回收沒有跑完」."""
+    from provision_builder.streamlit_desktop import store_builder
+
+    assert gc_mod.EXIT_EMPTY_PLAN == store_builder.GC_EXIT_EMPTY
+    assert gc_mod.EXIT_NOTHING_TO_RECLAIM == gc_mod.EXIT_EMPTY_PLAN   # one code, two names
+    # It is not any of the four the bat already knew: 0 would make it print
+    # 「都已經刪掉了」 about an empty list, and 3 would make it print 「回收失敗」
+    # about a store that is simply already clean.
+    assert gc_mod.EXIT_EMPTY_PLAN not in (
+        gc_mod.EXIT_OK, gc_mod.EXIT_PARTIAL, gc_mod.EXIT_NOTHING_DELETED,
+        gc_mod.EXIT_STORE_LOCKED, gc_mod.EXIT_ABORTED)
 
 
 def test_gc_can_scope_a_reclaim_to_one_app_and_says_which_apps_it_looked_at(

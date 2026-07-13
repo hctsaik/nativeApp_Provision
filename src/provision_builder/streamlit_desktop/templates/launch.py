@@ -344,88 +344,65 @@ def _local_module_path(roots: list[Path], name: str) -> Path | None:
     return None
 
 
-def _pages_dir(entrypoint: Path) -> Path:
-    """Streamlit's multipage folder: `pages/` NEXT TO THE ENTRY SCRIPT."""
-    return Path(entrypoint).parent / "pages"
+class LauncherIncomplete(Exception):
+    """A file this launcher needs is not in the package — the VERSION is broken.
 
-
-def _page_scripts(entrypoint: Path, app_root: Path) -> list[Path]:
-    """The app's pages — files Streamlit executes that NOTHING imports.
-
-    A multipage app's pages are discovered and run by Streamlit itself
-    (script_runner._mpa_v1: every `*.py` directly inside a `pages/` folder next
-    to the entry script, minus dotfiles and __init__.py — that rule is copied
-    from there, not guessed). The entrypoint never imports them, so an import
-    closure seeded with the entrypoint alone is blind to the whole folder: a
-    missing dependency in pages/2_report.py sails through the gate and reaches
-    the user as a red box the first time they click that page.
-
-    Also followed, because the path is a literal sitting in the AST:
-      * st.Page("pages/2_report.py") — the st.navigation API.
-      * .streamlit/pages.toml — the third-party `st-pages` convention
-        ([[pages]] path = "..."), read with tomllib when it is available.
-
-    NOT followed, and we do not pretend otherwise: a page list built at RUNTIME
-    (a loop over a directory, names from a database, st.Page(some_variable)).
-    Its paths do not exist until the app runs, so no static gate can see them;
-    such a page's missing dependency will surface as a red box, and the log
-    scan at shell exit is what has to catch it.
+    `pages.py` holds the ONE implementation of "what does Streamlit actually
+    load", shared with the build-side import gate (provision_builder's
+    imports.py). It is copied next to this file when a package is built. If it is
+    not here, this package was assembled by a builder that does not know about it,
+    and the page half of the preflight would be silently missing — the exact
+    blindness that shipped a broken multipage app. Say so out loud instead: a
+    version whose launcher folder is incomplete is a broken version (exit 4).
     """
-    pages: list[Path] = []
-    pages_dir = _pages_dir(entrypoint)
-    if pages_dir.is_dir():
-        pages += sorted(p for p in pages_dir.glob("*.py")
-                        if p.is_file() and not p.name.startswith(".")
-                        and p.name != "__init__.py")
-    pages += _declared_pages(entrypoint, app_root)
-    return pages
 
 
-def _declared_pages(entrypoint: Path, app_root: Path) -> list[Path]:
-    """Page scripts named by a literal string: st.Page(...) and st-pages' toml."""
-    bases = [Path(entrypoint).parent, Path(app_root)]
-    found: list[Path] = []
+_PAGES_MARK = "cim-streamlit-pages/1"
+_PAGES_MODULE = None
 
-    def add(raw: str) -> None:
-        if not isinstance(raw, str) or not raw.endswith(".py") or os.path.isabs(raw):
-            return
-        for base in bases:
-            candidate = base / raw
-            if candidate.is_file():
-                found.append(candidate)
-                return
 
-    try:
-        tree = ast.parse(Path(entrypoint).read_text("utf-8", errors="replace"))
-    except (OSError, SyntaxError):
-        tree = None                       # preflight reports the syntax error itself
-    if tree is not None:
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call) or not node.args:
-                continue
-            func = node.func
-            name = (func.attr if isinstance(func, ast.Attribute)
-                    else func.id if isinstance(func, ast.Name) else "")
-            if name not in ("Page", "StreamlitPage"):
-                continue
-            first = node.args[0]
-            if isinstance(first, ast.Constant):
-                add(first.value)
+def shared_pages():
+    """The page rules — loaded BY PATH, because this file must also run inside a
+    delivered package where there is no `provision_builder` to import from.
 
-    toml_path = Path(app_root) / ".streamlit" / "pages.toml"
-    if toml_path.is_file():
+      launcher/pages.py           the delivered copy (what runs on the device)
+      ../pages.py                 the repo: src/.../streamlit_desktop/pages.py,
+                                  which is the file the builders copy. Loading the
+                                  canonical file here is what keeps the tests
+                                  honest: they exercise the same loader the device
+                                  does, against the same source.
+
+    The MODULE_MARK check is not ceremony: `pages.py` is a common enough name that
+    picking up a stranger's file and calling it "the rules" is a real way to be
+    wrong. No mark, no deal.
+    """
+    global _PAGES_MODULE
+    if _PAGES_MODULE is not None:
+        return _PAGES_MODULE
+    here = Path(__file__).resolve().parent
+    tried = []
+    for path in (here / "pages.py", here.parent / "pages.py"):
+        tried.append(str(path))
+        if not path.is_file():
+            continue
         try:
-            import tomllib                      # stdlib on the shipped cp311 runtime
-        except ImportError:                     # pragma: no cover - older runtime
-            return found
-        try:
-            data = tomllib.loads(toml_path.read_text("utf-8", errors="replace"))
-        except (OSError, ValueError):
-            return found
-        for entry in data.get("pages") or []:
-            if isinstance(entry, dict):
-                add(entry.get("path"))
-    return found
+            spec = importlib.util.spec_from_file_location("cim_streamlit_pages", path)
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        except Exception as exc:                  # a truncated / half-copied file
+            log.warning("could not load the page rules from %s: %s", path, exc)
+            continue
+        if getattr(module, "MODULE_MARK", None) != _PAGES_MARK:
+            log.warning("%s is not the page-rules module (no %s mark)", path, _PAGES_MARK)
+            continue
+        _PAGES_MODULE = module
+        return module
+    raise LauncherIncomplete(
+        "launcher 資料夾不完整:找不到 pages.py(Streamlit 多頁面規則)。\n"
+        "  這個版本是用舊版打包工具組出來的,請重新建置這個版本。\n"
+        "  找過的位置:" + "、".join(tried))
 
 
 def preflight(entrypoint: Path, app_root: Path) -> tuple[list[str], str | None]:
@@ -436,20 +413,17 @@ def preflight(entrypoint: Path, app_root: Path) -> tuple[list[str], str | None]:
     playwright; the app does not, and must not be blamed for it).
 
     The queue starts at the entrypoint *and* at every page Streamlit will run on
-    its own (see _page_scripts) — a page is reachable for the user even though it
-    is unreachable for an import walk.
+    its own (pages.seed_scripts) — a page is reachable for the user even though it
+    is unreachable for an import walk. The pages folder is a first-party root too
+    (pages.first_party_roots): a .py next to a page IS a page's helper, not a PyPI
+    package, and reporting「請 pip install 2_report」made a working CV_Viewer
+    refuse to start.
     """
-    roots = _import_roots(entrypoint, app_root)
-    pages_dir = _pages_dir(entrypoint)
-    if pages_dir.is_dir():
-        # A .py next to a page IS a page, not a PyPI package. Treat the folder as
-        # first-party so a sibling import is followed instead of being reported
-        # as "please pip install 2_report" — the misdiagnosis that made a working
-        # CV_Viewer refuse to start.
-        roots = roots + [pages_dir]
+    pages = shared_pages()
+    roots = pages.first_party_roots(entrypoint, app_root)
     missing: list[str] = []
     seen_files: set[Path] = set()
-    queue = [Path(entrypoint), *_page_scripts(entrypoint, app_root)]
+    queue = list(pages.seed_scripts(entrypoint, app_root))
     while queue:
         source = queue.pop()
         source = source.resolve()
@@ -498,12 +472,23 @@ class StreamlitExited(Exception):
     """Streamlit died before it became healthy — never open an empty shell."""
 
 
-# How long after Streamlit answers /_stcore/health an error still counts as "the
-# app failed on arrival" rather than "the app broke while it was being used".
-# The portal iframes the app the moment our /control/start answers, so the first
-# script run happens a second or two later; 20s is that, with room for a slow
-# machine. Generous on purpose: the cost of calling a late error early is a
-# version wrongly marked dead.
+# How long after THE APP IS ASKED TO RUN an error still counts as "the app failed
+# on arrival" rather than "the app broke while it was being used".
+#
+# ANCHORED TO THE SESSION, NOT TO THE HEALTH CHECK. This used to start counting
+# when /_stcore/health first answered 200 — i.e. when the Streamlit *server* came
+# up. But the server comes up at launch, and the app script does not run until the
+# user presses "Start" in the portal, which can be minutes later. The window
+# therefore expired while the app had not executed a single line; the app was then
+# started, died on `import cv2`, and its traceback landed in the "late" half of the
+# log — which we deliberately treat as a warning (marker kept, exit 0). bootstrap
+# committed that build as last-known-good. The safety net stamped the broken
+# version good, and "the user took more than 20 seconds to press Start" is not an
+# edge case, it is the normal case.
+#
+# So the clock starts at _session_at (the /control/start hit), and until that
+# exists the window CANNOT close: with no session there is no app to have arrived,
+# and anything in the log is still an arrival failure.
 APP_ARRIVAL_SECONDS = 20.0
 
 
@@ -527,10 +512,19 @@ class StreamlitSupervisor:
         self._port = None
         self._log_file = None
         self._log_path = None
-        # When Streamlit became healthy (monotonic), and how many bytes of its
-        # log had been written by the time the app stopped "arriving". See
-        # note_arrival_window().
+        # Three different moments, and confusing two of them is what stamped a
+        # broken version as last-known-good:
+        #   _healthy_at      the SERVER answered /_stcore/health. Says nothing
+        #                    about the app: Streamlit serves 200 while the script
+        #                    is dying. Kept for the log, never for a verdict.
+        #   _session_at      the app was ASKED TO RUN (/control/start). This is
+        #                    when the script actually executes, and the only
+        #                    honest start for the arrival window.
+        #   _arrival_offset  how many bytes of the log had been written when the
+        #                    arrival window closed. None = still arriving, so the
+        #                    WHOLE log is arrival and any error in it is fatal.
         self._healthy_at = None
+        self._session_at = None
         self._arrival_offset = None
 
     # -- state ---------------------------------------------------------------
@@ -577,8 +571,14 @@ class StreamlitSupervisor:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         log_path = self.log_dir / f"streamlit-{stamp}-{port}.log"
         self._log_path = log_path
+        # A fresh process writing a fresh log: a fresh arrival window. Reset all
+        # three, or the previous run's offset would declare this run's startup
+        # crash "late" and keep the marker. Note this only ever runs when we are
+        # NOT already running (start() short-circuits on `if self.running`), so a
+        # portal that presses Start twice cannot rewind its own window.
         self._healthy_at = None
-        self._arrival_offset = None       # a fresh run, a fresh arrival window
+        self._session_at = None
+        self._arrival_offset = None
         self._log_file = log_path.open("ab")
         cmd = streamlit_command(self.manifest["_python"], self.manifest["_entrypoint"], port, self.host)
         log.info("spawning Streamlit on port %d -> %s", port, log_path.name)
@@ -646,34 +646,64 @@ class StreamlitSupervisor:
     def log_path(self) -> Path | None:
         return self._log_path
 
+    def note_session_start(self) -> None:
+        """The app has just been ASKED TO RUN — start the arrival clock.
+
+        Called from the control channel's /control/start (the portal pressing
+        "Start"), which is the first moment Streamlit executes the app script.
+        Idempotent: a portal that presses Start twice on a running app must not
+        push the window forward and turn a startup crash into a "late" error.
+        """
+        if self._session_at is not None:
+            return
+        self._session_at = time.monotonic()
+        # The gap is the whole bug, so put it in the log where the next person can
+        # see it: this is how long /_stcore/health had been answering 200 while the
+        # app had not executed a single line. Anchoring the window to THAT is what
+        # let a version die and still be committed as last-known-good.
+        waited = (self._session_at - self._healthy_at) if self._healthy_at else 0.0
+        log.info("the app was asked to run %.1fs after the server became healthy: "
+                 "arrival window opens (%.0fs)", waited, APP_ARRIVAL_SECONDS)
+
+    @property
+    def arriving(self) -> bool:
+        """True while an error in the log would mean "the app never worked"."""
+        return self._arrival_offset is None
+
     def note_arrival_window(self) -> None:
         """Freeze how much of the log belongs to "the app arriving".
 
-        Called on a tick while the shell is up (run_shell). Streamlit runs the
-        script only once a session opens, and the portal iframes the app the
-        moment /control/start answers — so the first render happens within a
-        second or two of the health check. Once APP_ARRIVAL_SECONDS have passed,
-        whatever the app logs from here on happened to an app that had already
+        Called on a tick while the shell is up (run_shell). The window opens when
+        the app is asked to run (note_session_start) and closes APP_ARRIVAL_SECONDS
+        later; whatever the app logs after that happened to an app that had already
         rendered for the user.
 
-        Honest about the limits: Streamlit logs NOTHING on a successful run, so
-        we cannot observe a render. "It became usable" is inferred from "it was
-        up, and quiet, past the arrival window". That means an app that blows up
-        on a page the user opens 30 seconds in is reported as a warning, not a
-        failed version — which is the direction we want to be wrong in: a red box
-        the user can retry is not worth silently downgrading a machine over.
+        UNTIL THERE IS A SESSION, THE WINDOW NEVER CLOSES. The user may stare at
+        the portal for ten minutes before pressing Start; Streamlit has been
+        healthy that whole time and the app has not run a line. Closing the window
+        on that timer meant the app's dying breath was filed as a late warning and
+        the version was committed as last-known-good.
+
+        Honest about the limits: Streamlit logs NOTHING on a successful run, so we
+        cannot observe a render. "It became usable" is inferred from "it was asked
+        to run, and stayed quiet, past the arrival window". An app that blows up on
+        a page the user opens a minute in is reported as a warning, not a failed
+        version — the direction we want to be wrong in: a red box the user can
+        retry is not worth downgrading a machine over.
         """
         if self._arrival_offset is not None:
             return
-        healthy_at, log_path = self._healthy_at, self._log_path
-        if healthy_at is None or log_path is None:
-            return
-        if time.monotonic() - healthy_at < APP_ARRIVAL_SECONDS:
+        session_at, log_path = self._session_at, self._log_path
+        if session_at is None or log_path is None:
+            return                       # nobody asked the app to run yet
+        if time.monotonic() - session_at < APP_ARRIVAL_SECONDS:
             return
         try:
             self._arrival_offset = log_path.stat().st_size
         except OSError:
             return                       # try again on the next tick
+        log.info("arrival window closed at %d bytes of %s",
+                 self._arrival_offset, log_path.name)
 
     def _split_log(self) -> tuple[str, str] | None:
         """(what the app logged on arrival, what it logged once it was working)."""
@@ -685,8 +715,9 @@ class StreamlitSupervisor:
             return None
         offset = self._arrival_offset
         if offset is None:
-            # The arrival window never closed — the user shut the app down inside
-            # it. Nothing in this log had time to be "an app that already worked".
+            # The arrival window never closed: either the user shut the app down
+            # inside it, or they never pressed Start at all. Nothing in this log
+            # had time to be "an app that already worked".
             offset = len(raw)
         return (raw[:offset].decode("utf-8", errors="replace"),
                 raw[offset:].decode("utf-8", errors="replace"))
@@ -707,6 +738,26 @@ class StreamlitSupervisor:
         """
         parts = self._split_log()
         return self._error_tail(parts[0]) if parts else None
+
+    def failing_on_arrival(self) -> str | None:
+        """The same verdict, asked ON A TICK instead of at the end of the session.
+
+        We already poll every 0.5s while the shell is up. If the app has died on
+        arrival, everything after this point is the operator staring at a red box
+        until they give up and close the window — and only then would we fail the
+        version and roll back. There is nothing to wait for: the verdict cannot
+        change while the window is still open (an error inside it is fatal by
+        definition). Close the shell, fail the candidate, let bootstrap roll back
+        NOW. That is the difference between the machine fixing itself and the
+        operator finding out tomorrow.
+
+        Deliberately the SAME question app_error_in_log() answers at exit, so a
+        session can never be killed for something the end-of-session verdict would
+        have forgiven.
+        """
+        if not self.arriving:
+            return None                  # the window closed: errors are warnings now
+        return self.app_error_in_log()
 
     def late_app_error_in_log(self) -> str | None:
         """The app worked, and only later did something raise.
@@ -836,6 +887,14 @@ class ControlServer:
                     except StreamlitExited as exc:
                         self._reply(503, {"error": str(exc)})
                         return
+                    # THE app's real starting gun. Streamlit has been serving
+                    # /_stcore/health since the launcher came up, but the script
+                    # does not execute until a session opens — and a session opens
+                    # because the portal, right now, was told where the app is.
+                    # Everything the app logs from here is "the app arriving".
+                    # (After start(): a restart resets the window, and this puts it
+                    # back — see StreamlitSupervisor.note_session_start.)
+                    server.supervisor.note_session_start()
                     self._reply(200, {"url": url, "port": server.supervisor.port})
                 elif self.path == "/control/stop":
                     released = server.supervisor.stop()
@@ -889,8 +948,48 @@ _MACHINE_HINT = (
 )
 
 
+def _terminate_shell(proc) -> None:
+    """Close the window WE opened. Only ever this PID's tree — never a name scan."""
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        log.warning("shell pid=%s ignored terminate; killing tree", proc.pid)
+    except OSError as exc:
+        log.warning("terminate failed for shell pid=%s: %s", proc.pid, exc)
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                       capture_output=True, check=False)
+    else:  # pragma: no cover - packages are Windows-only
+        proc.kill()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        log.error("shell pid=%s survived kill", proc.pid)
+
+
+# What the operator sees when we close the window on them. They just watched it
+# vanish; not saying why is how a self-healing rollback looks like a crash.
+_ARRIVAL_FAILURE_HINT = (
+    "\n[start][ERROR] App 一啟動就出錯,畫面上只會是一個紅色錯誤方塊,所以視窗已經關閉。\n"
+    "  這個版本會被標記為失敗並自動退回上一個可用版本,不需要您做任何事。\n"
+    "  (若這是您剛更新的版本,請把下面的錯誤訊息交給開發者。)"
+)
+
+
 def run_shell(manifest: dict, control: ControlServer, data_dir: Path,
               *, on_window_ready=None, on_tick=None) -> int:
+    """Run the window to its end and return the code the SESSION deserves.
+
+    `on_tick` is called every _SHELL_TICK_SECONDS while the window is up. It
+    returns truthy to say "stop now, the app is dead" — see
+    StreamlitSupervisor.failing_on_arrival. We do not make the operator sit in
+    front of a red box for the rest of the afternoon so that a rollback can start
+    when they finally close it.
+    """
     # cwd = data dir so the prebuilt shell (which may predate CIM_LOG_DIR support)
     # resolves its log dir to data\logs anyway.
     try:
@@ -943,8 +1042,17 @@ def run_shell(manifest: dict, control: ControlServer, data_dir: Path,
         try:
             return proc.wait(timeout=_SHELL_TICK_SECONDS)
         except subprocess.TimeoutExpired:
-            if on_tick is not None:
-                on_tick()
+            if on_tick is not None and on_tick():
+                # The app died on arrival. Waiting for the user to close the
+                # window would leave the machine on a version we already KNOW is
+                # broken — for minutes, or until tomorrow morning. Close it, and
+                # let finish_session revoke the marker and fail the candidate so
+                # bootstrap rolls back on the spot.
+                log.error("the app failed on arrival; closing the window and "
+                          "failing this version")
+                print(_ARRIVAL_FAILURE_HINT, file=sys.stderr, flush=True)
+                _terminate_shell(proc)
+                return EXIT_APP_BROKEN
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -1061,6 +1169,14 @@ def main(argv: list[str] | None = None) -> int:
         sys.path.insert(0, str(root))
     try:
         missing, syntax_error = preflight(manifest["_entrypoint"], app_root)
+    except LauncherIncomplete as exc:
+        # The launcher folder is missing the page rules it shares with the build
+        # gate. Refusing here is the point: a silent fallback would go blind to
+        # every pages/*.py, which is precisely the failure this module was fixed
+        # for. An incomplete version tree is a broken version (exit 4).
+        log.error("incomplete launcher: %s", exc)
+        print(f"\n[start][ERROR] {exc}\n  log: {log_path}", file=sys.stderr, flush=True)
+        return EXIT_VERSION_BROKEN
     finally:
         sys.path[:] = saved_path
     if syntax_error:
@@ -1104,12 +1220,21 @@ def main(argv: list[str] | None = None) -> int:
 
         # The marker means "this version WORKS", so it must not be written until
         # the window is really up: a missing WebView2 runtime kills the shell in
-        # a second, and that is exactly the case rollback exists for. The tick
-        # closes the app's arrival window while the user is working (see
-        # StreamlitSupervisor.note_arrival_window).
+        # a second, and that is exactly the case rollback exists for.
+        #
+        # The tick does two things, every half second, while the user works:
+        #   1. closes the app's arrival window once the app has been running for
+        #      APP_ARRIVAL_SECONDS (note_arrival_window), and
+        #   2. answers "is this app dying right now?" (failing_on_arrival) — a
+        #      truthy tick tells run_shell to close the window instead of leaving
+        #      the operator in front of a red box until they give up.
+        def tick() -> bool:
+            supervisor.note_arrival_window()
+            return supervisor.failing_on_arrival() is not None
+
         code = run_shell(manifest, control, data_dir,
                          on_window_ready=lambda: _write_marker(url),
-                         on_tick=supervisor.note_arrival_window)
+                         on_tick=tick)
         log.info("shell exited with code %s", code)
 
         # The user has now actually used the app (or tried to). Streamlit only
