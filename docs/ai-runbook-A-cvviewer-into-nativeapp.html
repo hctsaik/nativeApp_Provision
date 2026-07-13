@@ -1,0 +1,464 @@
+<title>Runbook A — 開發階段:把 CV Viewer 接進 Native App 殼</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1a1a1a; --muted: #5c6370; --line: #e3e6ea;
+    --code-bg: #f6f8fa; --code-fg: #24292f; --accent: #0b6bcb; --accent-soft: #eaf3fc;
+    --ok: #17663a; --ok-soft: #e8f5ee; --warn: #8a5700; --warn-soft: #fff4e0;
+    --danger: #b3261e; --danger-soft: #fdecea;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171a; --fg: #e6e6e6; --muted: #9aa4b2; --line: #2a2f36;
+      --code-bg: #1c2128; --code-fg: #d7dde5; --accent: #58a6ff; --accent-soft: #16283d;
+      --ok: #7ee2a8; --ok-soft: #13291d; --warn: #e3b341; --warn-soft: #2b2313;
+      --danger: #ff7b72; --danger-soft: #2d1a19;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #14171a; --fg: #e6e6e6; --muted: #9aa4b2; --line: #2a2f36;
+    --code-bg: #1c2128; --code-fg: #d7dde5; --accent: #58a6ff; --accent-soft: #16283d;
+    --ok: #7ee2a8; --ok-soft: #13291d; --warn: #e3b341; --warn-soft: #2b2313;
+    --danger: #ff7b72; --danger-soft: #2d1a19;
+  }
+  :root[data-theme="light"] {
+    --bg: #ffffff; --fg: #1a1a1a; --muted: #5c6370; --line: #e3e6ea;
+    --code-bg: #f6f8fa; --code-fg: #24292f; --accent: #0b6bcb; --accent-soft: #eaf3fc;
+    --ok: #17663a; --ok-soft: #e8f5ee; --warn: #8a5700; --warn-soft: #fff4e0;
+    --danger: #b3261e; --danger-soft: #fdecea;
+  }
+  body {
+    background: var(--bg); color: var(--fg); margin: 0;
+    font: 16px/1.7 -apple-system, "Segoe UI", "Noto Sans TC", "Microsoft JhengHei", sans-serif;
+  }
+  .wrap { max-width: 900px; margin: 0 auto; padding: 40px 20px 96px; }
+  h1 { font-size: 1.85rem; line-height: 1.3; margin: 0 0 6px; letter-spacing: -.01em; }
+  h2 { font-size: 1.28rem; margin: 48px 0 12px; padding-top: 18px; border-top: 1px solid var(--line); }
+  h3 { font-size: 1.05rem; margin: 26px 0 8px; }
+  p, li { color: var(--fg); }
+  .sub { color: var(--muted); margin: 0 0 26px; }
+  code { font-family: "Cascadia Code", Consolas, monospace; font-size: .875em;
+         background: var(--code-bg); color: var(--code-fg); padding: 2px 5px; border-radius: 4px; }
+  pre { background: var(--code-bg); color: var(--code-fg); padding: 14px 16px; border-radius: 8px;
+        overflow-x: auto; border: 1px solid var(--line); }
+  pre code { background: none; padding: 0; font-size: .84rem; line-height: 1.6; }
+  .box { border: 1px solid var(--line); border-left-width: 4px; border-radius: 6px;
+         padding: 12px 16px; margin: 16px 0; }
+  .box p:first-child { margin-top: 0; } .box p:last-child { margin-bottom: 0; }
+  .fact { border-left-color: var(--accent); background: var(--accent-soft); }
+  .ok   { border-left-color: var(--ok);     background: var(--ok-soft); }
+  .warn { border-left-color: var(--warn);   background: var(--warn-soft); }
+  .stop { border-left-color: var(--danger); background: var(--danger-soft); }
+  .tag { display: inline-block; font-size: .72rem; font-weight: 600; letter-spacing: .04em;
+         padding: 2px 8px; border-radius: 999px; vertical-align: middle; margin-left: 8px; }
+  .tag-v { background: var(--ok-soft); color: var(--ok); border: 1px solid var(--ok); }
+  .tag-u { background: var(--warn-soft); color: var(--warn); border: 1px solid var(--warn); }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; font-size: .9rem; }
+  th, td { border: 1px solid var(--line); padding: 8px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--code-bg); font-weight: 600; }
+  .scroll { overflow-x: auto; }
+  .step { display: flex; gap: 12px; align-items: baseline; margin: 40px 0 10px; }
+  .num { flex: 0 0 auto; width: 30px; height: 30px; border-radius: 50%; background: var(--accent);
+         color: #fff; font-weight: 700; font-size: .9rem; display: grid; place-items: center; }
+  .step h2 { margin: 0; border: none; padding: 0; }
+  ul.check { list-style: none; padding-left: 0; }
+  ul.check li { padding-left: 26px; position: relative; margin: 6px 0; }
+  ul.check li::before { content: "☐"; position: absolute; left: 0; color: var(--muted); }
+  footer { margin-top: 60px; padding-top: 18px; border-top: 1px solid var(--line);
+           color: var(--muted); font-size: .85rem; }
+</style>
+
+<div class="wrap">
+
+<h1>Runbook A — 開發階段:把 CV Viewer 接進 Native App 殼</h1>
+<p class="sub">
+  給 AI 照著執行。目標:在 <b>開發階段</b> 讓 CV Viewer 以「單一全高 iframe 的 Streamlit App」
+  出現在 CIM 平台的 Tauri 殼裡,按一次 Start 就跑起來。<br>
+  這份文件裡的每一個路徑與程式碼片段,都是從現有 repo 讀出來的,不是憑印象寫的。
+</p>
+
+<div class="box fact">
+  <p><b>先讀這段,再動手。</b>本文的「已驗證」標記代表:該事實是我打開檔案讀到的。</p>
+  <p><span class="tag tag-v">已驗證</span> = 路徑/程式碼實際存在,已引用行號。
+     <span class="tag tag-u">未實跑</span> = 依現有契約推導出來的新檔案,尚未在這台機器上跑過整條流程。</p>
+</div>
+
+<h2>0. 這件事的本質</h2>
+
+<p>
+  CIM 平台的 Tauri 殼(<code>cim-light.exe</code>)<b>不能被本機重新編譯</b>,也不能被叫去開啟任意 URL。
+  它在啟動時會拉起 Python engine,engine 掃描 <code>plugin.yaml</code> 建出「工具清單」,
+  殼把清單畫進 portal 的「工作流程」下拉,User 按 <code>Start</code>,engine 才把那個工具的
+  Streamlit 起在一個空閒埠上,並把 URL 交給殼去 iframe。
+</p>
+
+<p>
+  所以「把 CV Viewer 接進殼」<b>不是改殼</b>,而是:<b>讓 engine 認得 CV Viewer 這個工具</b>。
+  你只要放兩個檔案(一份 <code>plugin.yaml</code>、一支 runner),engine 下次開機就會自己掃到它。
+</p>
+
+<div class="box fact">
+  <p><b>關鍵事實</b> <span class="tag tag-v">已驗證</span></p>
+  <table>
+    <tr><th>事實</th><th>證據</th></tr>
+    <tr>
+      <td>engine 掃描兩個位置的 plugin.yaml,<b>它就是唯一的真相來源</b></td>
+      <td><code>sidecar/python-engine/engine.py:675-676</code><br>
+          <code>(ROOT_DIR/"scripts").glob("*/plugin.yaml")</code><br>
+          <code>(ROOT_DIR/"plugins").glob("*/modules/*/plugin.yaml")</code></td>
+    </tr>
+    <tr>
+      <td><code>runner: X</code> → 執行 <code>tools/X_runner.py</code></td>
+      <td><code>engine.py:688-689</code><br>
+          <code>script = _runner_map.get(runner, f"{runner}_runner.py")</code></td>
+    </tr>
+    <tr>
+      <td><b><code>id</code> 以 <code>app-</code> 開頭</b> → category <code>app</code> → 單一全高 iframe。<br>
+          <b>yaml 裡的 <code>category:</code> 欄位根本沒有被讀。</b></td>
+      <td><code>engine.py:769-780 _derive_category(tool_id)</code>:<br>
+          <code>if tool_id.startswith("app-"): return "app"</code><br>
+          掃描器完全沒有讀 <code>data.get("category")</code>。分類是從 <b>id 前綴</b>推出來的。</td>
+    </tr>
+    <tr>
+      <td>只有 <code>app</code> / <code>sheet</code> / <code>management</code> 會出現在下拉裡</td>
+      <td><code>main.jsx:73-79 menuGroupFor()</code> 對 <code>module</code>/<code>external</code> 回 <code>null</code> → 隱藏。<code>app</code> → 「共同應用程式」群組。</td>
+    </tr>
+    <tr>
+      <td>engine 自己挑空閒埠、等它 ready,再把 URL 交給殼</td>
+      <td><code>engine.py:1432-1449</code>:<code>find_free_port()</code> → <code>_spawn()</code> → <code>wait_for_port()</code> → 回傳 <code>input_url</code></td>
+    </tr>
+    <tr>
+      <td>portal 的下拉叫「工作流程」,按鈕上寫英文 <code>Start</code></td>
+      <td><code>apps/portal-react/src/main.jsx:245</code>(label)、<code>:274</code>(button)</td>
+    </tr>
+  </table>
+</div>
+
+<div class="box stop">
+  <p><b>不要做的三件事</b></p>
+  <ul>
+    <li><b>不要在本機 <code>cargo build</code> / <code>tauri build</code></b>。本機 WDAC 強制模式會擋新編譯的未簽章原生碼(<code>os error 4551</code>)。跑<b>既有的</b> exe 沒問題 —— 這正是 <code>start-dev-tauri.bat</code> 在做的事。</li>
+    <li><b>不要用 <code>engine.exe</code></b>。凍結版沒有打包 Streamlit 的前端靜態檔,每個工具的 <code>/</code> 都會回 404;開發一律用 <code>engine.py</code> 原始碼。</li>
+    <li><b>不要改殼</b>去讀什麼 URL 參數。殼沒有那個契約;工具清單是 engine 給的。</li>
+  </ul>
+</div>
+
+<div class="step"><div class="num">1</div><h2>確認前置條件</h2></div>
+
+<pre><code># 殼在不在(17.4 MB,已 commit 進 repo)
+dir "C:\code\claude\nativeApp\apps\host-tauri\prebuilt\cim-light.exe"
+
+# CV Viewer 的入口與相依
+dir "C:\code\claude\CV_Viewer\5_PG_Develop\app.py"
+type "C:\code\claude\CV_Viewer\requirements.lock.txt" | find /c /v ""</code></pre>
+
+<div class="box ok">
+  <p><b>應該看到</b> <span class="tag tag-v">已驗證</span></p>
+  <ul>
+    <li><code>cim-light.exe</code> — 17,444,816 bytes</li>
+    <li><code>5_PG_Develop\app.py</code> — CV Viewer 的入口(它 import 同層的 <code>casepkg</code> / <code>cocoio</code> / <code>viewer</code> 等 23 個模組)</li>
+    <li><code>requirements.lock.txt</code> — 53 行,完全釘死</li>
+    <li><code>CV_Viewer\models\</code> — <b>85 MB</b>(<code>dinov2_vits14.pth</code>)。它是 App 離線執行真的需要的權重,不是垃圾。</li>
+  </ul>
+</div>
+
+<div class="step"><div class="num">2</div><h2>照著 <code>app-lv</code> 抄:它跟 CV Viewer 是同一種形狀</h2></div>
+
+<p>
+  平台裡已經有一個活生生的範本:<b>LV (VisualLatent)</b>。它跟 CV Viewer 一樣是
+  <b>扁平的 <code>scripts/</code> 式 App</b> —— <code>app.py</code> 直接 import 同層的兄弟模組,
+  而不是一個可安裝的套件。這正是 CV Viewer 的形狀(<code>5_PG_Develop/app.py</code> import <code>casepkg</code>…)。
+</p>
+
+<p>先讀這兩個現成檔案,它們是你要仿造的樣板:</p>
+
+<div class="scroll">
+<table>
+  <tr><th>檔案</th><th>它做什麼</th></tr>
+  <tr>
+    <td><code>sidecar/python-engine/plugins/lv/modules/app-lv/plugin.yaml</code></td>
+    <td>宣告 <code>id: app-lv</code> / <code>runner: lv</code> / <code>category: app</code> / <code>requires:</code>(per-tool venv 的相依)</td>
+  </tr>
+  <tr>
+    <td><code>sidecar/python-engine/tools/lv_runner.py</code></td>
+    <td>把 LV 的 <code>scripts/</code> 塞進 <code>sys.path</code>,再用 <code>runpy.run_path(..., run_name="__main__")</code> 執行 <code>app.py</code> —— 等同於 <code>streamlit run scripts/app.py</code></td>
+  </tr>
+</table>
+</div>
+
+<div class="box fact">
+  <p><b>為什麼要 runner,而不是直接指向 app.py?</b> <span class="tag tag-v">已驗證</span></p>
+  <p>
+    因為扁平式 App 的 <code>import casepkg</code> 只有在「<code>app.py</code> 自己的目錄在 <code>sys.path</code> 上」時才成立。
+    <code>streamlit run x/y/app.py</code> 會把 <b>腳本自己的目錄</b> 放進 <code>sys.path</code> —— runner 就是在複製這個行為。
+    <code>lv_runner.py</code> 的 docstring 把這件事寫得很清楚:「LV is a <i>flat</i> scripts/ app … so this runner puts LV's scripts/ dir on sys.path and runpy-executes app.py as __main__」。
+  </p>
+</div>
+
+<div class="step"><div class="num">3</div><h2>把 CV Viewer 的原始碼接進來</h2></div>
+
+<p>
+  LV 與 AI4BI 是用 <b>git submodule</b> 掛在 <code>sidecar/python-engine/vendor/</code> 底下的
+  (<code>.gitmodules</code> <span class="tag tag-v">已驗證</span>)。CV Viewer 目前<b>沒有 GitHub remote</b>,
+  所以開發階段有兩條路,<b>選一條,不要兩條都做</b>:
+</p>
+
+<h3>路線 A(推薦,開發階段):用環境變數指到本機 repo</h3>
+<p>不動 CV Viewer 的 repo、不需要 GitHub。runner 讀一個環境變數,預設值指向 vendor,找不到就退回本機路徑。</p>
+
+<h3>路線 B(要進版控時):加成 submodule</h3>
+<pre><code># 先把 CV_Viewer 推上 GitHub,然後:
+cd C:\code\claude\nativeApp
+git submodule add https://github.com/&lt;you&gt;/CV_Viewer.git sidecar/python-engine/vendor/CV_Viewer
+git commit -m "vendor CV_Viewer as submodule"</code></pre>
+
+<div class="box warn">
+  <p><b>85 MB 的權重檔不要進 submodule。</b>LV 就是這樣處理的 —— 模型權重不入 submodule,
+    由 <code>LV_MODELS_DIR</code> 指向平台的 model-house。CV Viewer 照抄:用
+    <code>CV_VIEWER_MODELS_DIR</code> 指過去。</p>
+</div>
+
+<div class="step"><div class="num">4</div><h2>建立 runner:<code>tools/cv_viewer_runner.py</code></h2></div>
+
+<p>路徑必須<b>剛好</b>是這個 —— 因為 <code>runner: cv_viewer</code> 會被 engine 轉成 <code>cv_viewer_runner.py</code>(<code>engine.py:689</code>)。</p>
+
+<pre><code># C:\code\claude\nativeApp\sidecar\python-engine\tools\cv_viewer_runner.py
+"""Streamlit runner for the CV Viewer embedded app (``runner: cv_viewer`` → this file).
+
+CV Viewer is a *flat* app, exactly like LV: ``5_PG_Develop/app.py`` imports its
+sibling modules (``import casepkg`` / ``cocoio`` / ``viewer`` …, 23 of them) rather
+than being an installable package. `streamlit run x/app.py` puts the SCRIPT'S OWN
+directory on sys.path, and that is the only reason those imports resolve — so this
+runner reproduces exactly that, then runpy-executes app.py as __main__.
+
+Model weights (85 MB dinov2_vits14.pth) are NOT vendored: the platform points at a
+writable model-house via CV_VIEWER_MODELS_DIR, mirroring LV_MODELS_DIR.
+"""
+from __future__ import annotations
+
+import os
+import runpy
+import sys
+from pathlib import Path
+
+_ENGINE_ROOT = Path(__file__).resolve().parent.parent
+
+# vendor/ 優先(進了版控之後就是這裡);開發階段可用 CV_VIEWER_ROOT 指到本機 repo。
+_DEFAULT = _ENGINE_ROOT / "vendor" / "CV_Viewer"
+_CV_ROOT = Path(os.environ.get("CV_VIEWER_ROOT") or _DEFAULT)
+_CV_APP_DIR = _CV_ROOT / "5_PG_Develop"
+
+if not (_CV_APP_DIR / "app.py").is_file():
+    raise SystemExit(
+        f"[cv_viewer_runner] 找不到 CV Viewer 的入口:{_CV_APP_DIR / 'app.py'}\n"
+        f"  開發階段請設環境變數 CV_VIEWER_ROOT 指到 CV_Viewer repo,例如:\n"
+        f"    set CV_VIEWER_ROOT=C:\\code\\claude\\CV_Viewer\n"
+        f"  或把 CV_Viewer 掛成 submodule 到 {_DEFAULT}"
+    )
+
+# 權重:不進 submodule,跟 LV 一樣用環境變數指過去(未設就用 repo 自己的 models/)。
+os.environ.setdefault("CV_VIEWER_MODELS_DIR", str(_CV_ROOT / "models"))
+
+# 這一行就是整個 runner 的理由:扁平式 App 的 sibling import 只有這樣才成立。
+if str(_CV_APP_DIR) not in sys.path:
+    sys.path.insert(0, str(_CV_APP_DIR))
+
+runpy.run_path(str(_CV_APP_DIR / "app.py"), run_name="__main__")</code></pre>
+
+<div class="box warn">
+  <p><b>AI 注意:<code>sys.path.insert</code> 只影響「這個 Streamlit 子程序」。</b>
+    engine 對每一個 <code>app</code> 工具會各開一個程序(<code>engine.py:1411 _start_app</code>),
+    所以 CV Viewer 的通用模組名(<code>viewer</code> / <code>models</code>)不會污染別的外掛。
+    這是設計,不是巧合 —— <code>lv_runner.py</code> 的註解特別講了這件事。</p>
+</div>
+
+<div class="step"><div class="num">5</div><h2>建立 <code>plugin.yaml</code></h2></div>
+
+<p>放在 <code>plugins/&lt;plugin&gt;/modules/&lt;module&gt;/plugin.yaml</code> —— 這是 engine 掃描的第二個位置。</p>
+
+<pre><code># C:\code\claude\nativeApp\sidecar\python-engine\plugins\cv\modules\app-cv-viewer\plugin.yaml
+id: app-cv-viewer          # ★ 唯一決定「單一全高 iframe」的東西,就是這個 app- 前綴
+name: 🔍 CV Viewer         # ← 這一行就是下拉裡看到的字
+version: 1.0.0
+runner: cv_viewer          # → tools/cv_viewer_runner.py
+category: app              # 註:掃描器其實不讀這個欄位(分類是從 id 推的)。
+                           #     保留它純粹是為了讓人看 yaml 就懂,別依賴它。
+vendor: cimcore
+domain: inspection
+enabled: true
+slug: cvviewer
+author: system
+description: >
+  CV Viewer — 晶圓/影像檢視與比對。以「單一畫面內嵌的完整 Streamlit 應用」方式啟動
+  (id 以 app- 開頭 → category app;runner: cv_viewer → tools/cv_viewer_runner.py,
+  見 ToolProcessManager._start_app)。原始碼在自己的 repo,開發階段用 CV_VIEWER_ROOT
+  指過去;模型權重不入版控,由 CV_VIEWER_MODELS_DIR 指向平台 model-house。
+
+# 自帶相依(per-tool venv)。刻意不含 streamlit —— 用平台核心的 streamlit。
+# 這份清單請對照 CV_Viewer/requirements.lock.txt 填,不要憑印象。
+requires:
+  - numpy
+  - pillow
+  - opencv-python
+  - tifffile
+  - pyyaml
+  - torch
+  - torchvision</code></pre>
+
+<div class="box stop">
+  <p><b>AI 必做:不要照抄上面的 <code>requires</code>。</b></p>
+  <p>請打開 <code>C:\code\claude\CV_Viewer\requirements.lock.txt</code>(53 行),
+     把 CV Viewer 真正需要的第三方套件填進去,並<b>移除 <code>streamlit</code></b>
+     (平台核心已經有了,LV 的 plugin.yaml 對此有明確註解)。
+     這裡填錯,會在 <code>Start</code> 的時候才炸,而不是現在。</p>
+  <p>
+    <b>一個實測到的陷阱</b> <span class="tag tag-v">已驗證</span>:<code>torch</code>
+    <b>不在</b> CV Viewer 的 lock 裡,但 <code>5_PG_Develop/dinodiff.py:244</code>
+    在<b>函式內</b>延遲 import 它。所以 App <b>啟動不會炸</b>,而是等使用者點到「DINOv2 比對」那條路徑才失敗。
+    要那個功能就得把 <code>torch</code> / <code>torchvision</code> 放進 <code>requires:</code>
+    (LV 也是這樣做的:<code>torch==2.6.0</code>)。
+  </p>
+</div>
+
+<div class="step"><div class="num">6</div><h2>啟動,並用眼睛驗證</h2></div>
+
+<pre><code>rem 開發階段指到本機 CV Viewer repo
+set CV_VIEWER_ROOT=C:\code\claude\CV_Viewer
+
+cd /d C:\code\claude\nativeApp
+start-dev.bat</code></pre>
+
+<p>
+  <code>start-dev.bat</code> 只是一個轉導,實際做事的是 <code>start-dev-tauri.bat</code>
+  <span class="tag tag-v">已驗證</span>。它做的事(依序):
+</p>
+
+<ol>
+  <li>submodule preflight</li>
+  <li>找 exe:<code>prebuilt\cim-light.exe</code> → release → debug(<b>不重編</b>)</li>
+  <li><b>硬性要求 <code>apps\portal-react\dist\index.html</code> 存在</b> —— 沒有就直接失敗</li>
+  <li>找 Python(<code>py -3.11</code>)並確認 <code>uvicorn</code> / <code>fastapi</code> 裝好了</li>
+  <li>殺掉殘留的舊 engine</li>
+  <li>設 <code>CIM_ENGINE_EXE=…\engine.py</code>、<code>CIM_ENGINE_PYTHON=&lt;py311&gt;</code>,然後跑 exe</li>
+</ol>
+
+<div class="box fact">
+  <p><b>殼會自己拉起 engine —— 你不要另外去啟動 engine。</b> <span class="tag tag-v">已驗證</span></p>
+  <p>
+    Rust 殼讀 <code>CIM_ENGINE_EXE</code>(副檔名是 <code>.py</code> 就用 <code>CIM_ENGINE_PYTHON</code> 去跑它),
+    傳 <code>--control-port &lt;隨機空閒埠&gt; --log-dir &lt;dir&gt;</code>,然後輪詢 <code>GET /health</code> 等它回
+    <code>{"status":"ok"}</code>。<code>sidecar.rs:39-52, 116-124, 189</code>。
+    <b>沒有固定埠</b> —— control port 是臨時的,每個 Streamlit 子程序也各拿一個空閒埠。
+  </p>
+</div>
+
+<ul class="check">
+  <li>Tauri 視窗開起來,看得到 portal</li>
+  <li>「工作流程」下拉的<b>「共同應用程式」</b>群組裡出現 <b>🔍 CV Viewer</b></li>
+  <li>選它 → 按 <code>Start</code></li>
+  <li>整個視窗變成 CV Viewer 的 Streamlit 畫面(<b>單一全高 iframe</b>,不是左右兩欄的 Input/Output)</li>
+</ul>
+
+<div class="box warn">
+  <p><b>第一次按 Start 會很慢,這是正常的。</b> <span class="tag tag-v">已驗證</span></p>
+  <p>
+    plugin.yaml 裡有 <code>requires:</code> 就會觸發<b>該工具專屬的隔離 venv</b>
+    (<code>sidecar\python-engine\.tool-venvs\app-cv-viewer\</code>),第一次要把那些套件裝進去。
+    engine 知道這件事,會把 ready timeout 拉長(<code>engine.py:1429 _prewarm_deps_and_timeout</code>)。
+  </p>
+</div>
+
+<div class="box fact">
+  <p><b>看不到工具?</b>engine 只在<b>開機時</b>掃 plugin.yaml。改完 yaml 要<b>重啟</b>整個 app。
+     (<code>POST /reload</code> 只會「新增」,不會移除已刪掉的工具。)</p>
+  <p><b>要確認 engine 到底認得哪些工具</b>,在 portal 的 DevTools 主控台跑:</p>
+  <pre><code>[...document.querySelector('.toolSelect').options].map(o =&gt; o.value)</code></pre>
+</div>
+
+<div class="box stop">
+  <p><b>兩個會讓 AI 白忙一小時的陷阱</b> <span class="tag tag-v">已驗證</span></p>
+  <ul>
+    <li>
+      <b>portal 的 <code>dist/</code> 沒進 git,而且它是「烤進 exe 裡」的。</b>
+      <code>tauri.conf.json</code> 的 <code>frontendDist</code> 在 <code>cargo build</code> 當下就被嵌進二進位檔
+      (實測:對 <code>cim-light.exe</code> grep 得到 <code>index-BWgCAQ0N.js</code>,正是 <code>dist\assets\</code> 裡那兩個檔)。
+      所以<b>改 portal 原始碼、重新 <code>npm run build</code>,現有的 exe 不會吃到</b> —— 那需要在<b>沒有 WDAC 的機器</b>上重編殼。
+      (repo 自己的 CLAUDE.md 說 portal 是 runtime-loaded,<b>那是錯的</b>。)<br>
+      <b>但你這次不用碰 portal</b>:加一個工具只動 engine 端的 yaml + runner,那些是真的 runtime-loaded。
+    </li>
+    <li>
+      <b>絕對不要直接執行 <code>tools/*_runner.py</code>。</b>
+      runner 需要的環境變數(<code>CIM_TOOL_ID</code> / <code>CIM_LOG_DIR</code> / per-tool venv 的 <code>PYTHONPATH</code>…)
+      是 engine 在 spawn 的時候注入的(<code>engine.py:910-925</code>)。手動跑只會得到看不懂的錯誤。
+    </li>
+  </ul>
+</div>
+
+<div class="step"><div class="num">7</div><h2>出事的時候看哪裡</h2></div>
+
+<div class="box fact">
+  <p><b>log 在這裡</b> <span class="tag tag-v">已驗證</span>(不是 <code>apps/host-tauri/logs</code> —— 那個目錄根本不存在,repo 的 startup 文件寫錯了):</p>
+  <pre><code>C:\code\claude\nativeApp\apps\host-tauri\src-tauri\logs\
+  host.log                              殼 + engine 的 stdout/stderr
+  engine.log                            Python engine
+  streamlit-app-cv-viewer-&lt;tag&gt;.log     CV Viewer 這個 Streamlit 子程序自己的輸出  ← 按 Start 失敗就看這個</code></pre>
+</div>
+
+<div class="scroll">
+<table>
+  <tr><th>症狀</th><th>最可能的原因</th><th>怎麼查</th></tr>
+  <tr>
+    <td>下拉裡沒有 CV Viewer</td>
+    <td>plugin.yaml 沒被掃到(路徑不對),或 <code>enabled: false</code></td>
+    <td>確認路徑<b>剛好</b>是 <code>plugins/cv/modules/app-cv-viewer/plugin.yaml</code>;engine log 有 <code>Failed to parse</code> 就是 yaml 壞了</td>
+  </tr>
+  <tr>
+    <td>按 Start 後轉圈然後失敗</td>
+    <td>runner 起不來(缺套件 / import 錯)</td>
+    <td>看 engine log 與 streamlit log;<code>ModuleNotFoundError</code> = <code>requires:</code> 漏了東西</td>
+  </tr>
+  <tr>
+    <td>畫面是 <code>Not Found</code>,但 <code>/_stcore/health</code> 回 200</td>
+    <td>你用了 <code>engine.exe</code></td>
+    <td>改用 <code>engine.py</code>(凍結版沒包 Streamlit 前端靜態檔)</td>
+  </tr>
+  <tr>
+    <td>視窗一開就關</td>
+    <td>缺 Microsoft Edge WebView2 Runtime,或防毒隔離了 exe</td>
+    <td>裝 WebView2;把資料夾加進防毒排除清單</td>
+  </tr>
+  <tr>
+    <td><code>import casepkg</code> 失敗</td>
+    <td>runner 的 <code>sys.path.insert</code> 指錯目錄</td>
+    <td>必須是 <code>&lt;CV_VIEWER_ROOT&gt;\5_PG_Develop</code>,不是 repo 根目錄</td>
+  </tr>
+  <tr>
+    <td>啟動 CV Viewer 之後,原本在跑的工具不見了</td>
+    <td><b>這是設計</b>:同時只能有一個 active 工具</td>
+    <td><code>engine.py:1018-1020</code> — <code>start()</code> 第一件事就是 <code>self.stop()</code>。portal 也會在有工具執行時把下拉 disable 掉。</td>
+  </tr>
+</table>
+</div>
+
+<div class="box warn">
+  <p><b>收尾:別留孤兒程序。</b>engine 是 <code>python.exe</code>(不是 engine.exe),
+     Streamlit 又是 engine 的子程序,而 engine 崩潰會<b>自動換埠重啟</b>(3 秒後,<code>sidecar.rs:198-241</code>)——
+     所以「對記錄下來的埠送 shutdown」會漏掉新埠。</p>
+  <p>正常關窗是安全的:殼會攔 <code>CloseRequested</code> → <code>POST /shutdown</code> → 等 5 秒 → 才 kill
+     (<code>lib.rs:79-89</code>、<code>sidecar.rs:244-285</code>)。<b>強制砍 exe 才會留孤兒。</b></p>
+  <p>要清殘留,用 <code>start-dev-tauri.bat</code> 自己用的那一招(<b>只殺屬於這個平台的</b>,不會誤殺使用者其他的 python):</p>
+  <pre><code>powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'python.exe' -and $_.CommandLine -like '*engine.py*--control-port*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"</code></pre>
+</div>
+
+<h2>完成之後</h2>
+<p>
+  到這裡,CV Viewer 已經是平台上的一個一等公民工具了 —— 但它還<b>只活在你的開發機上</b>。
+  要把「殼 + CV Viewer + 可攜 Python」做成一個能拷給產線、雙擊就跑、不需安裝任何東西的資料夾,
+  請接著看 <b>Runbook B</b>。
+</p>
+
+<footer>
+  基準版本:native_Provision <code>affe211</code> · nativeApp(prebuilt cim-light.exe 17.4 MB)· CV_Viewer(local)<br>
+  文件中的路徑與行號皆為撰寫當下實際讀取所得;repo 變動後請重新確認。
+</footer>
+
+</div>

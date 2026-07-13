@@ -1,0 +1,383 @@
+<title>Runbook B — 打包:CV Viewer + Native App 殼 + native_Provision → 可交付資料夾</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1a1a1a; --muted: #5c6370; --line: #e3e6ea;
+    --code-bg: #f6f8fa; --code-fg: #24292f; --accent: #0b6bcb; --accent-soft: #eaf3fc;
+    --ok: #17663a; --ok-soft: #e8f5ee; --warn: #8a5700; --warn-soft: #fff4e0;
+    --danger: #b3261e; --danger-soft: #fdecea;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171a; --fg: #e6e6e6; --muted: #9aa4b2; --line: #2a2f36;
+      --code-bg: #1c2128; --code-fg: #d7dde5; --accent: #58a6ff; --accent-soft: #16283d;
+      --ok: #7ee2a8; --ok-soft: #13291d; --warn: #e3b341; --warn-soft: #2b2313;
+      --danger: #ff7b72; --danger-soft: #2d1a19;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #14171a; --fg: #e6e6e6; --muted: #9aa4b2; --line: #2a2f36;
+    --code-bg: #1c2128; --code-fg: #d7dde5; --accent: #58a6ff; --accent-soft: #16283d;
+    --ok: #7ee2a8; --ok-soft: #13291d; --warn: #e3b341; --warn-soft: #2b2313;
+    --danger: #ff7b72; --danger-soft: #2d1a19;
+  }
+  :root[data-theme="light"] {
+    --bg: #ffffff; --fg: #1a1a1a; --muted: #5c6370; --line: #e3e6ea;
+    --code-bg: #f6f8fa; --code-fg: #24292f; --accent: #0b6bcb; --accent-soft: #eaf3fc;
+    --ok: #17663a; --ok-soft: #e8f5ee; --warn: #8a5700; --warn-soft: #fff4e0;
+    --danger: #b3261e; --danger-soft: #fdecea;
+  }
+  body { background: var(--bg); color: var(--fg); margin: 0;
+         font: 16px/1.7 -apple-system, "Segoe UI", "Noto Sans TC", "Microsoft JhengHei", sans-serif; }
+  .wrap { max-width: 900px; margin: 0 auto; padding: 40px 20px 96px; }
+  h1 { font-size: 1.85rem; line-height: 1.3; margin: 0 0 6px; letter-spacing: -.01em; }
+  h2 { font-size: 1.28rem; margin: 48px 0 12px; padding-top: 18px; border-top: 1px solid var(--line); }
+  h3 { font-size: 1.05rem; margin: 26px 0 8px; }
+  .sub { color: var(--muted); margin: 0 0 26px; }
+  code { font-family: "Cascadia Code", Consolas, monospace; font-size: .875em;
+         background: var(--code-bg); color: var(--code-fg); padding: 2px 5px; border-radius: 4px; }
+  pre { background: var(--code-bg); color: var(--code-fg); padding: 14px 16px; border-radius: 8px;
+        overflow-x: auto; border: 1px solid var(--line); }
+  pre code { background: none; padding: 0; font-size: .84rem; line-height: 1.6; }
+  .box { border: 1px solid var(--line); border-left-width: 4px; border-radius: 6px;
+         padding: 12px 16px; margin: 16px 0; }
+  .box p:first-child { margin-top: 0; } .box p:last-child { margin-bottom: 0; }
+  .fact { border-left-color: var(--accent); background: var(--accent-soft); }
+  .ok   { border-left-color: var(--ok);     background: var(--ok-soft); }
+  .warn { border-left-color: var(--warn);   background: var(--warn-soft); }
+  .stop { border-left-color: var(--danger); background: var(--danger-soft); }
+  .tag { display: inline-block; font-size: .72rem; font-weight: 600; letter-spacing: .04em;
+         padding: 2px 8px; border-radius: 999px; vertical-align: middle; margin-left: 8px; }
+  .tag-v { background: var(--ok-soft); color: var(--ok); border: 1px solid var(--ok); }
+  .tag-u { background: var(--warn-soft); color: var(--warn); border: 1px solid var(--warn); }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; font-size: .9rem; }
+  th, td { border: 1px solid var(--line); padding: 8px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--code-bg); font-weight: 600; }
+  .scroll { overflow-x: auto; }
+  .step { display: flex; gap: 12px; align-items: baseline; margin: 40px 0 10px; }
+  .num { flex: 0 0 auto; width: 30px; height: 30px; border-radius: 50%; background: var(--accent);
+         color: #fff; font-weight: 700; font-size: .9rem; display: grid; place-items: center; }
+  .step h2 { margin: 0; border: none; padding: 0; }
+  ul.check { list-style: none; padding-left: 0; }
+  ul.check li { padding-left: 26px; position: relative; margin: 6px 0; }
+  ul.check li::before { content: "☐"; position: absolute; left: 0; color: var(--muted); }
+  footer { margin-top: 60px; padding-top: 18px; border-top: 1px solid var(--line);
+           color: var(--muted); font-size: .85rem; }
+</style>
+
+<div class="wrap">
+
+<h1>Runbook B — 打包成可交付資料夾</h1>
+<p class="sub">
+  給 AI 照著執行。目標:把 <b>CV Viewer + Tauri 殼 + 可攜 Python</b> 合成一個資料夾,
+  拷給產線的人,<b>雙擊就跑,不需要安裝 Python、Streamlit、Node 或 Rust</b>。<br>
+  工具是 <code>native_Provision</code>。基準版本 <code>affe211</code>(全套測試綠燈、交付鏈 E2E 12/12)。
+</p>
+
+<div class="box fact">
+  <p><b>先決定:你要哪一種佈局?</b>兩種都能交付,差別在「第二個 App 進來的時候」。</p>
+  <table>
+    <tr><th></th><th>fat(單一資料夾)</th><th>Store(版本化 + 共用)</th></tr>
+    <tr><td>大小</td><td>約 600 MB(每個 App 各自帶一份 runtime)</td><td>共用 runtime 約 500 MB + <b>每個版本槽只有 10–100 MB</b></td></tr>
+    <tr><td>第二個 App</td><td>再吃一次 600 MB</td><td><b>+0 MB runtime</b>(同一份 lock 就重用)</td></tr>
+    <tr><td>更新</td><td>整包重發</td><td>只發版本槽;原子更新 + 自動回滾</td></tr>
+    <tr><td>相依要求</td><td>requirements.txt 或 pyproject 就行</td><td><b>必須是完全釘死的 lock</b></td></tr>
+    <tr><td>什麼時候選它</td><td>只有一個 App、只給幾台機器、先試試看</td><td>要長期維護、要發新版、一台機器要放多個 App</td></tr>
+  </table>
+  <p><b>CV Viewer 有 <code>requirements.lock.txt</code>(53 行,完全釘死)<span class="tag tag-v">已驗證</span>,兩種都能走。</b>
+     這份文件兩條路都寫。</p>
+</div>
+
+<div class="box stop">
+  <p><b>這件事跟 Runbook A 是「兩條獨立的路」,不要搞混。</b></p>
+  <ul>
+    <li><b>Runbook A</b>(開發):把 CV Viewer 註冊成 CIM 平台的一個工具 → 跑在<b>完整的平台</b>裡(engine + portal + 所有其他工具)。</li>
+    <li><b>Runbook B</b>(交付):把 CV Viewer <b>單獨</b>包成一個桌面 App → 殼裡只有它一個。
+        它<b>不需要</b> Runbook A 的 plugin.yaml / runner,也<b>不會</b>把 CIM 平台的其他工具帶過去。</li>
+  </ul>
+  <p>兩者共用同一顆 <code>cim-light.exe</code>,但走的是不同的 engine:交付包裡跑的是 native_Provision 自己的
+     <code>engine_shim.py</code>,只服務這一個 App。</p>
+</div>
+
+<h2>0. 環境檢查(30 秒)</h2>
+
+<pre><code>cd /d C:\code\claude\native_Provision
+py -3.11 -c "import sys; print(sys.version)"</code></pre>
+
+<p>打包器會<b>自動偵測</b>殼與可攜 Python,不用你填 <span class="tag tag-v">已驗證</span>:</p>
+
+<pre><code>py -3.11 -c "import sys; sys.path.insert(0,'src'); from provision_builder.streamlit_desktop import discover; \
+print('殼     :', discover.find_shell().value); \
+print('runtime:', discover.find_runtime().value)"</code></pre>
+
+<div class="box ok">
+  <p><b>應該印出</b> <span class="tag tag-v">已驗證</span></p>
+  <pre><code>殼     : C:\code\claude\nativeApp\apps\host-tauri\prebuilt\cim-light.exe
+runtime: C:\code\claude\native_Provision\.runtime-cache\python311</code></pre>
+  <p>找不到 runtime 的話,GUI 上會出現「下載可攜 Python…」按鈕(需要網路;<b>建置機要能上網,交付出去的資料夾則完全離線</b>)。</p>
+</div>
+
+<div class="step"><div class="num">1</div><h2>路線一:GUI(人來操作,最不會出錯)</h2></div>
+
+<pre><code>cd /d C:\code\claude\native_Provision
+start-gui.bat</code></pre>
+
+<p>切到 <b>「Streamlit 專案 → 桌面 App」</b> 分頁。</p>
+
+<ul class="check">
+  <li><b>專案資料夾</b> → 選 <code>C:\code\claude\CV_Viewer</code>。<br>
+      其餘欄位會自動帶出:<b>應用名稱 = CV Viewer</b>、<b>入口檔案 = 5_PG_Develop\app.py</b>
+      <span class="tag tag-v">已驗證</span>(入口偵測會遞迴找、會跳過 spike/tests/.venv、會要求那個檔真的有 render 呼叫)</li>
+  <li><b>進階設定 → 相依 lock 檔</b> → 指到 <code>CV_Viewer\requirements.lock.txt</code>
+      <span class="tag tag-v">已驗證</span><br>
+      <span style="color:var(--muted)">(不填也能跑,它會自己找;但要跟別的 App <b>共用 runtime</b>,就必須兩邊指同一份 lock。)</span></li>
+  <li><b>進階設定 → WebView2 離線安裝檔</b> → <b>目標機不能上網就一定要填</b>(見下方紅框)</li>
+  <li>按 <b>「檢查專案」</b> → 0 秒內給答案</li>
+  <li>按 <b>「建立可交付資料夾」</b></li>
+</ul>
+
+<div class="box warn">
+  <p><b>CV Viewer 實際跑出來的檢查結果</b> <span class="tag tag-v">已驗證(剛剛實跑)</span></p>
+  <pre><code>validate_request  → 通過(0 errors)
+⚠ 選用相依「torch」沒有宣告,但只在 5_PG_Develop/dinodiff.py:244(函式內延遲 import)用到,
+  不會擋住啟動;若那條路徑要能用,請把它加進 requirements。</code></pre>
+  <p>
+    這個警告是<b>對的,而且很重要</b>:<code>torch</code> 在 <code>dinodiff.py</code> 的<b>函式裡面</b>才 import,
+    所以 App <b>啟動不會炸</b> —— 閘門因此只警告、不擋建置(擋了就會誤殺一個能跑的 App)。
+    但那條「用 DINOv2 做比對」的功能路徑會在<b>使用者點下去的時候</b>才失敗。
+  </p>
+  <p><b>你要做的決定</b>:那個功能要不要交付?要 → 把 <code>torch</code>(和 <code>torchvision</code>)加進 lock 再建置。
+     不要 → 就這樣出,但你已經知道它會缺。</p>
+</div>
+
+<div class="box warn">
+  <p><b>檢查專案會跳出「這個專案裡有一些大東西」—— 這是對的,不是 bug。</b> <span class="tag tag-v">已驗證</span></p>
+  <pre><code>⚠ 專案裡的大檔:models/dinov2_vits14.pth(84 MB)——確定要交付嗎?
+· 已自動排除:wheels/ 124 MB、.git/ 11 MB、__pycache__/ 3 MB(共 138 MB,不會進交付包)</code></pre>
+  <p>
+    那 84 MB 是 DINOv2 的權重,<b>App 離線執行真的需要它</b> → 按「確定」帶進去。<br>
+    而 <code>wheels/</code>、<code>.git/</code> 是自動排掉的,只是<b>資訊</b>,不需要你做任何決定。
+  </p>
+</div>
+
+<div class="box stop">
+  <p><b>WebView2:這是交付包裡「唯一」需要事先裝在目標機上的東西。</b></p>
+  <p>
+    應用視窗是 WebView2 畫出來的。Win11 大多內建;但<b>無網工廠機</b>如果沒有,
+    App 會開不起來(<code>start.bat</code> 會先偵測並 exit 5),而且<b>當場沒網路可以裝</b>。
+  </p>
+  <p>
+    到 <a href="https://go.microsoft.com/fwlink/?LinkId=2124701">go.microsoft.com/fwlink/?LinkId=2124701</a>
+    下載 <b>Evergreen Standalone Installer</b>,在「進階設定 → WebView2 離線安裝檔」指定它。
+    它會被放進交付包的 <code>prereq\</code>,<code>tools\安裝WebView2.bat</code> 就能離線裝(不需管理員權限)。
+  </p>
+  <p><b>沒填的話</b>,建置<b>不會</b>假裝成功 —— 完成對話框會警告你這件事。
+     而且<b>已經建好的包不必重建</b>:把安裝檔複製進 <code>&lt;交付包&gt;\prereq\</code> 就行。</p>
+</div>
+
+<div class="step"><div class="num">2</div><h2>路線二:程式碼(給 AI 自動化用)</h2></div>
+
+<h3>fat 佈局 —— 一個資料夾,雙擊就跑</h3>
+
+<pre><code># build_cv_viewer_fat.py
+import sys
+sys.path.insert(0, r"C:\code\claude\native_Provision\src")
+
+from pathlib import Path
+from provision_builder.streamlit_desktop import (
+    BuildRequest, build, validate_request, warnings_for,
+    find_entrypoint, find_runtime, find_shell, suggest_name,
+)
+from provision_builder.streamlit_desktop.builder import scan_project
+
+PROJECT = Path(r"C:\code\claude\CV_Viewer")
+
+request = BuildRequest(
+    project_dir=PROJECT,
+    entrypoint=find_entrypoint(PROJECT).value,          # → 5_PG_Develop\app.py
+    display_name=suggest_name(PROJECT),                 # → "CV Viewer"(保留大小寫)
+    output_dir=Path(r"C:\code\claude\native_Provision\dist\streamlit-apps"),
+    shell_exe=find_shell().value,                       # → nativeApp 的 cim-light.exe
+    runtime_template=find_runtime().value,              # → .runtime-cache\python311
+    preferred_port=0,                                   # 0 = 每次啟動隨機挑一個沒被占用的埠
+    requirements=PROJECT / "requirements.lock.txt",
+    # webview2_installer=Path(r"C:\...\MicrosoftEdgeWebView2RuntimeInstallerX64.exe"),
+)
+
+# 1) 閘門:0 秒就給答案,不要等 6 分鐘的 pip 裝完才炸
+errors = validate_request(request)
+if errors:
+    raise SystemExit("檢查未通過:\n  " + "\n  ".join(errors))
+for w in warnings_for(request):
+    print("⚠", w)
+
+# 2) 大檔在「開工前」就知道
+scan = scan_project(request)
+print(f"專案 {scan.application_mb:.0f} MB")
+for w in scan.warnings:  print("⚠", w)     # 需要你決定的(84MB 權重檔)
+for n in scan.notes:     print("·", n)     # 純資訊(已自動排除的 138MB)
+
+# 3) 建置(progress 會逐行吐出來,包含 pip 的輸出)
+result = build(request, progress=lambda line: print("   ", line))
+if not result.ok:
+    raise SystemExit(f"建置失敗:{result.errors}\n完整記錄:{result.log_path}")
+
+print(f"\n交付資料夾:{result.package_dir}")
+print(f"大小 {result.size_mb:.0f} MB · {result.duration_seconds:.0f} 秒")
+for w in result.warnings:
+    print("⚠", w)          # ← 沒附 WebView2 安裝檔的話,警告會出現在這裡</code></pre>
+
+<h3>Store 佈局 —— 版本化、共用 runtime、可回滾</h3>
+
+<pre><code># build_cv_viewer_store.py（承上,request 相同）
+from provision_builder.streamlit_desktop import build_into_store, export_full_tree
+
+STORE = Path(r"C:\code\claude\native_Provision\dist\cv-store")
+
+result = build_into_store(request, STORE, version="v1.0.0",
+                          progress=lambda line: print("   ", line))
+if not result.ok:
+    raise SystemExit(result.errors)
+
+print(f"版本 {result.version}:{result.version_mb:.0f} MB")
+print(f"本次磁碟新增 {result.added_mb:.0f} MB(runtime 重用 = {result.runtime_reused})")
+
+# 匯出「完整交付」給新機器 —— 整棵可執行的樹
+export = export_full_tree(STORE, Path(r"D:\deliver"), app_id=result.app_id,
+                          version="v1.0.0",
+                          progress=lambda line: print("   ", line))
+print(f"交付物:{export.out_dir}({export.total_mb:.0f} MB)")
+print(f"User 要雙擊的是:{export.entry_hint()}")
+for w in export.warnings:
+    print("⚠", w)</code></pre>
+
+<div class="box stop">
+  <p><b>AI 最容易犯的一個錯:匯出時忘了傳 <code>version=</code>。</b></p>
+  <p>
+    不傳的話,<code>export_full_tree</code> 會去交付 <code>state.current</code> ——
+    而在<b>建置機</b>上,剛建好的新版是設成 <b>pending</b>(建置機自己不會去啟動它),
+    所以 <code>current</code> 是<b>舊的那一版</b>。
+    結果就是:你選了 v1.1.0、走一趟工廠、裝上去的還是 v1.0.0。
+  </p>
+  <p>用 <code>newest_version(STORE, app_id)</code> 拿「最新且完整」的版本,或明確指定。</p>
+</div>
+
+<div class="step"><div class="num">3</div><h2>驗證交付物(不要只看「建立完成」)</h2></div>
+
+<pre><code>py -3.11 -c "import sys; sys.path.insert(0,'src'); from pathlib import Path; \
+p = Path(r'dist\streamlit-apps\cv-viewer'); \
+print('start.bat        ', (p/'start.bat').is_file()); \
+print('讀我-使用說明.txt', (p/'讀我-使用說明.txt').is_file()); \
+print('WebView2 安裝檔  ', any((p/'prereq').glob('*.exe')) if (p/'prereq').is_dir() else False); \
+print('app 程式碼       ', (p/'application'/'5_PG_Develop'/'app.py').is_file()); \
+print('權重檔           ', (p/'application'/'models'/'dinov2_vits14.pth').is_file()); \
+print('殼               ', (p/'shell'/'cim-light.exe').is_file())"</code></pre>
+
+<div class="box warn">
+  <p><b>最後一哩要用眼睛看。</b>把資料夾拷到一台<b>沒裝過 Python</b> 的機器(或至少換個帳號),
+     雙擊 <code>start.bat</code>,確認:</p>
+  <ul class="check">
+    <li>視窗開起來(沒有 WebView2 的話,這裡會直接告訴你,並指向 <code>tools\安裝WebView2.bat</code>)</li>
+    <li>在「工作流程」下拉確認選到 <b>CV Viewer</b></li>
+    <li>按一次 <b><code>Start</code></b> → CV Viewer 出現在視窗裡</li>
+  </ul>
+  <p><b>那一次 Start 是已知限制</b>:portal 烤在預建 exe 裡,要自動啟動就得重編殼,而本機 WDAC 擋重編。</p>
+</div>
+
+<div class="step"><div class="num">4</div><h2>發新版給已經交付出去的機器</h2></div>
+
+<p>這是 Store 佈局存在的理由。<b>不要重發 600 MB。</b></p>
+
+<pre><code># 建置機:建 v1.1.0(同一份 lock → runtime 重用 → 只多一個版本槽)
+build_into_store(request, STORE, version="v1.1.0", ...)
+
+# 匯出「更新包」(只有這一版,十幾 MB)
+from provision_builder.streamlit_desktop import export_update
+upd = export_update(STORE, app_id, "v1.1.0", Path(r"D:\update"), include_runtime=False)</code></pre>
+
+<p>然後在<b>目標機</b>上(交付樹自己就帶著 bootstrap):</p>
+
+<pre><code>rem 套用更新:複製 → 逐檔驗 files.json → 驗過才寫 .complete → 設為下次啟動套用
+python bootstrap\bootstrap.py --install D:\update\app-cv-viewer
+
+rem 或者用選單:tools\admin.bat → [3] 套用已複製進來的更新包
+</code></pre>
+
+<div class="box fact">
+  <p><b>目標機能自己做的事</b> <span class="tag tag-v">已驗證</span>(<code>bootstrap.py --help</code>)</p>
+  <table>
+    <tr><td><code>--status</code></td><td>目前版本 / 上一版 / 最後可用 / 待套用 / 更新來源 / 失敗紀錄(一頁,可以念給電話另一頭聽)</td></tr>
+    <tr><td><code>--install &lt;包&gt;</code></td><td>安裝更新包。<b>驗證不過就完全不動系統</b></td></tr>
+    <tr><td><code>--clear-pending</code></td><td>裝好了但改變主意 → 取消(版本留在磁碟上,之後還能再套用)</td></tr>
+    <tr><td><code>--rollback</code></td><td>立刻退回上一個<b>能用的</b>版本。<b>沒東西可退就明講並失敗</b>,不會假裝成功</td></tr>
+    <tr><td><code>--rollback-to &lt;版本&gt;</code></td><td>退到指定版本</td></tr>
+    <tr><td><code>--clear-failed &lt;版本&gt;</code></td><td>修好之後,讓它可以再試一次</td></tr>
+    <tr><td><code>--set-update-source &lt;路徑&gt;</code></td><td>指向網路芳鄰/USB,之後自動更新</td></tr>
+  </table>
+</div>
+
+<div class="box ok">
+  <p><b>安全網:壞版上不了線,上了線也退得回來</b></p>
+  <ul>
+    <li><b>建置端</b>:import 閉包掃描(含 Streamlit 多頁 App 的 <code>pages/</code>)—— App 會 import 的東西,runtime 裡沒有,<b>直接讓建置失敗</b>,不會等到產線才炸。</li>
+    <li><b>啟動端</b>:launcher 在 spawn 任何東西之前,先用 App 自己的 runtime 做一次 import 預檢。
+        <code>/_stcore/health</code> 是<b>伺服器</b>回的 —— App 死在 <code>import cv2</code> 照樣回 200,所以它不能當唯一的健康訊號。</li>
+    <li><b>晉升為 last-known-good</b> 的條件是:<b>正常結束 + healthy marker 還在</b>。
+        不是「marker 一出現就蓋章」—— App 腳本要等 User 按 Start 才跑,可能是幾分鐘之後的事。</li>
+    <li><b>exit code 分流</b>:<code>3</code>=App 壞了、<code>4</code>=版本樹壞了、<code>5</code>=<b>這台機器</b>壞了(缺 WebView2/防毒)。
+        殼是所有版本共用的 —— 把環境失敗算在版本頭上,會標死一個好版本,再「回滾」到一樣開不起來的版本。</li>
+  </ul>
+</div>
+
+<div class="step"><div class="num">5</div><h2>磁碟滿了:回收</h2></div>
+
+<pre><code>rem 目標機:先試算(不會刪任何東西)
+python bootstrap\gc.py
+
+rem 確認之後才真的刪
+python bootstrap\gc.py --apply
+
+rem 或用選單:tools\admin.bat → [5] 回收磁碟空間(會先試算 → 問 y/N → 才刪)</code></pre>
+
+<div class="box fact">
+  <p><b>GC 的 exit code 是分得開的</b> <span class="tag tag-v">已驗證</span> —— 「乾淨的樹」跟「回收失敗」不是同一回事:</p>
+  <table>
+    <tr><td><code>0</code></td><td>有東西可回收 / 全部刪掉了</td></tr>
+    <tr><td><code>2</code></td><td><b>部分</b>回收(有些檔案被 App 佔用著)</td></tr>
+    <tr><td><code>3</code></td><td>試了,一個位元組都沒回收 → <b>有問題</b></td></tr>
+    <tr><td><code>4</code></td><td>拿不到鎖,根本沒掃</td></tr>
+    <tr><td><code>6</code></td><td><b>沒有可回收的項目(乾淨的樹)</b> —— 這不是失敗</td></tr>
+  </table>
+  <p>它<b>報實際刪掉的量,不報預測值</b>。刪不掉的會列出來並說原因(檔案使用中 → 關掉 App 再跑一次)。</p>
+</div>
+
+<h2>已知限制(不要花時間去「修」它們)</h2>
+
+<div class="scroll">
+<table>
+  <tr><th>限制</th><th>為什麼</th></tr>
+  <tr>
+    <td>User 雙擊之後,還要在「工作流程」下拉按一次 <code>Start</code></td>
+    <td>portal 烤在預建 exe 裡。要自動啟動就得重編殼,而本機 WDAC 擋重編(<code>os error 4551</code>)。要在沒有 WDAC 的機器上重編殼才能改掉。</td>
+  </tr>
+  <tr>
+    <td>fat 包約 600 MB</td>
+    <td>Streamlit 生態系的地板(pandas / pyarrow / numpy…)。Store 佈局就是為了讓第二個 App 不用再吃一次。</td>
+  </tr>
+  <tr>
+    <td>Store 佈局要求<b>完全釘死</b>的 lock</td>
+    <td>「共用同一份 runtime」的前提是「兩邊的相依完全一樣」。指紋是從釘死的 pin 算出來的。</td>
+  </tr>
+  <tr>
+    <td>WebView2 要事先裝在目標機上</td>
+    <td>它是系統元件,不是我們能塞進資料夾的東西。所以我們把<b>離線安裝檔</b>塞進去。</td>
+  </tr>
+</table>
+</div>
+
+<footer>
+  基準版本:native_Provision <code>affe211</code>(786 tests green · 交付鏈 E2E 12/12)<br>
+  CV_Viewer:入口 <code>5_PG_Develop/app.py</code> · lock 53 行 · <code>models/</code> 85 MB<br>
+  殼:<code>nativeApp\apps\host-tauri\prebuilt\cim-light.exe</code>(17.4 MB,不在本機重編)
+</footer>
+
+</div>
