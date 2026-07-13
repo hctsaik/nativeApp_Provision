@@ -42,7 +42,11 @@ from . import imports as imports_mod
 from . import requirements as requirements_mod
 from . import runtime as runtime_mod
 from . import builder
-from .builder import _rename_with_retry, scan_project
+# _write_bat / bat_problems are THE mechanism for writing a .bat cmd.exe can read
+# (ASCII-only, CRLF, no BOM, no paren in an echo). One mechanism, in builder.py,
+# used by both packagers — a second copy would drift, and this is not a bug you get
+# to find twice.
+from .builder import _rename_with_retry, _write_bat, bat_problems, scan_project
 from .device import gc as gc_mod
 from .device import integrity
 from .device.identifiers import validate_identifier
@@ -461,11 +465,197 @@ def _build_version_dir(paths: AppPaths, request: BuildRequest, version: str,
 
 # ── .bat templates ───────────────────────────────────────────────────────────
 #
-# All of them are written UTF-8 with `chcp 65001` on line 3 — a display name with
-# Chinese characters used to raise UnicodeEncodeError while writing an ascii .bat,
-# and UnicodeEncodeError is not an OSError, so it escaped every guard in sight.
+# EVERY .bat THIS MODULE WRITES IS PURE ASCII. Not a style rule — the only thing
+# that makes cmd.exe able to read them at all.
+#
+# Under `chcp 65001` cmd tracks its position in a .bat as a BYTE offset but
+# computes that offset by counting CHARACTERS. While it walks forward line by line
+# nothing goes wrong. The moment it has to RE-READ the file — after a `for /f`, a
+# pipe, an external command, a `goto`, all of which these bats do on every run — it
+# seeks to an offset that is wrong by however many multi-byte characters came
+# before, lands in the MIDDLE of a line, and executes whatever text is sitting
+# there. We reproduced it on the store's own start.bat: 1 corrupted run in 30, cmd
+# executing the tail of a Chinese `rem`. That failure rate is precisely why it
+# survived every review and every single-run test — a bat that works nineteen times
+# looks like a bat that works.
+#
+# In an ASCII-only file, byte offset == character offset, so the seek cannot miss.
+# The repo's old "no em-dash (U+2014)" rule was this same bug seen through a
+# keyhole; ASCII-only subsumes it. Operator-facing Traditional Chinese lives in
+# <ROOT>\messages\*.txt and is printed with `type`, which hands the bytes to the
+# console and never parses them.
+#
+# Enforced mechanically: every write goes through builder._write_bat(), which
+# refuses a non-ASCII body and refuses a paren in an `echo` (an unescaped paren
+# inside a ( ) block closes the block early and cmd then executes the tail of the
+# line). Same helper, same messages\ layout as builder.py — one mechanism, not two.
+#
 # All of them use `pushd` rather than `cd /d`: `cd /d` silently fails on a UNC
 # path and leaves you in C:\Windows, where every later diagnostic is a lie.
+#
+# The bats are ASCII; the paths and app_ids they carry are ASCII by construction
+# (slugify), and the only Chinese that reaches cmd is a %TITLE% expanded from a
+# message file at RUN time — a variable's bytes are not the file's bytes, so the
+# seek arithmetic never sees them.
+
+MESSAGES_DIR = "messages"
+
+# The Chinese every store bat prints. `type`d, never parsed. Text here may hold
+# anything a cp950 console can render (parens, 「」, even an em-dash) precisely
+# because cmd.exe does not read it as code.
+_MESSAGES: dict[str, str] = {
+    "start-nofolder.txt":
+        "無法進入程式資料夾。\n"
+        "若是從網路磁碟機執行,請先把整個資料夾複製到本機磁碟,再試一次。\n",
+    "start-webview2.txt":
+        "這台電腦沒有 Microsoft Edge WebView2 Runtime,應用視窗會開不起來\n"
+        "(Streamlit 會正常啟動,但你只會看到一片空白的視窗)。\n"
+        "\n"
+        f"  請先雙擊 tools\\{WEBVIEW2_BAT_NAME},裝好之後再執行這個檔案。\n"
+        "  它可以用一般使用者權限安裝,不需要系統管理員。\n"
+        "\n"
+        f"  代碼 {EXIT_SHELL_ENVIRONMENT} = 這台機器缺東西,不是這個版本壞掉。\n",
+    "start-noruntime.txt":
+        "這份交付不完整:deps\\runtimes\\ 底下沒有 python.exe。\n"
+        "請向提供者重新索取完整的資料夾。\n",
+    "start-failed.txt":
+        "啟動失敗。詳細記錄在這個資料夾裡:\n",
+    "nopython.txt":
+        "找不到任何可用的 python.exe:deps\\runtimes\\ 底下是空的。\n"
+        "這份交付不完整,沒有東西可以執行。請向提供者重新索取完整的資料夾。\n",
+    # ── gc ──
+    "gc-title.txt": "回收磁碟空間",
+    "gc-dryrun.txt": "=== 先試算,不會刪除任何東西 ===\n",
+    "gc-confirm.txt":
+        "\n以上列出的項目要真的刪除嗎?\n"
+        "輸入 y 後按 Enter 才會刪除;直接按 Enter 或輸入其他任何字都是取消。\n",
+    "gc-cancelled.txt": "已取消,沒有刪除任何東西。\n",
+    "gc-start.txt": "\n=== 開始回收 ===\n",
+    "gc-done.txt": "回收完成。上面列出的項目都已經刪掉了。\n",
+    # The four outcomes gc.py now distinguishes. Each says ONLY what its exit code
+    # proves — 「回收失敗,沒有刪掉任何東西,大概是 store 鎖被佔用」 used to be printed
+    # over a run that had just reclaimed 400 MB and merely tripped on one folder.
+    "gc-partial.txt":
+        "有一部分刪掉了,但有些項目刪不掉,那些空間「沒有」回收。\n"
+        "上面「刪不掉」那幾行就是還留在磁碟上的東西。\n"
+        "最常見的原因:App 還開著,或檔案總管、防毒正在讀那個資料夾。\n"
+        "請把 App 完全關掉(所有視窗),再重跑一次這個檔案。\n",
+    "gc-nothing.txt":
+        "回收失敗:一個項目都沒有刪掉。原因在上面那幾行。\n"
+        "GC 寧可整個中止,也不會在看不懂這棵樹的時候亂刪東西。\n",
+    "gc-locked.txt":
+        "回收失敗:現在正在下載或安裝更新(store 鎖被佔用),這次沒有刪掉任何東西。\n"
+        "等它做完,再重跑一次這個檔案。\n",
+    "gc-unknown.txt":
+        "回收沒有跑完。上面那幾行是 GC 自己說的原因。\n"
+        "這個代碼不在預期之內,所以這裡不猜「刪了沒有」:請照上面的訊息處理。\n",
+    "gc-planfailed.txt":
+        "回收失敗:試算階段就出錯了,沒有刪除任何東西。原因在上面那幾行。\n",
+    # ── admin ──
+    "admin-prompt.txt": "\n請輸入代號後按 Enter:\n",
+    "admin-rollback.txt":
+        "\n直接按 Enter = 退回上一個能用的版本;也可以輸入指定的版本號。\n"
+        "版本號(可留空):\n",
+    "admin-install.txt":
+        "\n請先把更新包資料夾(裡面有 release.json)複製到這台電腦,再輸入它的路徑。\n"
+        "更新包資料夾路徑:\n",
+    "admin-source.txt":
+        "\n更新來源是一個資料夾(USB 或網路磁碟),新版本會放在那裡,程式會自己去拿。\n"
+        "更新來源資料夾路徑:\n",
+    "admin-clearfailed.txt":
+        "\n某個版本啟動失敗過就不會再被自動套用。修好之後,在這裡清掉它的失敗記錄。\n"
+        "要清除哪一個版本的失敗記錄:\n",
+    "admin-clearpending.txt":
+        "\n已經裝好、但還沒套用的更新,可以在這裡取消。\n"
+        "版本會留在磁碟上,之後還能再套用。\n",
+    # ── webview2 ──
+    "webview2-title.txt": "安裝 Microsoft Edge WebView2 Runtime",
+    "webview2-have.txt":
+        "這台電腦已經有 WebView2 Runtime,不需要再安裝。版本:\n",
+    "webview2-none.txt":
+        "這份交付沒有附帶 WebView2 安裝檔,prereq\\ 是空的或不存在。\n"
+        "\n"
+        "  1. 有網路的話,用瀏覽器下載「Evergreen Bootstrapper」,執行它就會安裝:\n"
+        f"     {WEBVIEW2_DOWNLOAD}\n"
+        "  2. 沒網路的話,請向提供者索取 MicrosoftEdgeWebview2Setup.exe,\n"
+        "     放進這個資料夾的 prereq\\ 底下,再執行一次本檔案。\n"
+        "\n"
+        "它可以用一般使用者權限安裝,不需要系統管理員。\n",
+    "webview2-installing.txt":
+        "正在安裝 Microsoft Edge WebView2 Runtime,可能需要幾分鐘…\n",
+    "webview2-done.txt":
+        "安裝完成。現在可以回到上一層,雙擊 start 開頭的 .bat 啟動應用。\n",
+    "webview2-failed.txt":
+        "安裝失敗。請改用瀏覽器下載安裝:\n"
+        f"  {WEBVIEW2_DOWNLOAD}\n",
+}
+
+
+def _menu_text(display_name: str, app_id: str) -> str:
+    return (
+        "\n"
+        "============================================\n"
+        f"  {display_name}\n"
+        f"  管理主控台 - 應用代號:{app_id}\n"
+        "============================================\n"
+        "\n"
+        "  [1] 檢視狀態\n"
+        "  [2] 退回上一版\n"
+        "  [3] 套用已複製進來的更新包\n"
+        "  [4] 設定更新來源\n"
+        "  [5] 回收磁碟空間\n"
+        "  [6] 清除失敗記錄\n"
+        "  [7] 取消還沒套用的更新\n"
+        "  [0] 離開\n")
+
+
+def _write_messages(root: Path, apps: list[str], *, source: Path) -> None:
+    """<ROOT>\\messages\\*.txt — every Chinese string the bats print, as DATA.
+
+    Same layout and the same rules as builder._write_messages: cmd `type`s these
+    and never parses them, so the seek bug cannot reach them. Written UTF-8 with
+    CRLF; each one must survive cp950, because that is the code page of the console
+    that will render it.
+
+    The table is the store's own, not builder's: this tree's entry point may be
+    start-<app>.bat rather than start.bat, its consoles live in tools\\, and its
+    WebView2 installer lives in prereq\\. Reusing the fat package's wording would
+    reintroduce the very 「雙擊 start.bat」 lie that S8 is about.
+    """
+    root = Path(root)
+    messages = root / MESSAGES_DIR
+    messages.mkdir(parents=True, exist_ok=True)
+
+    bodies = dict(_MESSAGES)
+    for app_id in apps:
+        display = _display_name_of(source, app_id)
+        # A title is expanded into `title %TITLE%`, so it IS parsed by cmd once —
+        # strip the characters cmd treats as syntax. The menus are only ever
+        # `type`d, so they keep the real name, parens and all.
+        bodies[f"title-{app_id}.txt"] = f"{_bat_safe(display)} - 啟動中,請不要關閉這個視窗"
+        bodies[f"admin-title-{app_id}.txt"] = f"{_bat_safe(display)} - 管理主控台"
+        bodies[f"starting-{app_id}.txt"] = (
+            f"正在啟動 {display}…\n"
+            "第一次啟動需要檢查共用元件,可能要幾分鐘,請不要關掉這個黑色視窗。\n")
+        bodies[f"admin-menu-{app_id}.txt"] = _menu_text(display, app_id)
+
+    if len(apps) > 1:
+        lines = ["\n", "============================================\n",
+                 "  管理主控台 - 這個資料夾裡有多個應用\n",
+                 "============================================\n", "\n"]
+        lines += [f"  [{i}] {_display_name_of(source, a)}  {a}\n"
+                  for i, a in enumerate(apps, 1)]
+        lines += ["  [0] 離開\n"]
+        bodies["admin-chooser.txt"] = "".join(lines)
+
+    for name, body in bodies.items():
+        body.encode("cp950")               # a zh-TW console must be able to render it
+        (messages / name).write_bytes(body.replace("\n", "\r\n").encode("utf-8"))
+
+    keep = set(bodies)
+    for stale in messages.glob("*.txt"):   # an app that is gone keeps no messages
+        if stale.name not in keep:
+            stale.unlink()
 
 # The WebView2 probe, shared by start.bat and tools\安裝WebView2.bat so the two
 # can never disagree about whether this machine has it.
@@ -500,23 +690,31 @@ def _webview2_check() -> str:
 
 
 _START_BAT = r"""@echo off
+rem PURE ASCII, ON PURPOSE. Chinese goes in messages\*.txt and is `type`d.
+rem cmd.exe seeks by byte offset but counts characters: a non-ASCII .bat gets
+rem re-read at a wrong offset after any for/f, pipe, goto or external command,
+rem lands mid-line and executes the garbage it finds. ~1 run in 20. See
+rem builder._write_bat, which refuses to write a non-ASCII .bat at all.
 setlocal
 chcp 65001 >nul 2>&1
-title {display_name} - 啟動中,請不要關閉這個視窗
 pushd "%~dp0" || (
-  echo [start][ERROR] 無法進入程式資料夾。若是從網路磁碟機執行,請先複製到本機磁碟再試一次。
+  echo [start][ERROR] cannot enter the program folder: %~dp0
+  type "%~dp0messages\start-nofolder.txt" 2>nul
   pause
   exit /b 1
 )
-rem 視窗是用 Microsoft Edge WebView2 Runtime 畫出來的。缺了它,Streamlit 會起來、
-rem 視窗卻是一片空白:先檢查再啟動,不要讓人等 60 秒才看到空白視窗。
-rem pv=0.0.0.0 是「解除安裝後留下的空殼」,不算裝好。
+rem The title is Chinese, so it is READ, not written: a variable's bytes are not
+rem the file's bytes, so the seek arithmetic never sees them.
+set "TITLE="
+if exist "messages\title-{app_id}.txt" set /p TITLE=<"messages\title-{app_id}.txt"
+if defined TITLE title %TITLE%
+rem The window is drawn by Microsoft Edge WebView2. Without it Streamlit starts
+rem fine and the window is BLANK, so check before starting anything. pv=0.0.0.0 is
+rem the husk an uninstall leaves behind and does NOT count as installed.
 {webview2_check}if not defined WV2 (
   echo.
-  echo [start][ERROR] 這台電腦沒有 Microsoft Edge WebView2 Runtime,視窗會開不起來。
-  echo                請先雙擊 tools\{webview2_bat},裝好之後再執行這個檔案。
-  echo                它可以用一般使用者權限安裝,不需要系統管理員。
-  echo                代碼 {exit_env} = 這台機器缺東西,不是這個版本壞掉。
+  echo [start][ERROR] Microsoft Edge WebView2 Runtime is missing.
+  type "messages\start-webview2.txt" 2>nul
   popd
   pause
   exit /b {exit_env}
@@ -527,25 +725,24 @@ rem Runtimes are shared and immutable - no .pyc may ever be written into them.
 set "PYTHONDONTWRITEBYTECODE=1"
 set "PYTHONUTF8=1"
 set "PY="
-for /d %%R in ("deps\runtimes\*") do if exist "%%~R\python.exe" set "PY=%%~R\python.exe"
+for /d %%R in ("deps\runtimes\*") do if not defined PY if exist "%%~R\python.exe" set "PY=%%~R\python.exe"
 if not defined PY (
-  echo [start][ERROR] 這份交付不完整:deps\runtimes\ 底下沒有 python.exe。
-  echo                請向提供者重新索取完整的資料夾。
+  echo.
+  echo [start][ERROR] no python.exe under deps\runtimes\
+  type "messages\start-noruntime.txt" 2>nul
   popd
   pause
   exit /b 1
 )
-echo 正在啟動 {display_name}…(第一次啟動需要檢查共用元件,可能要幾分鐘)
+type "messages\starting-{app_id}.txt" 2>nul
 "%PY%" "bootstrap\bootstrap.py" --app {app_id} %*
 set "RC=%errorlevel%"
 popd
-rem 下面這個區塊裡不能出現「半形括號」。cmd 在 ( ) 區塊裡看到任何一個沒跳脫的半形
-rem 括號,整個區塊就剖不出來:畫面上只有 "was unexpected at this time",批次檔當場
-rem 中止、exit 255。於是「啟動失敗、記錄在哪裡」一個字都不會印,pause 也不會執行,
-rem 視窗直接關掉,使用者只看到黑窗一閃。見 test_no_bat_echoes_a_paren_inside_a_block。
 if not "%RC%"=="0" (
   echo.
-  echo [start] 啟動失敗,代碼 %RC%。詳細記錄在 apps\{app_id}\data\logs\ 裡。
+  echo [start][ERROR] exit code %RC%
+  type "%~dp0messages\start-failed.txt" 2>nul
+  echo     apps\{app_id}\data\logs\
   pause
 )
 exit /b %RC%
@@ -581,8 +778,9 @@ exit /b %RC%
 # this module writes.
 _PICK_PYTHON = r"""set "PY="
 setlocal enabledelayedexpansion
-rem 1) 先找「目前這一版真的在用」的 runtime。GC 不會刪掉自己正在執行的那份 runtime,
-rem    所以絕不能拿一份「沒人引用的孤兒 runtime」來跑 GC:那樣它就永遠刪不掉了。
+rem 1) Prefer the runtime a CURRENT version really uses. GC will not delete the
+rem    runtime it is itself executing from, so running GC under an ORPHAN runtime
+rem    is the one way to guarantee the 450 MB orphan can never be reclaimed.
 for /d %%A in ("apps\*") do (
   if not defined PY (
     set "CUR="
@@ -606,8 +804,8 @@ for /d %%A in ("apps\*") do (
     )
   )
 )
-rem 2) 真的問不出來(state.json 壞了之類):退而求其次,取「第一個」找得到的 runtime。
-rem    取第一個而不是最後一個,結果才是可預期、可重現的。
+rem 2) The tree cannot answer, e.g. a corrupt state.json. Fall back to the FIRST
+rem    runtime found, not the last: predictable beats whatever the loop landed on.
 if not defined PY (
   for /d %%R in ("deps\runtimes\*") do (
     if not defined PY if exist "%%~R\python.exe" set "PY=%%~R\python.exe"
@@ -616,9 +814,8 @@ if not defined PY (
 endlocal & set "PY=%PY%"
 if not defined PY (
   echo.
-  echo [{tag}][ERROR] 找不到任何可用的 python.exe:deps\runtimes\ 底下是空的,
-  echo                這份交付不完整,沒有東西可以執行。
-  echo                請向提供者重新索取完整的資料夾。
+  echo [{tag}][ERROR] no usable python.exe under deps\runtimes\
+  type "messages\nopython.txt" 2>nul
   popd
   pause
   exit /b 1
@@ -632,41 +829,43 @@ def _pick_python(tag: str) -> str:
 
 
 _GC_BAT = r"""@echo off
-rem 回收沒有任何版本槽引用的版本與 runtime。先試算,確認後才真的刪。
+rem PURE ASCII, ON PURPOSE - see the module header. Chinese lives in messages\.
+rem Reclaim versions and runtimes no slot references. Dry-run first, delete only
+rem after the operator says y.
 setlocal
 chcp 65001 >nul 2>&1
-title 回收磁碟空間
 pushd "%~dp0.." || (
-  echo [gc][ERROR] 無法進入程式資料夾。若是從網路磁碟機執行,請先複製到本機磁碟。
+  echo [gc][ERROR] cannot enter the program folder.
+  type "%~dp0..\messages\start-nofolder.txt" 2>nul
   pause
   exit /b 1
 )
+set "TITLE="
+if exist "messages\gc-title.txt" set /p TITLE=<"messages\gc-title.txt"
+if defined TITLE title %TITLE%
 set "PYTHONDONTWRITEBYTECODE=1"
 set "PYTHONUTF8=1"
 {pick_python}
-echo === 先試算,不會刪除任何東西 ===
+type "messages\gc-dryrun.txt" 2>nul
 echo.
 "%PY%" "bootstrap\gc.py"
-rem 呼叫完馬上把結果收進 RC。errorlevel 在 () 區塊裡是進區塊前就展開的,讀到的會是舊值。
+rem Capture RC immediately. %errorlevel% inside a ( ) block is expanded when the
+rem block is PARSED, i.e. before the command ran, so it reads the previous value.
 set "RC=%errorlevel%"
 if "%RC%"=="{locked}" goto locked
 if not "%RC%"=="0" goto planfailed
-echo.
+type "messages\gc-confirm.txt" 2>nul
 set "YES="
-set /p YES=以上列出的項目要真的刪除嗎? 輸入 y 後按 Enter,其他任何鍵則取消:
-if /i not "%YES%"=="y" (
-  echo 已取消,沒有刪除任何東西。
-  popd
-  pause
-  exit /b 0
-)
-echo.
-echo === 開始回收 ===
+set /p YES=[y/N]
+if /i not "%YES%"=="y" goto cancelled
+type "messages\gc-start.txt" 2>nul
 "%PY%" "bootstrap\gc.py" --apply
 set "RC=%errorlevel%"
-rem 一個代碼一個結局。以前這裡只有「成功」跟「回收失敗,沒有刪掉任何東西 + 大概是
-rem store 鎖被佔用」兩條路:GC 明明刪掉了 400 MB、只是有一個資料夾被檔案總管開著
-rem 刪不掉,畫面照樣說「沒有刪掉任何東西」,還把原因賴給一個根本沒被佔用的鎖。
+rem One code, one outcome. There used to be exactly two paths here - success, and
+rem "it failed, nothing was deleted, probably the store lock" - so a GC that had
+rem just reclaimed 400 MB and merely tripped over one folder Explorer had open
+rem reported the same thing as a GC that never started, and blamed a lock that was
+rem not held. gc.py distinguishes them now; this consumes that.
 if "%RC%"=="0" goto done
 if "%RC%"=="{partial}" goto partial
 if "%RC%"=="{nothing}" goto nothing
@@ -675,50 +874,56 @@ goto failed
 
 :done
 echo.
-echo [gc] 回收完成。上面列出的項目都已經刪掉了。
+echo [gc] OK
+type "messages\gc-done.txt" 2>nul
+popd
+pause
+exit /b 0
+
+:cancelled
+type "messages\gc-cancelled.txt" 2>nul
 popd
 pause
 exit /b 0
 
 :partial
 echo.
-echo [gc][注意] 有一部分刪掉了,但有些項目刪不掉,那些空間「沒有」回收。
-echo            上面 "刪不掉" 那幾行就是還留著的東西。
-echo            最常見的原因:App 還開著,或檔案總管/防毒正在讀那個資料夾。
-echo            請把 App 完全關掉(所有視窗),再重跑一次這個檔案。
+echo [gc][WARN] exit code %RC%
+type "messages\gc-partial.txt" 2>nul
 popd
 pause
 exit /b %RC%
 
 :nothing
 echo.
-echo [gc][ERROR] 回收失敗(代碼 %RC%),一個項目都沒有刪掉。原因在上面那幾行。
-echo             GC 寧可整個中止,也不會在看不懂這棵樹的時候亂刪東西。
+echo [gc][ERROR] exit code %RC%
+type "messages\gc-nothing.txt" 2>nul
 popd
 pause
 exit /b %RC%
 
 :locked
 echo.
-echo [gc][ERROR] 現在有更新正在下載或安裝(store 鎖被佔用),這次沒有刪掉任何東西。
-echo             等它做完,再重跑一次這個檔案。
+echo [gc][ERROR] exit code %RC%
+type "messages\gc-locked.txt" 2>nul
 popd
 pause
 exit /b %RC%
 
-rem 沒有這一段的時候,失敗的 GC 和成功的 GC 在畫面上長得一模一樣:視窗關掉,
-rem 磁碟一點也沒少,而操作的人以為自己已經回收過了。
+rem Without this, a failed GC and a successful one looked identical: the window
+rem closed, the disk was just as full, and the operator believed they had reclaimed.
 :planfailed
 echo.
-echo [gc][ERROR] 回收失敗(試算階段,代碼 %RC%),沒有刪除任何東西。原因在上面那幾行。
+echo [gc][ERROR] exit code %RC%
+type "messages\gc-planfailed.txt" 2>nul
 popd
 pause
 exit /b %RC%
 
 :failed
 echo.
-echo [gc][ERROR] 回收沒有跑完(代碼 %RC%)。上面那幾行是 GC 自己說的原因。
-echo             這個代碼不在預期之內,所以這裡不猜「刪了沒有」:請照上面的訊息處理。
+echo [gc][ERROR] exit code %RC%
+type "messages\gc-unknown.txt" 2>nul
 popd
 pause
 exit /b %RC%
@@ -728,36 +933,31 @@ exit /b %RC%
 # One console per app. The old one hardcoded apps[0] but was labelled with THIS
 # build's display name: in a two-app store, "退回上一版" rolled back the wrong app.
 _ADMIN_BAT = r"""@echo off
-rem 管理主控台:狀態 / 退版 / 套用更新包 / 設定更新來源 / 回收 / 清除失敗記錄。
+rem PURE ASCII, ON PURPOSE - see the module header. Chinese lives in messages\.
+rem Admin console: status / rollback / install a payload / update source / gc /
+rem clear a failure record / cancel a pending update. One console PER APP: the old
+rem one hardcoded apps[0] while wearing THIS build's display name, so in a two-app
+rem store the rollback menu item rolled back the wrong app.
 setlocal
 chcp 65001 >nul 2>&1
-title {display_name} - 管理主控台
 pushd "%~dp0.." || (
-  echo [admin][ERROR] 無法進入程式資料夾。若是從網路磁碟機執行,請先複製到本機磁碟。
+  echo [admin][ERROR] cannot enter the program folder.
+  type "%~dp0..\messages\start-nofolder.txt" 2>nul
   pause
   exit /b 1
 )
+set "TITLE="
+if exist "messages\admin-title-{app_id}.txt" set /p TITLE=<"messages\admin-title-{app_id}.txt"
+if defined TITLE title %TITLE%
 set "PYTHONDONTWRITEBYTECODE=1"
 set "PYTHONUTF8=1"
 {pick_python}
 :menu
 cls
-echo ============================================
-echo   {display_name} - 管理主控台
-echo   應用代號:{app_id}
-echo ============================================
-echo.
-echo   [1] 檢視狀態
-echo   [2] 退回上一版
-echo   [3] 套用已複製進來的更新包
-echo   [4] 設定更新來源
-echo   [5] 回收磁碟空間
-echo   [6] 清除失敗記錄
-echo   [7] 取消還沒套用的更新
-echo   [0] 離開
-echo.
+type "messages\admin-menu-{app_id}.txt" 2>nul
+type "messages\admin-prompt.txt" 2>nul
 set "CHOICE="
-set /p CHOICE=請輸入代號後按 Enter:
+set /p CHOICE=[?]
 if "%CHOICE%"=="1" goto status
 if "%CHOICE%"=="2" goto rollback
 if "%CHOICE%"=="3" goto install
@@ -775,10 +975,9 @@ pause
 goto menu
 
 :rollback
-echo.
-echo 直接按 Enter = 退回上一個能用的版本;也可以輸入指定的版本號。
+type "messages\admin-rollback.txt" 2>nul
 set "VER="
-set /p VER=版本號(可留空):
+set /p VER=[?]
 if defined VER (
   "%PY%" "bootstrap\bootstrap.py" --app {app_id} --rollback-to "%VER%"
 ) else (
@@ -788,20 +987,18 @@ pause
 goto menu
 
 :install
-echo.
-echo 請先把更新包資料夾(裡面有 release.json)複製到這台電腦,再輸入它的路徑。
+type "messages\admin-install.txt" 2>nul
 set "PAYLOAD="
-set /p PAYLOAD=更新包資料夾路徑:
+set /p PAYLOAD=[?]
 if not defined PAYLOAD goto menu
 "%PY%" "bootstrap\bootstrap.py" --app {app_id} --install "%PAYLOAD%"
 pause
 goto menu
 
 :source
-echo.
-echo 更新來源是一個資料夾(USB 或網路磁碟),新版本會放在那裡,程式會自己去拿。
+type "messages\admin-source.txt" 2>nul
 set "SRC="
-set /p SRC=更新來源資料夾路徑:
+set /p SRC=[?]
 if not defined SRC goto menu
 "%PY%" "bootstrap\bootstrap.py" --app {app_id} --set-update-source "%SRC%"
 pause
@@ -809,75 +1006,87 @@ goto menu
 
 :reclaim
 echo.
-echo === 先試算,不會刪除任何東西 ===
+type "messages\gc-dryrun.txt" 2>nul
 echo.
 "%PY%" "bootstrap\gc.py"
-rem 呼叫完馬上把結果收進 RC。errorlevel 在 () 區塊裡是進區塊前就展開的,讀到的會是舊值。
+rem Capture RC immediately: %errorlevel% inside a ( ) block is expanded when the
+rem block is parsed, i.e. before the command ran, so it reads the previous value.
 set "RC=%errorlevel%"
-rem 這些 echo 裡不能有半形括號:cmd 在 ( ) 區塊裡碰到沒跳脫的半形括號會整個剖壞,
-rem 訊息一個字都不會印出來。全形括號與逗號沒有這個問題。
-if "%RC%"=="{gc_locked}" (
-  echo.
-  echo [admin][ERROR] 現在正在下載或安裝更新,store 鎖被佔用,這次沒有刪掉任何東西。
-  echo                等它做完,再回來試一次。
-  pause
-  goto menu
-)
-if not "%RC%"=="0" (
-  echo.
-  echo [admin][ERROR] 回收失敗:試算階段就出錯了,代碼 %RC%,沒有刪掉任何東西。
-  echo                原因在上面那幾行。
-  pause
-  goto menu
-)
-echo.
+if "%RC%"=="{gc_locked}" goto rlocked
+if not "%RC%"=="0" goto rplanfailed
+type "messages\gc-confirm.txt" 2>nul
 set "YES="
-set /p YES=以上列出的項目要真的刪除嗎? 輸入 y 後按 Enter,其他任何鍵則取消:
-if /i not "%YES%"=="y" (
-  echo 已取消,沒有刪除任何東西。
-  pause
-  goto menu
-)
-echo.
+set /p YES=[y/N]
+if /i not "%YES%"=="y" goto rcancelled
+type "messages\gc-start.txt" 2>nul
 "%PY%" "bootstrap\gc.py" --apply
 set "RC=%errorlevel%"
-rem 一個代碼一個結局:刪掉一部分、一個都沒刪、鎖被佔用,是三件不一樣的事,
-rem 以前全部被說成「回收失敗,可能一個也沒刪掉,大概是 store 鎖被佔用」。
-if "%RC%"=="0" (
-  echo.
-  echo [admin] 回收完成。上面列出的項目都已經刪掉了。
-) else if "%RC%"=="{gc_partial}" (
-  echo.
-  echo [admin][注意] 有一部分刪掉了,但有些項目刪不掉,那些空間沒有回收。
-  echo                最常見的原因:App 還開著,或檔案總管與防毒正在讀那個資料夾。
-  echo                請把 App 完全關掉,再回來重跑一次。
-) else if "%RC%"=="{gc_nothing}" (
-  echo.
-  echo [admin][ERROR] 回收失敗,代碼 %RC%,一個項目都沒有刪掉。原因在上面那幾行。
-) else if "%RC%"=="{gc_locked}" (
-  echo.
-  echo [admin][ERROR] 現在正在下載或安裝更新,store 鎖被佔用,這次沒有刪掉任何東西。
-  echo                等它做完,再回來試一次。
-) else (
-  echo.
-  echo [admin][ERROR] 回收沒有跑完,代碼 %RC%。上面那幾行是 GC 自己說的原因,請照它處理。
-)
+rem One code, one outcome: deleted some, deleted none, and lock-held are three
+rem different things, and all three used to print the same sentence.
+if "%RC%"=="0" goto rdone
+if "%RC%"=="{gc_partial}" goto rpartial
+if "%RC%"=="{gc_nothing}" goto rnothing
+if "%RC%"=="{gc_locked}" goto rlocked
+goto runknown
+
+:rdone
+echo.
+echo [admin] OK
+type "messages\gc-done.txt" 2>nul
+pause
+goto menu
+
+:rcancelled
+type "messages\gc-cancelled.txt" 2>nul
+pause
+goto menu
+
+:rpartial
+echo.
+echo [admin][WARN] exit code %RC%
+type "messages\gc-partial.txt" 2>nul
+pause
+goto menu
+
+:rnothing
+echo.
+echo [admin][ERROR] exit code %RC%
+type "messages\gc-nothing.txt" 2>nul
+pause
+goto menu
+
+:rlocked
+echo.
+echo [admin][ERROR] exit code %RC%
+type "messages\gc-locked.txt" 2>nul
+pause
+goto menu
+
+:rplanfailed
+echo.
+echo [admin][ERROR] exit code %RC%
+type "messages\gc-planfailed.txt" 2>nul
+pause
+goto menu
+
+:runknown
+echo.
+echo [admin][ERROR] exit code %RC%
+type "messages\gc-unknown.txt" 2>nul
 pause
 goto menu
 
 :clearfailed
-echo.
-echo 某個版本啟動失敗過就不會再被自動套用。修好之後,在這裡清掉它的失敗記錄。
+type "messages\admin-clearfailed.txt" 2>nul
 set "VER="
-set /p VER=要清除哪一個版本的失敗記錄:
+set /p VER=[?]
 if not defined VER goto menu
 "%PY%" "bootstrap\bootstrap.py" --app {app_id} --clear-failed "%VER%"
 pause
 goto menu
 
 :clearpending
-echo.
-echo 已經裝好、但還沒套用的更新,可以在這裡取消(版本會留在磁碟上,之後還能再套用)。
+type "messages\admin-clearpending.txt" 2>nul
 "%PY%" "bootstrap\bootstrap.py" --app {app_id} --clear-pending
 pause
 goto menu
@@ -891,87 +1100,95 @@ exit /b 0
 # One app: tools\admin.bat is the name the 讀我 and the docs point at, so it must
 # exist — it just forwards to that app's own console.
 _ADMIN_ONE_BAT = r"""@echo off
-rem 這棵樹只有一個應用,直接開它的管理主控台。
+rem One app in this tree: go straight to its console.
 call "%~dp0admin-{app_id}.bat" %*
 """
 
 
 _ADMIN_CHOOSER_BAT = r"""@echo off
-rem 這棵樹有多個應用:先選要管理哪一個,再進它自己的主控台。
-rem (以前這裡寫死第一個 app,卻掛著另一個 app 的名字,退版會退錯 app。)
+rem PURE ASCII, ON PURPOSE - see the module header. The menu, which carries the
+rem apps' Chinese display names, is DATA: messages\admin-chooser.txt.
+rem More than one app here: choose which one to administer. The old chooser
+rem hardcoded the first app but wore another app's name, so it rolled back the
+rem wrong one.
 setlocal
 chcp 65001 >nul 2>&1
-title 管理主控台 - 選擇應用
-pushd "%~dp0" || (
-  echo [admin][ERROR] 無法進入 tools 資料夾。若是從網路磁碟機執行,請先複製到本機磁碟。
+title Admin console
+pushd "%~dp0.." || (
+  echo [admin][ERROR] cannot enter the program folder.
+  type "%~dp0..\messages\start-nofolder.txt" 2>nul
   pause
   exit /b 1
 )
 :menu
 cls
-echo ============================================
-echo   管理主控台 - 這個資料夾裡有多個應用
-echo ============================================
-echo.
-{entries}
-echo   [0] 離開
-echo.
+type "messages\admin-chooser.txt" 2>nul
+type "messages\admin-prompt.txt" 2>nul
 set "CHOICE="
-set /p CHOICE=請輸入代號後按 Enter:
+set /p CHOICE=[?]
 {dispatch}
-if "%CHOICE%"=="0" (
-  popd
-  exit /b 0
-)
+if "%CHOICE%"=="0" goto done
 goto menu
+
+:done
+popd
+exit /b 0
 """
 
 
 _WEBVIEW2_BAT = r"""@echo off
-rem WebView2 Runtime:視窗的顯示元件。沒有它,應用會啟動但視窗一片空白。
+rem PURE ASCII, ON PURPOSE - see the module header. Chinese lives in messages\.
+rem WebView2 Runtime: the component that DRAWS the window. Without it the app
+rem starts and the window is blank.
 setlocal
 chcp 65001 >nul 2>&1
-title 安裝 Microsoft Edge WebView2 Runtime
 pushd "%~dp0.." || (
-  echo [webview2][ERROR] 無法進入程式資料夾。若是從網路磁碟機執行,請先複製到本機磁碟。
+  echo [webview2][ERROR] cannot enter the program folder.
+  type "%~dp0..\messages\start-nofolder.txt" 2>nul
   pause
   exit /b 1
 )
-rem 跟 start.bat 用同一段偵測:兩邊對「這台機器到底有沒有 WebView2」不能有兩種答案。
-rem pv=0.0.0.0 = 解除安裝後留下的空殼,不算裝好(照樣要裝)。
+set "TITLE="
+if exist "messages\webview2-title.txt" set /p TITLE=<"messages\webview2-title.txt"
+if defined TITLE title %TITLE%
+rem The SAME probe start.bat uses: the two must never disagree about whether this
+rem machine has WebView2. pv=0.0.0.0 is the husk an uninstall leaves behind.
 {webview2_check}if defined WV2 (
-  echo 這台電腦已經有 WebView2 Runtime,版本 %WV2%,不需要再安裝。
+  type "messages\webview2-have.txt" 2>nul
+  echo     %WV2%
   popd
   pause
   exit /b 0
 )
-if exist "{installer}" goto install
-echo 這份交付沒有附帶 WebView2 安裝檔。
-echo.
-echo 請用瀏覽器下載「Evergreen Bootstrapper」,執行它就會安裝:
-echo   {download}
-echo.
-echo 它可以用一般使用者權限安裝,不需要系統管理員。
-popd
-pause
-exit /b 1
-
-rem 這裡不用 () 區塊:區塊裡的 %errorlevel% 在進區塊前就被展開,永遠讀到舊值。
-:install
-echo 正在安裝 Microsoft Edge WebView2 Runtime,可能需要幾分鐘…
-"{installer}" /silent /install
+rem The canonical name build_into_store writes, then ANY .exe an operator dropped
+rem into prereq\ themselves: both bootstrappers take /silent /install, and telling
+rem someone who did the right thing with the right file that they did not is worse
+rem than useless.
+set "WV2SETUP="
+if exist "{installer}" set "WV2SETUP={installer}"
+for %%F in ("prereq\*.exe") do if not defined WV2SETUP set "WV2SETUP=prereq\%%~nxF"
+if not defined WV2SETUP (
+  type "messages\webview2-none.txt" 2>nul
+  popd
+  pause
+  exit /b 1
+)
+type "messages\webview2-installing.txt" 2>nul
+echo     %WV2SETUP%
+rem No ( ) block here: %errorlevel% inside one is expanded before the command runs.
+"%WV2SETUP%" /silent /install
 set "RC=%errorlevel%"
 if "%RC%"=="0" goto ok
 echo.
-echo [webview2][ERROR] 安裝失敗(代碼 %RC%)。
-echo                   請改用瀏覽器下載安裝:{download}
+echo [webview2][ERROR] exit code %RC%
+type "messages\webview2-failed.txt" 2>nul
 popd
 pause
 exit /b %RC%
 
 :ok
 echo.
-echo 安裝完成。現在可以回到上一層,雙擊 start 開頭的 .bat 啟動應用。
+type "messages\webview2-done.txt" 2>nul
 popd
 pause
 exit /b 0
@@ -1094,9 +1311,14 @@ def _write_store_readme(root: Path, apps: list[str], bats: list[str], *,
 
 def _write_tools(root: Path, apps: list[str] | None = None, *,
                  names_from: Path | None = None) -> None:
-    """tools/gc.bat + tools/安裝WebView2.bat + one admin console PER APP.
+    """tools/gc.bat + tools/安裝WebView2.bat + one admin console PER APP, and the
+    messages\\ those bats print.
 
-    Written UTF-8 (a Chinese display name used to raise UnicodeEncodeError here).
+    Every bat goes through builder._write_bat: ASCII-only, CRLF, no BOM, no paren
+    in an echo. The Chinese is written next to them as data (see _write_messages).
+    A .bat with Chinese in it is not a style problem, it is a bat cmd.exe re-reads
+    at the wrong byte offset and then executes the middle of a line.
+
     `names_from` lets an export generate the consoles for a subset of apps while
     still reading each app's real display name from the source store.
 
@@ -1115,38 +1337,34 @@ def _write_tools(root: Path, apps: list[str] | None = None, *,
     tools = root / "tools"
     tools.mkdir(parents=True, exist_ok=True)
 
-    (tools / "gc.bat").write_text(
-        _GC_BAT.format(pick_python=_pick_python("gc"), partial=GC_EXIT_PARTIAL,
-                       nothing=GC_EXIT_NOTHING, locked=GC_EXIT_LOCKED),
-        encoding="utf-8")
-    (tools / WEBVIEW2_BAT_NAME).write_text(
-        _WEBVIEW2_BAT.format(webview2_check=_webview2_check(),
-                             installer=WEBVIEW2_INSTALLER.replace("/", "\\"),
-                             download=WEBVIEW2_DOWNLOAD),
-        encoding="utf-8")
+    _write_messages(root, apps, source=source)
+
+    _write_bat(tools / "gc.bat",
+               _GC_BAT.format(pick_python=_pick_python("gc"), partial=GC_EXIT_PARTIAL,
+                              nothing=GC_EXIT_NOTHING, locked=GC_EXIT_LOCKED))
+    _write_bat(tools / WEBVIEW2_BAT_NAME,
+               _WEBVIEW2_BAT.format(webview2_check=_webview2_check(),
+                                    installer=WEBVIEW2_INSTALLER.replace("/", "\\")))
 
     for stale in tools.glob("admin-*.bat"):
         if stale.name[len("admin-"):-len(".bat")] not in apps:
             stale.unlink()      # an app that is not here must not keep a console
 
-    names = {app_id: _bat_safe(_display_name_of(source, app_id)) for app_id in apps}
     for app_id in apps:
-        (tools / f"admin-{app_id}.bat").write_text(
-            _ADMIN_BAT.format(app_id=app_id, display_name=names[app_id],
-                              pick_python=_pick_python("admin"),
-                              gc_partial=GC_EXIT_PARTIAL, gc_nothing=GC_EXIT_NOTHING,
-                              gc_locked=GC_EXIT_LOCKED), encoding="utf-8")
+        _write_bat(tools / f"admin-{app_id}.bat",
+                   _ADMIN_BAT.format(app_id=app_id, pick_python=_pick_python("admin"),
+                                     gc_partial=GC_EXIT_PARTIAL,
+                                     gc_nothing=GC_EXIT_NOTHING,
+                                     gc_locked=GC_EXIT_LOCKED))
 
     if len(apps) == 1:
-        (tools / "admin.bat").write_text(
-            _ADMIN_ONE_BAT.format(app_id=apps[0]), encoding="utf-8")
+        _write_bat(tools / "admin.bat", _ADMIN_ONE_BAT.format(app_id=apps[0]))
     elif apps:
-        entries = "\n".join(f"echo   [{i}] {names[a]}  ({a})"
-                            for i, a in enumerate(apps, 1))
+        # The menu ITSELF is data (messages\admin-chooser.txt): it carries the apps'
+        # Chinese display names, and those may never be bytes in a .bat.
         dispatch = "\n".join(f'if "%CHOICE%"=="{i}" call "%~dp0admin-{a}.bat"'
                              for i, a in enumerate(apps, 1))
-        (tools / "admin.bat").write_text(
-            _ADMIN_CHOOSER_BAT.format(entries=entries, dispatch=dispatch), encoding="utf-8")
+        _write_bat(tools / "admin.bat", _ADMIN_CHOOSER_BAT.format(dispatch=dispatch))
 
 
 def _install_bootstrap(root: Path) -> None:
@@ -1157,9 +1375,10 @@ def _install_bootstrap(root: Path) -> None:
 
 
 def _start_bat_text(root: Path, app_id: str, display_name: str) -> str:
-    return _START_BAT.format(app_id=app_id, display_name=_bat_safe(display_name),
-                             webview2_check=_webview2_check(),
-                             webview2_bat=WEBVIEW2_BAT_NAME,
+    """The display name is NOT interpolated: it is Chinese, and Chinese bytes in a
+    .bat are what cmd.exe mis-seeks into. It reaches the user from
+    messages\\title-<app>.txt and messages\\starting-<app>.txt instead."""
+    return _START_BAT.format(app_id=app_id, webview2_check=_webview2_check(),
                              exit_env=EXIT_SHELL_ENVIRONMENT)
 
 
@@ -1178,7 +1397,7 @@ def _write_entry_bats(root: Path, display_name: str = "App") -> tuple[list[str],
         for stale in root.glob("start-*.bat"):
             stale.unlink()
         if apps:
-            single.write_text(_start_bat_text(root, apps[0], display_name), encoding="utf-8")
+            _write_bat(single, _start_bat_text(root, apps[0], display_name))
             return ["start.bat"], False
         return [], False
 
@@ -1188,8 +1407,8 @@ def _write_entry_bats(root: Path, display_name: str = "App") -> tuple[list[str],
     bats = []
     for app_id in apps:
         name = f"start-{app_id}.bat"
-        (root / name).write_text(
-            _start_bat_text(root, app_id, _display_name_of(root, app_id)), encoding="utf-8")
+        _write_bat(root / name,
+                   _start_bat_text(root, app_id, _display_name_of(root, app_id)))
         bats.append(name)
     return bats, removed
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -149,6 +150,52 @@ def test_full_export_of_one_app_leaves_the_other_behind(stub_toolchain, tmp_path
     # the console of an app that is not in this delivery must not be offered
     assert (out / "tools" / f"admin-{first.app_id}.bat").is_file()
     assert not (out / "tools" / f"admin-{second.app_id}.bat").exists()
+
+
+def test_the_delivery_carries_the_messages_its_bats_print(build_request, stub_toolchain,
+                                                          tmp_path):
+    """The bats are ASCII and `type` their Chinese out of messages\\*.txt. Deliver the
+    bats without the messages and every `type ... 2>nul` prints NOTHING: the WebView2
+    gate turns the user away in silence, the failed launch says nothing, and the
+    window closes. The messages are not documentation, they are the program's voice."""
+    root = tmp_path / "ROOT"
+    assert store_builder.build_into_store(build_request, root, version="v1.0.0").ok
+    out = tmp_path / "deliver"
+    export = store_builder.export_full_tree(root, out)
+
+    typed = set()
+    for bat in generated_bats(out):
+        raw = bat.read_bytes()
+        assert raw.isascii(), bat.name          # the delivered bats keep the rule
+        typed |= set(re.findall(r'messages\\([\w.-]+\.txt)', raw.decode("ascii")))
+        typed |= set(re.findall(r'set /p TITLE=<"messages\\([\w.-]+\.txt)"',
+                                raw.decode("ascii")))
+    assert typed, "沒有任何 bat 會印訊息?"
+    for name in sorted(typed):
+        path = out / store_builder.MESSAGES_DIR / name
+        assert path.is_file(), f"交付樹缺 messages\\{name}(bat 會 type 它,卻不存在)"
+        path.read_bytes().decode("utf-8").encode("cp950")
+    assert Path(export.out_dir) == out
+
+
+@pytest.mark.skipif(os.name != "nt", reason="需要真的 cmd.exe 來剖析 .bat")
+def test_the_delivered_start_bat_speaks_on_every_single_run(build_request, stub_toolchain,
+                                                            tmp_path):
+    """The delivered tree, driven by a real cmd.exe, {CMD_RUNS} times. This is the
+    artifact the factory actually receives: it has to work every time, not 19 times
+    out of 20."""
+    root = tmp_path / "ROOT"
+    assert store_builder.build_into_store(build_request, root, version="v1.0.0").ok
+    out = tmp_path / "deliver"
+    store_builder.export_full_tree(root, out)
+    env = shim_reg(tmp_path / "shim", None)              # this machine has no WebView2
+
+    for attempt in range(CMD_RUNS):
+        proc = run_bat(out / "start.bat", stdin="\n\n", env=env)
+        assert parse_damage(proc) == [], f"第 {attempt + 1} 次:{proc.stderr}"
+        assert proc.returncode == 5, proc.stdout        # the environment code
+        assert "沒有 Microsoft Edge WebView2 Runtime" in proc.stdout, proc.stdout
+        assert store_builder.WEBVIEW2_BAT_NAME in proc.stdout
 
 
 def test_full_export_rejects_an_unknown_app(build_request, stub_toolchain, tmp_path):
@@ -580,6 +627,10 @@ def test_export_update_says_something_while_it_copies(build_request, stub_toolch
 
 # ── .bat 產生 ────────────────────────────────────────────────────────────────
 
+def message(root: Path, name: str) -> str:
+    return (root / store_builder.MESSAGES_DIR / name).read_text("utf-8")
+
+
 def test_admin_console_is_emitted_per_app(stub_toolchain, tmp_path):
     """The old admin.bat hardcoded apps[0] while wearing THIS build's display name:
     in a two-app store, 「退回上一版」 silently rolled back the wrong app."""
@@ -594,11 +645,18 @@ def test_admin_console_is_emitted_per_app(stub_toolchain, tmp_path):
     beta = (tools / f"admin-{second.app_id}.bat").read_text("utf-8")
     assert f"--app {first.app_id}" in alpha and second.app_id not in alpha
     assert f"--app {second.app_id}" in beta and first.app_id not in beta
-    assert "Alpha Viewer" in alpha and "Beta Viewer" in beta
+    # The display name is DATA, never bytes in a .bat (see the ASCII rule) — but it
+    # must still reach the operator, on the right console.
+    assert "Alpha Viewer" in message(root, f"admin-menu-{first.app_id}.txt")
+    assert "Beta Viewer" in message(root, f"admin-menu-{second.app_id}.txt")
+    assert "Beta Viewer" not in message(root, f"admin-menu-{first.app_id}.txt")
+    assert f"admin-menu-{first.app_id}.txt" in alpha        # and the console types it
 
     chooser = (tools / "admin.bat").read_text("utf-8")
     assert f"admin-{first.app_id}.bat" in chooser
     assert f"admin-{second.app_id}.bat" in chooser
+    both = message(root, "admin-chooser.txt")
+    assert "Alpha Viewer" in both and "Beta Viewer" in both
 
     # every menu item the docs name, and a gc that can actually free anything
     for item in ("--status", "--rollback", "--rollback-to", "--install",
@@ -666,13 +724,17 @@ def test_gc_bat_picks_the_runtime_a_current_version_actually_uses(build_request,
         assert 'set "PY=deps\\runtimes\\!FP!\\python.exe"' in bat
         # 2. the fallback is the FIRST runtime, not the last: the loop stops
         assert 'if not defined PY if exist "%%~R\\python.exe"' in bat
-        # 3. no python at all = a Chinese error, not a silent run with PY unset
-        assert "找不到任何可用的 python.exe" in bat
+        # 3. no python at all = a Chinese error, not a silent run with PY unset.
+        #    The bat is ASCII, so it `type`s the Chinese out of messages\.
+        assert 'type "messages\\nopython.txt"' in bat
+        assert "找不到任何可用的 python.exe" in message(root, "nopython.txt")
         # 4. a failed GC must not look exactly like a successful one
         assert 'set "RC=%errorlevel%"' in bat
-        assert "回收失敗" in bat and "回收完成" in bat
-        # cp950: nothing here may be un-encodable on a zh-TW console
-        bat.encode("cp950")
+        assert "回收失敗" in message(root, "gc-nothing.txt")
+        assert "回收完成" in message(root, "gc-done.txt")
+        # cp950: every message must be renderable on a zh-TW console, and the bat
+        # itself must be pure ASCII (see test_every_generated_bat_is_pure_ascii)
+        bat.encode("ascii")
 
 
 def test_gc_bat_has_no_last_wins_interpreter_loop(build_request, stub_toolchain, tmp_path):
@@ -704,6 +766,46 @@ def test_no_generated_bat_contains_an_em_dash(stub_toolchain, tmp_path):
         text = bat.read_text("utf-8")
         assert "—" not in text, f"{bat.name} 帶了 em-dash,cmd.exe 會把那一行剖壞"
         text.encode("cp950")           # and every character must survive a zh-TW console
+
+
+def generated_bats(root: Path) -> list[Path]:
+    return sorted(root.glob("*.bat")) + sorted((root / "tools").glob("*.bat"))
+
+
+def test_every_generated_bat_is_pure_ascii(stub_toolchain, tmp_path):
+    """THE rule. Under `chcp 65001` cmd.exe tracks its position in a .bat as a BYTE
+    offset but computes it by counting CHARACTERS. Every re-read — after a `for /f`,
+    a pipe, an external command, a `goto`, all of which these bats do — seeks to an
+    offset wrong by however many multi-byte characters came before it, lands in the
+    MIDDLE of a line, and executes whatever text is sitting there. We measured it on
+    this module's own start.bat: 1 corrupted run in 30, cmd executing the tail of a
+    Chinese `rem`. In an ASCII-only file byte offset == character offset, so the seek
+    cannot miss. The old 「no em-dash」 rule was this same bug seen through a keyhole.
+
+    Checked with builder.bat_problems() — the same gate builder.py uses, not a second
+    copy of the rule — plus the on-disk bytes, because that is what cmd reads.
+    """
+    root = tmp_path / "ROOT"
+    request = make_project(tmp_path, "產線 檢視器")           # a name full of landmines
+    assert store_builder.build_into_store(request, root, version="v1.0.0").ok
+
+    bats = generated_bats(root)
+    assert len(bats) >= 4
+    for bat in bats:
+        raw = bat.read_bytes()
+        assert store_builder.bat_problems(raw.decode("utf-8")) == [], bat.name
+        assert raw.isascii(), f"{bat.name} 帶了非 ASCII 位元組:cmd.exe 會 seek 到行中間"
+        assert not raw.startswith(b"\xef\xbb\xbf"), f"{bat.name} 有 BOM"
+        assert b"\r\n" in raw and b"\n" not in raw.replace(b"\r\n", b""), \
+            f"{bat.name} 不是 CRLF"
+
+    # and the Chinese still exists — as DATA the bats `type` and cmd never parses
+    messages = sorted((root / store_builder.MESSAGES_DIR).glob("*.txt"))
+    assert messages
+    for path in messages:
+        text = path.read_bytes().decode("utf-8")
+        text.encode("cp950")            # a zh-TW console has to be able to render it
+    assert any("產線 檢視器" in p.read_bytes().decode("utf-8") for p in messages)
 
 
 def test_no_bat_echoes_a_paren_inside_a_block(stub_toolchain, tmp_path):
@@ -759,17 +861,72 @@ def test_a_failed_launch_tells_the_user_where_the_log_is(build_request, stub_too
     assert proc.returncode not in (0, 255)      # the app's code, not a cmd parse error
 
 
-def run_bat(path: Path, *, stdin: str = "n\n") -> subprocess.CompletedProcess:
+def run_bat(path: Path, *, stdin: str = "n\n",
+            env: dict | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(["cmd", "/c", str(path)], input=stdin, capture_output=True,
-                          text=True, encoding="utf-8", errors="replace", timeout=120)
+                          text=True, encoding="utf-8", errors="replace", timeout=120,
+                          env=env)
 
 
 def parse_damage(proc: subprocess.CompletedProcess) -> list[str]:
-    """Lines cmd could not parse. A split multi-byte character shows up as a
-    replacement char and/or as 'X is not recognized as an internal command' —
-    which is what a corrupted .bat looks like from the outside, in any locale."""
+    """Lines cmd could not parse. A mis-seek lands in the middle of a line and cmd
+    executes the tail of it, which surfaces as 'X is not recognized as an internal
+    command', as 'X was unexpected at this time' (a fragment of a ( ) block), and/or
+    as replacement characters — what a corrupted .bat looks like from outside."""
     return [line for line in proc.stderr.splitlines()
-            if "not recognized" in line or "不是內部或外部" in line or "�" in line]
+            if "not recognized" in line or "不是內部或外部" in line or "�" in line
+            or "unexpected at this time" in line]
+
+
+# A 1-in-20 failure does not show up in a single run. Measured on the pre-fix bats:
+# start.bat corrupted 1 run in 30. So one run catches it 3% of the time — which is
+# how it passed every real-cmd test in this file until now. 20 runs of one bat catch
+# it ~49% of the time; 20 runs of each of the five bats below, all of which carried
+# the same Chinese, catch it ~97% of the time. That is a backstop, not a proof: the
+# PROOF is test_every_generated_bat_is_pure_ascii, which is deterministic. Both stay.
+CMD_RUNS = 20
+
+
+@pytest.mark.skipif(os.name != "nt", reason="需要真的 cmd.exe 來剖析 .bat")
+def test_every_bat_survives_being_run_over_and_over_by_a_real_cmd(stub_toolchain,
+                                                                  tmp_path):
+    """The test that would have caught it — and the reason the old ones did not.
+
+    The seek bug fires on roughly 1 run in 20, so a real-cmd test that runs a bat
+    ONCE proves nothing at all: it passes nineteen times out of twenty on a .bat that
+    is definitely broken. Measured on the pre-fix bats, start.bat corrupted 1 run in
+    30 (cmd executed the mojibake'd tail of a Chinese `rem`). Every bat here is run
+    {CMD_RUNS} times and every single run must come back with clean stderr.
+    """
+    root = tmp_path / "ROOT"
+    alpha = make_project(tmp_path, "產線 檢視器")             # Chinese display names:
+    beta = make_project(tmp_path, "Beta 檢視器")             # the old landmine source
+    assert store_builder.build_into_store(alpha, root, version="v1.0.0").ok
+    assert store_builder.build_into_store(beta, root, version="v1.0.0").ok
+
+    absent = shim_reg(tmp_path / "shim-absent", None)          # no WebView2
+    present = shim_reg(tmp_path / "shim-present", "121.0.2277.128")
+
+    cases = [
+        # bat,                              stdin,   env,      a marker proving it ran
+        (root / f"start-{alpha.app_id}.bat", "\n\n", absent,  "[start][ERROR]"),
+        (root / "tools" / "gc.bat",          "n\n",  absent,  "[gc][ERROR]"),
+        (root / "tools" / f"admin-{alpha.app_id}.bat", "0\n", absent, "產線 檢視器"),
+        (root / "tools" / "admin.bat",       "0\n",  absent,  "Beta 檢視器"),   # chooser
+        (root / "tools" / store_builder.WEBVIEW2_BAT_NAME, "\n", present,
+         "WebView2 Runtime"),
+    ]
+    for bat, stdin, env, marker in cases:
+        assert bat.is_file(), bat
+        for attempt in range(CMD_RUNS):
+            proc = run_bat(bat, stdin=stdin, env=env)
+            assert parse_damage(proc) == [], \
+                f"{bat.name} 第 {attempt + 1} 次執行被 cmd 剖壞了:{proc.stderr}"
+            # not just "no error": it must have reached the line it was supposed to.
+            # A mis-seek can also SKIP a line silently, and silence is what the
+            # operator was left with.
+            assert marker in proc.stdout, \
+                f"{bat.name} 第 {attempt + 1} 次執行沒印出該印的東西:{proc.stdout!r}"
 
 
 @pytest.mark.skipif(os.name != "nt", reason="需要真的 cmd.exe 來剖析 .bat")
@@ -831,24 +988,26 @@ def test_gc_bat_does_not_blame_the_store_lock_for_every_failure(build_request,
 
     for name in ("gc.bat", f"admin-{build_request.app_id}.bat"):
         bat = (root / "tools" / name).read_text("utf-8")
-        # one code, one outcome — and each outcome says only what its code proves
+        # one code, one message file — and each outcome says only what its code proves
         assert f'"%RC%"=="{store_builder.GC_EXIT_PARTIAL}"' in bat
         assert f'"%RC%"=="{store_builder.GC_EXIT_NOTHING}"' in bat
         assert f'"%RC%"=="{store_builder.GC_EXIT_LOCKED}"' in bat
-        assert "有一部分刪掉了" in bat            # partial: some space DID come back
-        assert "一個項目都沒有刪掉" in bat        # nothing: and we say so, honestly
-        # the lock is named to the OPERATOR only on a line that also says nothing was
-        # deleted — i.e. only where the code proves it, never as a guess after any
-        # failure (`rem` lines are for us, not for them)
-        lock_lines = [line.strip() for line in bat.splitlines()
-                      if "store 鎖被佔用" in line and line.strip().startswith("echo ")]
-        assert lock_lines, bat
-        for line in lock_lines:
-            assert "沒有刪掉任何東西" in line, line
-        assert "常見原因:目前正在下載或安裝更新" not in bat      # the old guess
-        # an unknown code claims nothing about what was or was not deleted
-        assert "不在預期之內" in bat or "上面那幾行是 GC 自己說的原因" in bat
-        bat.encode("cp950")
+        for txt in ("gc-partial.txt", "gc-nothing.txt", "gc-locked.txt",
+                    "gc-unknown.txt", "gc-done.txt"):
+            assert f'type "messages\\{txt}"' in bat, (name, txt)
+
+    assert "有一部分刪掉了" in message(root, "gc-partial.txt")     # some space DID return
+    assert "一個項目都沒有刪掉" in message(root, "gc-nothing.txt")  # and we say so, honestly
+    # the store lock is named in exactly ONE message: the one the LOCKED code selects.
+    # It used to be the guess printed after every failure, including the ones that had
+    # just reclaimed 400 MB.
+    named = [name for name in sorted((root / store_builder.MESSAGES_DIR).glob("*.txt"))
+             if "store 鎖被佔用" in name.read_text("utf-8")]
+    assert [p.name for p in named] == ["gc-locked.txt"], named
+    assert "沒有刪掉任何東西" in message(root, "gc-locked.txt")
+    assert "常見原因" not in message(root, "gc-nothing.txt")       # no more guessing
+    # an unknown code claims nothing about what was or was not deleted
+    assert "不在預期之內" in message(root, "gc-unknown.txt")
 
     # the console's table IS gc.py's table. A bat that maps 4 to 「鎖被佔用」 while
     # gc.py maps 4 to something else is a worse lie than the one we just fixed.
@@ -915,22 +1074,41 @@ def test_a_tree_with_no_runtime_says_so_instead_of_running_nothing(stub_toolchai
     assert proc.returncode == 1
 
 
-def test_a_chinese_display_name_does_not_blow_up_the_tools_write(stub_toolchain, tmp_path):
-    """`encoding="ascii"` + a Chinese name = UnicodeEncodeError, which is NOT an
-    OSError — it sailed past `except OSError` and killed a build whose version dir
-    was already complete (and therefore immutable: unrecoverable)."""
+def test_a_chinese_display_name_reaches_the_operator_without_entering_the_bat(
+        stub_toolchain, tmp_path):
+    """A Chinese display name must reach the user — and must NOT be a byte in a .bat.
+
+    (This test used to assert the opposite: 「產線 檢視器」 in start.bat. That is the
+    defect. cmd.exe seeks through a .bat by byte offset while counting characters, so
+    a name in the file is a landmine that goes off about 1 run in 20 — the bat is
+    re-read after every for/f, pipe, goto and external command, lands mid-line, and
+    executes whatever is there. The name lives in messages\\*.txt now, which cmd
+    `type`s and never parses. The original point of the test still stands and is
+    still checked: writing it must not blow the build up.)
+    """
     root = tmp_path / "ROOT"
     request = make_project(tmp_path, "產線 檢視器")
     result = store_builder.build_into_store(request, root, version="v1.0.0")
 
     assert result.ok, result.errors
     assert not any("tools" in w for w in result.warnings), result.warnings
-    admin = (root / "tools" / f"admin-{request.app_id}.bat").read_text("utf-8")
-    assert "產線 檢視器" in admin
-    assert "chcp 65001 >nul 2>&1" in admin.splitlines()[:5]   # codepage BEFORE any echo
+
+    app = request.app_id
+    assert "產線 檢視器" in message(root, f"title-{app}.txt")
+    assert "產線 檢視器" in message(root, f"starting-{app}.txt")
+    assert "產線 檢視器" in message(root, f"admin-menu-{app}.txt")
+
+    admin = (root / "tools" / f"admin-{app}.bat").read_text("utf-8")
+    start = (root / "start.bat").read_text("utf-8")
+    for bat in (admin, start, (root / "tools" / "gc.bat").read_text("utf-8")):
+        assert bat.isascii()
+        assert "產線" not in bat
+    assert "chcp 65001 >nul 2>&1" in admin.splitlines()[:8]   # codepage BEFORE any type
     assert 'set "PYTHONUTF8=1"' in admin
-    (root / "tools" / "gc.bat").read_text("utf-8")          # decodes as utf-8
-    assert "產線 檢視器" in (root / "start.bat").read_text("utf-8")
+    # and each bat really does print it: title from a file, body from a file
+    assert f'set /p TITLE=<"messages\\title-{app}.txt"' in start
+    assert f'type "messages\\starting-{app}.txt"' in start
+    assert f'type "messages\\admin-menu-{app}.txt"' in admin
 
 
 def test_start_bat_checks_webview2_before_starting_anything(build_request, stub_toolchain,
@@ -941,14 +1119,16 @@ def test_start_bat_checks_webview2_before_starting_anything(build_request, stub_
     assert store_builder.WEBVIEW2_CLIENT in start
     assert "HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\EdgeUpdate\\Clients" in start
     assert "HKCU\\SOFTWARE\\Microsoft\\EdgeUpdate\\Clients" in start
-    assert store_builder.WEBVIEW2_BAT_NAME in start
     # the check must come BEFORE we hand over to bootstrap.py
     assert start.index("reg query") < start.index("bootstrap.py")
+    # what the user is told to do about it is Chinese, so it is a message, not code
+    assert 'type "messages\\start-webview2.txt"' in start
+    assert store_builder.WEBVIEW2_BAT_NAME in message(root, "start-webview2.txt")
 
     installer = (root / "tools" / store_builder.WEBVIEW2_BAT_NAME).read_text("utf-8")
     assert "MicrosoftEdgeWebview2Setup.exe" in installer
     assert "/silent /install" in installer
-    assert store_builder.WEBVIEW2_DOWNLOAD in installer
+    assert store_builder.WEBVIEW2_DOWNLOAD in message(root, "webview2-none.txt")
 
 
 # ── A/S4:WebView2 供應鏈 ────────────────────────────────────────────────────

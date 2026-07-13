@@ -108,12 +108,22 @@ def main() -> int:
     print("    " + "\n    ".join(out.stdout.strip().splitlines()[:12]))
     assert out.returncode == 0, out.stderr
 
-    step(6, "建置 v1.1.0(同一份 lock → runtime 應該重用,+0 MB)")
+    step(6, "建置 v1.1.0(同一份 lock → runtime 應該重用,新增的只有版本槽本身)")
     r2 = build_into_store(request("v1.1.0"), STORE, version="v1.1.0",
                           progress=lambda line: None)
     assert r2.ok, r2.errors
     print(f"    ok  runtime 重用 = {r2.runtime_reused}   本次新增 {r2.added_mb:.1f} MB")
-    assert r2.runtime_reused and r2.added_mb < 30
+    print(f"    警告(開工前就該講的):{r2.warnings or '(無)'}")
+    # 重用 runtime 才是這一步要證明的事:第二版不該再吃一份 500 MB 的 runtime。
+    # 版本槽本身多大,取決於「專案裡有什麼」——CV_Viewer 現在帶了一個 84 MB 的
+    # DINOv2 權重檔,那是 App 離線執行真的需要的東西,本來就該交付出去。所以這裡
+    # 不對版本槽的絕對大小設上限(那會變成「專案不准變大」),只確認:
+    #   (a) runtime 真的重用了(沒有再多一份 500 MB)
+    #   (b) 大檔在建置前就被警告過(而不是事後才發現包變胖)
+    assert r2.runtime_reused, "runtime 沒有重用 —— 共用機制失效了"
+    assert r2.added_mb < 200, f"新增 {r2.added_mb:.0f} MB —— 遠超過版本槽該有的大小"
+    assert any("dinov2" in w for w in r2.warnings), \
+        "84 MB 的權重檔沒有在建置前被警告 —— 管理員會在事後才發現包變胖"
 
     step(7, "匯出「更新包」(十幾 MB,給已部署的機器)")
     upd = export_update(STORE, r2.app_id, "v1.1.0", PAYLOAD, include_runtime=False)
