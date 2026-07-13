@@ -76,10 +76,41 @@
   這份文件裡的每一個路徑與程式碼片段,都是從現有 repo 讀出來的,不是憑印象寫的。
 </p>
 
+<div class="box ok">
+  <p><b>這份文件已經被實際執行過一次,而且成功了。</b> <span class="tag tag-v">已實跑</span></p>
+  <p>照著本文建立那兩個檔案之後,直接把 engine 起在 headless(不開殼、不開視窗)並打它的 API:</p>
+  <pre><code>[1] engine ready
+[2] /tools 共 25 個工具
+    找到:app-cv-viewer  name=🔍 CV Viewer  category=app
+[3] POST /tools/app-cv-viewer/start …(portal 的 Start 按鈕做的就是這件事)
+    ok (2s)
+    category  = app
+    input_url = http://127.0.0.1:64827
+    output_url= http://127.0.0.1:64827   ← app 類:兩者相同 = 一個 iframe
+[4] GET http://127.0.0.1:64827 -> HTTP 200, 5381 bytes
+    是 Streamlit 的頁面嗎:True
+    是 Not Found 嗎     :False
+[5] CV Viewer 的 streamlit log:沒有 error / traceback
+[6] 用平台核心的 python 對 app.py 做 import 閉包預檢:缺少的模組 (無)</code></pre>
+  <p>
+    <b>我沒有驗證到的那一步,老實講:</b>我是透過 engine 的 API 驗的,<b>沒有真的開起 Tauri 視窗、
+    用眼睛看到下拉裡的「🔍 CV Viewer」再按下 Start</b>。engine 那一層(工具被認得、
+    category 是 app、Start 起得來、Streamlit 真的服務得出頁面)全部通過;
+    剩下的是殼把它畫進 iframe —— 那條路徑跟 <code>app-lv</code> / <code>app-ai4bi</code> 完全共用,
+    但我沒有親眼看過 CV Viewer 出現在那裡。
+  </p>
+  <p>
+    另外:<code>GET /</code> 回 200 只證明「Streamlit 伺服器起來了、靜態檔服務得出去」
+    (<b>這正是 <code>engine.exe</code> 做不到、會回 404 的那件事</b>)。
+    Streamlit 要等 <b>websocket session</b> 建立才會真的執行 <code>app.py</code> ——
+    也就是「你在殼裡按下 Start、iframe 載入」的那一刻。
+    所以 [4] 不等於「App 的程式碼跑起來了」;[6] 的 import 預檢才是那個保證。
+  </p>
+</div>
+
 <div class="box fact">
-  <p><b>先讀這段,再動手。</b>本文的「已驗證」標記代表:該事實是我打開檔案讀到的。</p>
-  <p><span class="tag tag-v">已驗證</span> = 路徑/程式碼實際存在,已引用行號。
-     <span class="tag tag-u">未實跑</span> = 依現有契約推導出來的新檔案,尚未在這台機器上跑過整條流程。</p>
+  <p><b>標記說明。</b><span class="tag tag-v">已驗證</span> = 我打開檔案讀到的,或實際跑出來的。
+     <span class="tag tag-u">未實跑</span> = 依契約推導,尚未跑過。</p>
 </div>
 
 <h2>0. 這件事的本質</h2>
@@ -214,7 +245,7 @@ git commit -m "vendor CV_Viewer as submodule"</code></pre>
 <div class="box warn">
   <p><b>85 MB 的權重檔不要進 submodule。</b>LV 就是這樣處理的 —— 模型權重不入 submodule,
     由 <code>LV_MODELS_DIR</code> 指向平台的 model-house。CV Viewer 照抄:用
-    <code>CV_VIEWER_MODELS_DIR</code> 指過去。</p>
+    <code>CVR_MODELS_DIR</code> 指過去。</p>
 </div>
 
 <div class="step"><div class="num">4</div><h2>建立 runner:<code>tools/cv_viewer_runner.py</code></h2></div>
@@ -231,7 +262,7 @@ directory on sys.path, and that is the only reason those imports resolve — so 
 runner reproduces exactly that, then runpy-executes app.py as __main__.
 
 Model weights (85 MB dinov2_vits14.pth) are NOT vendored: the platform points at a
-writable model-house via CV_VIEWER_MODELS_DIR, mirroring LV_MODELS_DIR.
+writable model-house via CVR_MODELS_DIR, mirroring LV_MODELS_DIR.
 """
 from __future__ import annotations
 
@@ -255,8 +286,11 @@ if not (_CV_APP_DIR / "app.py").is_file():
         f"  或把 CV_Viewer 掛成 submodule 到 {_DEFAULT}"
     )
 
-# 權重:不進 submodule,跟 LV 一樣用環境變數指過去(未設就用 repo 自己的 models/)。
-os.environ.setdefault("CV_VIEWER_MODELS_DIR", str(_CV_ROOT / "models"))
+# 權重:CV Viewer 自己就支援 CVR_MODELS_DIR —— app.py:1050 的註解直接寫著
+# 「CVR_MODELS_DIR 讓 Tauri 殼日後把它的共用模型夾接進來,不需要改任何程式」。
+# 不設也能跑(app.py 用 Path(__file__).parents[1]/'models',不依賴 cwd),
+# 設了就能把權重放到平台的共用 model-house,不必塞進每個交付包。
+os.environ.setdefault("CVR_MODELS_DIR", str(_CV_ROOT / "models"))
 
 # 這一行就是整個 runner 的理由:扁平式 App 的 sibling import 只有這樣才成立。
 if str(_CV_APP_DIR) not in sys.path:
@@ -291,18 +325,25 @@ description: >
   CV Viewer — 晶圓/影像檢視與比對。以「單一畫面內嵌的完整 Streamlit 應用」方式啟動
   (id 以 app- 開頭 → category app;runner: cv_viewer → tools/cv_viewer_runner.py,
   見 ToolProcessManager._start_app)。原始碼在自己的 repo,開發階段用 CV_VIEWER_ROOT
-  指過去;模型權重不入版控,由 CV_VIEWER_MODELS_DIR 指向平台 model-house。
+  指過去;模型權重不入版控,由 CVR_MODELS_DIR 指向平台 model-house。
 
 # 自帶相依(per-tool venv)。刻意不含 streamlit —— 用平台核心的 streamlit。
-# 這份清單請對照 CV_Viewer/requirements.lock.txt 填,不要憑印象。
-requires:
-  - numpy
-  - pillow
-  - opencv-python
-  - tifffile
-  - pyyaml
-  - torch
-  - torchvision</code></pre>
+#
+# 這台機器上「刻意留空」,而且實測可行 —— 平台核心的 py -3.11 已經有
+# CV Viewer 需要的每一個套件:
+#   streamlit OK / numpy OK / PIL OK / cv2 OK / tifffile OK / yaml OK / pandas OK / torch OK
+# 填了反而會為它開一個隔離 venv,再裝一份重複的 torch(好幾分鐘、好幾 GB)。
+#
+# 什麼時候該填:CV Viewer 需要一個核心「沒有」、或版本與核心衝突的套件。
+# 來源是 CV_Viewer/requirements.lock.txt(53 行),不要憑印象寫。
+# requires:
+#   - some-package==1.2.3</code></pre>
+
+<div class="box ok">
+  <p><b>AI 先做這件事,再決定要不要填 <code>requires:</code></b> <span class="tag tag-v">已驗證</span></p>
+  <pre><code>py -3.11 -c "import importlib.util as u; [print(f'  {m:12} {\"OK\" if u.find_spec(m) else \"MISSING\"}') for m in ('streamlit','numpy','PIL','cv2','tifffile','yaml','pandas','torch')]"</code></pre>
+  <p>核心有的就別填。<b>填了不是「比較保險」,是多花好幾分鐘裝一份一模一樣的東西。</b></p>
+</div>
 
 <div class="box stop">
   <p><b>AI 必做:不要照抄上面的 <code>requires</code>。</b></p>
@@ -319,7 +360,62 @@ requires:
   </p>
 </div>
 
-<div class="step"><div class="num">6</div><h2>啟動,並用眼睛驗證</h2></div>
+<div class="step"><div class="num">6</div><h2>先 headless 驗一次(不開視窗,30 秒)</h2></div>
+
+<p>
+  <b>AI 應該先跑這個,再去開殼。</b>它把 engine 單獨起在一個固定埠上,直接問它三個問題:
+  「你認得 CV Viewer 嗎?」「你啟動得起來嗎?」「它真的服務得出頁面嗎?」——
+  這三題全過,剩下的就只是殼把它畫進 iframe 而已。開視窗除錯很慢;這個很快。
+</p>
+
+<pre><code>rem 視窗 1:把 engine 起在 8099(它平常是殼幫你起的)
+cd /d C:\code\claude\nativeApp\sidecar\python-engine
+set CV_VIEWER_ROOT=C:\code\claude\CV_Viewer
+set PYTHONUTF8=1
+py -3.11 engine.py --control-port 8099 --log-dir .\logs-dev</code></pre>
+
+<pre><code># 視窗 2:問它三個問題
+import json, time, urllib.request
+BASE = "http://127.0.0.1:8099"
+get = lambda p: json.loads(urllib.request.urlopen(BASE + p, timeout=10).read())
+
+for _ in range(60):                                  # 殼就是這樣等的:輪詢 /health
+    try:
+        if get("/health")["status"] == "ok": break
+    except Exception: time.sleep(1)
+
+tools = get("/tools")
+cv = [t for t in tools if t["tool_id"] == "app-cv-viewer"]
+assert cv, f"engine 不認得 app-cv-viewer!現有:{[t['tool_id'] for t in tools]}"
+assert cv[0]["category"] == "app", "category 不是 app → 不會是單一全高 iframe"
+print("認得它:", cv[0]["name"], cv[0]["category"])
+
+req = urllib.request.Request(BASE + "/tools/app-cv-viewer/start", method="POST")
+res = json.loads(urllib.request.urlopen(req, timeout=180).read())
+print("啟動:", res["input_url"], "| category:", res["category"])
+
+body = urllib.request.urlopen(res["input_url"], timeout=30).read().decode("utf-8", "replace")
+assert "Not Found" not in body, "回 Not Found → 你用了 engine.exe(它沒包 Streamlit 的靜態檔)"
+print("Streamlit 服務得出頁面:", len(body), "bytes")
+
+for p in ("/tools/stop", "/shutdown"):               # 收工,別留孤兒
+    urllib.request.urlopen(urllib.request.Request(BASE + p, method="POST"), timeout=10)</code></pre>
+
+<div class="box warn">
+  <p><b>這裡有一個陷阱,而且是我們自己踩過的。</b></p>
+  <p>
+    <code>GET /</code> 回 200、<code>/_stcore/health</code> 回 200,<b>都不代表 App 的程式碼跑起來了</b>。
+    Streamlit 只有在 <b>websocket session 建立</b>(= 有人真的開了那個頁面)時才會執行 <code>app.py</code>。
+    所以上面 [4] 證明的是「Streamlit 伺服器 + 靜態檔沒問題」——這正是 <code>engine.exe</code> 會失敗的地方。
+  </p>
+  <p>
+    要證明 <b>CV Viewer 自己的 import 都解得開</b>,再跑一次 import 閉包預檢
+    (缺套件的話,你會在按下 Start、iframe 載入的那一刻才看到紅字):
+  </p>
+  <pre><code>py -3.11 -c "import sys; sys.path.insert(0, r'C:\code\claude\CV_Viewer\5_PG_Develop'); import app" 2&gt;&amp;1 | findstr /i "ModuleNotFoundError"</code></pre>
+</div>
+
+<div class="step"><div class="num">7</div><h2>啟動整個平台,並用眼睛驗證</h2></div>
 
 <pre><code>rem 開發階段指到本機 CV Viewer repo
 set CV_VIEWER_ROOT=C:\code\claude\CV_Viewer
@@ -393,7 +489,7 @@ start-dev.bat</code></pre>
   </ul>
 </div>
 
-<div class="step"><div class="num">7</div><h2>出事的時候看哪裡</h2></div>
+<div class="step"><div class="num">8</div><h2>出事的時候看哪裡</h2></div>
 
 <div class="box fact">
   <p><b>log 在這裡</b> <span class="tag tag-v">已驗證</span>(不是 <code>apps/host-tauri/logs</code> —— 那個目錄根本不存在,repo 的 startup 文件寫錯了):</p>
