@@ -9,6 +9,8 @@ build may proceed and what lands in the folder.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -172,7 +174,7 @@ def test_build_produces_the_expected_layout(request_, stub_pip):
     pkg = result.package_dir
 
     for expected in ("start.bat", "app-package.json", "讀我-使用說明.txt",
-                     "tools/安裝WebView2.bat",
+                     "tools/安裝WebView2.bat", "messages/start-webview2.txt",
                      "application/app.py", "application/requirements.txt",
                      "runtime/python.exe", "launcher/launch.py",
                      "launcher/engine_shim.py", "shell/cim-light.exe"):
@@ -268,6 +270,133 @@ def test_a_path_pattern_does_not_exclude_the_entire_project():
     assert keep("raw.csv", False, ("data/*",), "data/raw.csv")
     assert keep("deep.csv", False, ("data/*",), "data/nested/deep.csv")   # 整棵子樹
     assert keep("data", True, ("data/",), "data")
+
+
+# ── a build-output NAME means different things at different depths ───────────
+
+def test_a_custom_components_compiled_frontend_survives_the_build(request_, stub_pip):
+    """S6, the blocker. `dist` was matched by BARE NAME at any depth, so a Streamlit
+    custom component's COMPILED frontend — the thing components.declare_component(
+    path=...) points straight at, the thing that IS the component — was deleted on
+    the way into the package. Verified on the real AI4BI:
+    ai4bi/ui/components/field_well/frontend/dist/. The build then reported success
+    and the delivered app rendered a blank box where the component should be.
+
+    A `dist/` one level down belongs to whatever lives there. Keep it.
+    """
+    frontend = request_.project_dir / "ui" / "components" / "field_well" / "frontend"
+    (frontend / "dist" / "assets").mkdir(parents=True)
+    (frontend / "dist" / "index.html").write_text("<div id=root>", encoding="utf-8")
+    (frontend / "dist" / "assets" / "index.js").write_text("export default 1", encoding="utf-8")
+
+    rel = "ui/components/field_well/frontend/dist"
+    assert not builder_mod.should_ignore("dist", True, rel=rel)
+
+    scan = builder_mod.scan_project(request_)          # the estimate counts it...
+    assert "dist/" not in scan.excluded
+
+    pkg = build(request_).package_dir                  # ...and the copy delivers it
+    shipped = pkg / "application" / "ui" / "components" / "field_well" / "frontend" / "dist"
+    assert shipped.is_dir()
+    assert (shipped / "index.html").is_file()
+    assert (shipped / "assets" / "index.js").is_file()
+
+
+def test_a_top_level_dist_is_still_the_projects_own_build_output(request_, stub_pip):
+    """The other half of the same rule: at the PROJECT ROOT, `dist/` is the junk we
+    have always meant to drop. Fixing S6 must not stop dropping it."""
+    (request_.project_dir / "dist").mkdir()
+    (request_.project_dir / "dist" / "index.html").write_text("x", encoding="utf-8")
+    (request_.project_dir / "build").mkdir()
+    (request_.project_dir / "build" / "index.html").write_text("x", encoding="utf-8")
+
+    assert builder_mod.should_ignore("dist", True, rel="dist")
+    assert builder_mod.should_ignore("build", True, rel="build")
+
+    pkg = build(request_).package_dir
+    assert not (pkg / "application" / "dist").exists()
+    assert not (pkg / "application" / "build").exists()
+
+
+def test_junk_that_can_never_be_the_app_is_dropped_at_any_depth(request_, stub_pip):
+    """The depth-independent set is not an accident, it is a claim: none of these
+    names can BE application code. A nested node_modules/ is the component's build
+    dependency (AI4BI's is 200 MB); nothing in a packaged Python app ever opens it,
+    and the compiled output already sits in dist/ — which we now keep."""
+    frontend = request_.project_dir / "ui" / "components" / "field_well" / "frontend"
+    for junk in ("node_modules", "__pycache__", ".git", ".venv", ".mypy_cache"):
+        (frontend / junk).mkdir(parents=True)
+        (frontend / junk / "junk.txt").write_text("x", encoding="utf-8")
+    (frontend / "dist").mkdir()
+    (frontend / "dist" / "index.html").write_text("keep", encoding="utf-8")
+
+    pkg = build(request_).package_dir
+    out = pkg / "application" / "ui" / "components" / "field_well" / "frontend"
+    for junk in ("node_modules", "__pycache__", ".git", ".venv", ".mypy_cache"):
+        assert not (out / junk).exists(), f"nested {junk} must not travel"
+    assert (out / "dist" / "index.html").is_file()     # ...and the payload still does
+
+
+# ── the escape hatch actually opens ──────────────────────────────────────────
+
+def test_a_user_pattern_can_re_include_what_a_builtin_rule_dropped(request_, stub_pip):
+    """S7. The built-ins were checked FIRST and returned immediately, so nothing the
+    operator could write was able to rescue a file we had decided to drop. An escape
+    hatch that cannot open is not an escape hatch. Built-ins are now only the
+    starting position; the last matching user pattern wins, gitignore-style."""
+    (request_.project_dir / "dist").mkdir()
+    (request_.project_dir / "dist" / "index.html").write_text("payload", encoding="utf-8")
+    (request_.project_dir / ".provisionignore").write_text("!dist\n", encoding="utf-8")
+
+    assert not builder_mod.should_ignore("dist", True, ("!dist",), "dist")
+
+    pkg = build(request_).package_dir
+    assert (pkg / "application" / "dist" / "index.html").read_text("utf-8") == "payload"
+
+
+def test_a_bang_pattern_is_honoured_and_not_silently_discarded(request_, stub_pip):
+    """`!pattern` was LOADED (ignore_patterns_for kept the line) and then treated as
+    'not a pattern' by the matcher — so a .provisionignore full of `!keep/this`
+    looked honoured and did exactly nothing. Silence is the bug: the operator has no
+    way to find out."""
+    (request_.project_dir / ".provisionignore").write_text(
+        "*.mp4\n!keep/demo.mp4\n", encoding="utf-8")
+    (request_.project_dir / "drop.mp4").write_bytes(b"x" * 64)
+    (request_.project_dir / "keep").mkdir()
+    (request_.project_dir / "keep" / "demo.mp4").write_bytes(b"x" * 64)
+
+    patterns = builder_mod.ignore_patterns_for(request_)
+    assert "!keep/demo.mp4" in patterns                 # it survives the load...
+
+    pkg = build(request_).package_dir
+    assert not (pkg / "application" / "drop.mp4").exists()
+    assert (pkg / "application" / "keep" / "demo.mp4").is_file()   # ...and it BITES
+
+
+def test_the_last_matching_pattern_wins_like_gitignore(request_):
+    keep = builder_mod.should_ignore
+    assert not keep("demo.mp4", False, ("*.mp4", "!demo.mp4"), "demo.mp4")
+    assert keep("demo.mp4", False, ("!demo.mp4", "*.mp4"), "demo.mp4")   # order matters
+    assert not keep("a.log", False, ("*.log", "!*.log"), "a.log")
+
+
+def test_a_directory_pattern_does_not_leave_an_empty_directory_behind(request_, stub_pip):
+    """`data/*` excluded every child of data/ but never matched data/ itself, so the
+    directory was not pruned and an EMPTY data/ shipped. The operator who wrote
+    `data/*` and still finds data/ in the package concludes, reasonably, that the
+    exclusion did not work."""
+    data = request_.project_dir / "data"
+    (data / "nested").mkdir(parents=True)
+    (data / "raw.csv").write_text("1", encoding="utf-8")
+    (data / "nested" / "deep.csv").write_text("2", encoding="utf-8")
+    (request_.project_dir / ".provisionignore").write_text("data/*\n", encoding="utf-8")
+
+    assert builder_mod.should_ignore("data", True, ("data/*",), "data")     # the DIR itself
+    assert builder_mod.should_ignore("logs", True, ("logs/**",), "logs")    # and `**` too
+
+    pkg = build(request_).package_dir
+    assert not (pkg / "application" / "data").exists(), "an empty data/ shipped"
+    assert (pkg / "application" / "app.py").is_file()
 
 
 def test_the_store_slot_honours_the_same_exclusions_as_the_fat_package(request_, stub_pip):
@@ -431,6 +560,13 @@ def test_swap_retries_through_a_transient_windows_lock(tmp_path, monkeypatch):
 
 
 def test_swap_gives_up_with_a_real_error_if_the_lock_never_clears(tmp_path, monkeypatch):
+    """A real build of CV_Viewer lost this race: Defender was still scanning the
+    500 MB runtime it had just written, and the operator got
+
+        [WinError 5] 存取被拒。: '...\\.staging-2b0aa162' -> '...\\cp311-845b4ecb...'
+
+    which tells them nothing they can act on — least of all that the build had in
+    fact succeeded and a retry would work."""
     staging = tmp_path / "staging"
     staging.mkdir()
 
@@ -440,8 +576,13 @@ def test_swap_gives_up_with_a_real_error_if_the_lock_never_clears(tmp_path, monk
     monkeypatch.setattr(builder_mod.os, "rename", always_denied)
     monkeypatch.setattr(builder_mod.time, "sleep", lambda _s: None)
 
-    with pytest.raises(PermissionError):
+    with pytest.raises(runtime_mod.RuntimeError_) as caught:
         builder_mod._swap_into_place(staging, tmp_path / "final")
+
+    message = str(caught.value)
+    assert "防毒" in message                    # names the actual cause
+    assert "重跑一次建置" in message            # and the thing to do about it
+    assert "排除清單" in message                # and how to stop it happening again
 
 
 # ── cancel really cancels ────────────────────────────────────────────────────
@@ -581,3 +722,156 @@ def test_build_manifest_is_stable(request_):
     assert manifest["schema_version"] == 1
     assert manifest["health_path"] == "/_stcore/health"
     assert manifest["shell_executable"] == "shell/cim-light.exe"
+
+
+# ── the offline WebView2 promise ─────────────────────────────────────────────
+
+def test_a_package_with_no_webview2_installer_says_so_instead_of_claiming_success(
+        request_, stub_pip):
+    """S1/S4. NOTHING in the tree ever created prereq/ — the store builder only
+    copies one if it already exists, and it never did. So the package told the user
+    to run tools\\安裝WebView2.bat, whose offline branch needs
+    prereq\\MicrosoftEdgeWebview2Setup.exe, on the air-gapped factory machine this
+    product exists for. The only self-rescue path was a dead end, and the build
+    called it 完成. It may still succeed — it must not stay quiet."""
+    result = build(request_)
+    assert result.ok
+    assert not (result.package_dir / "prereq").exists()
+
+    warned = [w for w in result.warnings if "WebView2" in w]
+    assert warned, "a package that cannot start on an offline target must warn"
+    assert "exit 5" in warned[0]                    # the code start.bat actually returns
+    assert "沒有網路就裝不了" in warned[0]
+
+    readme = (result.package_dir / "讀我-使用說明.txt").read_text("utf-8")
+    assert "沒有" in readme and "prereq" in readme  # and the 讀我 does not promise one
+
+
+def test_the_webview2_installer_is_copied_into_prereq_where_the_helper_looks(
+        request_, stub_pip, tmp_path):
+    installer = tmp_path / "MicrosoftEdgeWebview2Setup.exe"
+    installer.write_bytes(b"MZ fake webview2 bootstrapper")
+    request_.webview2_installer = installer
+    request_.__post_init__()                        # re-resolve, as the GUI would
+
+    result = build(request_)
+    assert result.ok, result.errors
+    shipped = result.package_dir / "prereq" / "MicrosoftEdgeWebview2Setup.exe"
+    assert shipped.is_file()
+    assert shipped.read_bytes() == b"MZ fake webview2 bootstrapper"
+    assert not [w for w in result.warnings if "WebView2" in w]   # nothing to warn about
+
+    helper = (result.package_dir / "tools" / "安裝WebView2.bat").read_text("utf-8")
+    assert "prereq" in helper
+
+
+def test_a_webview2_installer_that_does_not_exist_fails_the_build_loudly(
+        request_, stub_pip, tmp_path):
+    """Never silently downgrade to 'no prereq' on a package we promised one for."""
+    request_.webview2_installer = tmp_path / "not-there.exe"
+    result = build(request_)
+    assert not result.ok
+    assert any("WebView2" in e for e in result.errors)
+
+
+def test_the_helper_bat_runs_whatever_installer_is_in_prereq_not_one_hard_coded_name(
+        request_, stub_pip):
+    """Microsoft ships the offline runtime as
+    MicrosoftEdgeWebView2RuntimeInstallerX64.exe; the helper only ever ran
+    MicrosoftEdgeWebview2Setup.exe, so an operator who supplied the right file was
+    told 「沒有附安裝檔」. Both take /silent /install."""
+    helper = (build(request_).package_dir / "tools" / "安裝WebView2.bat").read_text("utf-8")
+    assert 'for %%F in ("prereq\\*.exe")' in helper
+    assert "/silent /install" in helper
+
+
+def test_start_bat_checks_every_webview2_registry_location_and_exits_5():
+    """One source of truth for 'is WebView2 here'. Miss a location and a machine that
+    HAS it is turned away at the door: per-machine on x64 lands under WOW6432Node,
+    per-machine on ARM64/x86 lands in the native path, per-user only ever appears in
+    HKCU. And a pv of 0.0.0.0 is what a broken/partial install leaves behind — the
+    key is there, the runtime is not."""
+    bat = (builder_mod.TEMPLATES / "start.bat").read_text("ascii")
+    assert "HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\EdgeUpdate" in bat
+    assert "HKLM\\SOFTWARE\\Microsoft\\EdgeUpdate" in bat
+    assert "HKCU\\SOFTWARE\\Microsoft\\EdgeUpdate" in bat
+    assert '"%%W"=="0.0.0.0"' in bat
+    assert "exit /b 5" in bat            # the environment code, not a generic 1
+
+
+# ── the .bat files cmd.exe can actually parse ────────────────────────────────
+
+def _bats(pkg: Path) -> list[Path]:
+    return [builder_mod.TEMPLATES / "start.bat", pkg / "start.bat",
+            pkg / "tools" / "安裝WebView2.bat"]
+
+
+def test_every_bat_we_ship_is_pure_ascii_crlf_and_bomless(request_, stub_pip):
+    """Under `chcp 65001` cmd tracks its place in a .bat as a BYTE offset but counts
+    CHARACTERS. Every time it re-reads the file — after a `for /f`, a pipe, an
+    external command, a `goto` — it seeks to an offset that is wrong by however many
+    multi-byte characters came before, lands mid-line, and executes what it finds.
+    A real cmd.exe executed the tail of a Chinese `rem` comment in start.bat. It
+    misfires on ~1 run in 20, which is exactly how it passed review and shipped.
+
+    In an ASCII file byte offset == character offset and the seek cannot miss. The
+    old em-dash rule was this bug seen through a keyhole; ASCII-only subsumes it.
+    The Chinese now lives in messages\\*.txt, which cmd `type`s and never parses."""
+    pkg = build(request_).package_dir
+    for bat in _bats(pkg):
+        raw = bat.read_bytes()
+        assert not raw.startswith(b"\xef\xbb\xbf"), f"{bat.name} has a BOM"
+        assert raw.count(b"\n") == raw.count(b"\r\n"), f"{bat.name} has a bare LF"
+        text = raw.decode("utf-8")
+        assert text.isascii(), f"{bat.name} 不是純 ASCII,cmd.exe 會 seek 到行中間"
+        assert "—" not in text
+        assert not builder_mod.bat_problems(text), builder_mod.bat_problems(text)
+
+
+def test_no_bat_echoes_a_bare_parenthesis_inside_a_block(request_, stub_pip):
+    """`echo ... (exit 5)` inside `if not defined WV2PV ( ... )`: the unescaped `)`
+    closed the block, so the WebView2 error printed UNCONDITIONALLY and start.bat
+    turned away every machine — including the ones that had WebView2."""
+    pkg = build(request_).package_dir
+    for bat in _bats(pkg):
+        for line in bat.read_text("utf-8").splitlines():
+            if line.strip().lower().startswith("echo"):
+                assert "(" not in line and ")" not in line, f"{bat.name}: {line!r}"
+
+    with pytest.raises(ValueError, match="括號"):
+        builder_mod._write_bat(pkg / "x.bat", "@echo off\r\nif 1==1 (\r\necho hi (5)\r\n)\r\n")
+
+
+def test_the_chinese_messages_travel_and_survive_a_cp950_console(request_, stub_pip):
+    """start.bat is ASCII, so every operator-facing sentence it prints comes out of
+    messages\\. Ship the .bat without them and the user gets an English tag and then
+    silence, at the one moment they need to be told something."""
+    pkg = build(request_).package_dir
+    for name in builder_mod.MESSAGES:
+        body = (pkg / "messages" / name).read_text("utf-8")
+        body.encode("cp950")                       # a zh-TW console can render it
+    assert "WebView2" in (pkg / "messages" / "start-webview2.txt").read_text("utf-8")
+
+    # and the package self-check refuses to ship without them
+    (pkg / "messages" / "start-webview2.txt").unlink()
+    manifest = json.loads((pkg / "app-package.json").read_text("utf-8"))
+    assert any("start-webview2.txt" in p for p in smoke_test(pkg, manifest))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="需要真的 cmd.exe 來剖析 .bat")
+def test_a_real_cmd_exe_parses_every_bat_we_ship_without_corrupting_itself(
+        request_, stub_pip):
+    """The test that would have caught all of the above: hand the REAL files to a
+    REAL cmd.exe and look at stderr. A corrupted .bat announces itself as
+    「'...' is not recognized as an internal or external command」 — cmd executing
+    the second half of a line it landed in the middle of."""
+    pkg = build(request_).package_dir
+    (pkg / "runtime" / "python.exe").write_bytes(b"MZ")     # exists; not a real exe
+
+    for bat in (pkg / "start.bat", pkg / "tools" / "安裝WebView2.bat"):
+        for _ in range(8):                     # it misfires ~1 in 20; do not trust one run
+            proc = subprocess.run(["cmd", "/c", str(bat)], input="\n", capture_output=True,
+                                  text=True, encoding="utf-8", errors="replace", timeout=120)
+            damage = [line for line in proc.stderr.splitlines()
+                      if "not recognized" in line or "不是內部或外部" in line or "�" in line]
+            assert not damage, f"{bat.name} 被 cmd.exe 剖壞了:{damage}"

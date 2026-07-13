@@ -9,9 +9,12 @@ from .builder import build, build_manifest, smoke_test
 from .store_builder import (
     ExportResult,
     StoreBuildResult,
+    VersionInfo,
     build_into_store,
     export_full_tree,
     export_update,
+    list_versions,
+    newest_version,
     update_needs_runtime,
 )
 from .discover import (
@@ -31,9 +34,12 @@ __all__ = [
     "Detected",
     "ExportResult",
     "StoreBuildResult",
+    "VersionInfo",
     "build_into_store",
     "export_full_tree",
     "export_update",
+    "list_versions",
+    "newest_version",
     "app_id_for",
     "build",
     "build_manifest",

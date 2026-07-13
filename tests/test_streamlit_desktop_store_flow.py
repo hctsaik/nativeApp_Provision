@@ -569,6 +569,41 @@ def test_second_version_with_same_lock_reuses_the_runtime(build_request, stub_to
     assert state_mod.StateStore(root / "apps" / build_request.app_id / "state").load().pending == "v1.1.0"
 
 
+def test_a_delivered_tree_does_not_promote_the_build_machines_pending_on_first_boot(
+        build_request, stub_toolchain, monkeypatch, tmp_path):
+    """S4, proven on the target rather than argued on the build machine.
+
+    The exporter used to copy state.json verbatim. A build machine NEVER launches
+    what it builds, so its second build sits in `pending` forever — and `pending` is
+    not a note, it is an INSTRUCTION: bootstrap promotes it before it launches
+    anything. So the operator delivered v1.0.0, the factory machine booted, and it
+    silently promoted and ran v1.1.0. Here the delivered tree is booted for real
+    (only the launcher process is faked) and it must run what was delivered.
+    """
+    root = tmp_path / "ROOT"
+    app = build_request.app_id
+    assert store_builder.build_into_store(build_request, root, version="v1.0.0").ok
+    assert store_builder.build_into_store(build_request, root, version="v1.1.0").ok
+    build_state = state_mod.StateStore(root / "apps" / app / "state").load()
+    assert build_state.current == "v1.0.0" and build_state.pending == "v1.1.0"
+
+    out = tmp_path / "deliver"
+    store_builder.export_full_tree(root, out)            # default: current = v1.0.0
+
+    monkeypatch.setattr(bootstrap.time, "sleep", lambda _s: None)
+    popen = popen_factory([dict(healthy=True)])
+    code = bootstrap.start_app(paths_mod.AppPaths(out, app), [],
+                               notify=lambda *a: None, popen=popen)
+
+    assert code == 0
+    launched = popen.calls[0][1]
+    assert "v1.0.0" in launched and "v1.1.0" not in launched
+    final = state_mod.StateStore(out / "apps" / app / "state").load()
+    assert final.current == "v1.0.0" and final.pending is None
+    # and the version it was never meant to have is not even on the disk
+    assert not (out / "apps" / app / "versions" / "v1.1.0").exists()
+
+
 def test_version_slot_excludes_build_artifacts(build_request, stub_toolchain, tmp_path):
     """The slot is what travels on every update — a project's wheelhouse must not
     ride along (CV_Viewer's added 124 MB to every single version)."""

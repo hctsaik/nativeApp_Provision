@@ -20,13 +20,46 @@ on the version marks a perfectly good release dead and "rolls back" to a version
 that fails identically.
 
   0  ok
-  3  the app itself is broken (missing module, syntax error, script raised)
+  3  the app itself is broken (missing module, syntax error, script raised
+     before it ever rendered)
      -> this VERSION is bad: mark failed, roll back
   4  the version tree is broken (bad/missing manifest, path escapes package)
      -> this VERSION is bad: mark failed, roll back
   5  the machine is broken (no WebView2, antivirus ate the shell, no window)
      -> the shell is SHARED; every version fails the same way. Touch no state,
         claim no rollback, tell the operator what to install.
+
+THE HEALTHY MARKER (CIM_HEALTHY_MARKER), and what bootstrap may conclude
+=======================================================================
+The marker is our one bit of good news, so it must mean exactly one thing:
+
+    the marker exists  <=>  this version opened a window
+                            AND the app did not fail on arrival
+
+We write it once the window has survived its creation phase (or exited 0 inside
+it — see run_shell), and we DELETE it again if the log later proves the app was
+never usable. bootstrap commits candidate -> last-known-good on a CLEAN EXIT with
+the marker still present; it must not commit the instant the marker appears,
+because the app script does not even run until the user presses Start.
+
+  exit  marker   what happened                          bootstrap does
+  ----  -------  -------------------------------------  --------------------------
+   0    present  window opened, user closed it, app OK   commit candidate -> LKG
+   0    present  app rendered, threw LATER (red box,     commit; we printed a
+                 user carried on) -> [WARN], not a       warning to console + log
+                 failed version
+   3    absent   app never became usable (missing        version failed: roll back
+                 module / syntax error / raised on
+                 arrival / Streamlit never healthy);
+                 the marker is REVOKED if we had
+                 already written it
+   4    absent   this version's tree/manifest is wrong   version failed: roll back
+   5    absent   the window never opened at all          machine: touch no state
+   5    present  window was up, shell died non-zero      machine (SHARED shell):
+                 later                                   touch no state, no commit
+
+  (--no-shell is a developer flag: no window is involved and bootstrap never
+   passes it. It writes the marker on a healthy Streamlit and nothing else.)
 """
 
 from __future__ import annotations
@@ -221,6 +254,9 @@ def http_ok(url: str, timeout: float = 2.0) -> bool:
 # happens: it is what "the admin forgot to add opencv to requirements" looks
 # like. What it does NOT catch is a script that imports fine and then raises —
 # for that, see `app_error_in_log()`, which is checked when the shell exits.
+#
+# The closure is seeded with the entrypoint AND with the app's pages (below):
+# Streamlit runs pages/*.py itself, without anyone importing them.
 
 _STDLIB = set(getattr(sys, "stdlib_module_names", ()))
 # import name -> the module the app actually needs to find. Only names that
@@ -308,17 +344,112 @@ def _local_module_path(roots: list[Path], name: str) -> Path | None:
     return None
 
 
+def _pages_dir(entrypoint: Path) -> Path:
+    """Streamlit's multipage folder: `pages/` NEXT TO THE ENTRY SCRIPT."""
+    return Path(entrypoint).parent / "pages"
+
+
+def _page_scripts(entrypoint: Path, app_root: Path) -> list[Path]:
+    """The app's pages — files Streamlit executes that NOTHING imports.
+
+    A multipage app's pages are discovered and run by Streamlit itself
+    (script_runner._mpa_v1: every `*.py` directly inside a `pages/` folder next
+    to the entry script, minus dotfiles and __init__.py — that rule is copied
+    from there, not guessed). The entrypoint never imports them, so an import
+    closure seeded with the entrypoint alone is blind to the whole folder: a
+    missing dependency in pages/2_report.py sails through the gate and reaches
+    the user as a red box the first time they click that page.
+
+    Also followed, because the path is a literal sitting in the AST:
+      * st.Page("pages/2_report.py") — the st.navigation API.
+      * .streamlit/pages.toml — the third-party `st-pages` convention
+        ([[pages]] path = "..."), read with tomllib when it is available.
+
+    NOT followed, and we do not pretend otherwise: a page list built at RUNTIME
+    (a loop over a directory, names from a database, st.Page(some_variable)).
+    Its paths do not exist until the app runs, so no static gate can see them;
+    such a page's missing dependency will surface as a red box, and the log
+    scan at shell exit is what has to catch it.
+    """
+    pages: list[Path] = []
+    pages_dir = _pages_dir(entrypoint)
+    if pages_dir.is_dir():
+        pages += sorted(p for p in pages_dir.glob("*.py")
+                        if p.is_file() and not p.name.startswith(".")
+                        and p.name != "__init__.py")
+    pages += _declared_pages(entrypoint, app_root)
+    return pages
+
+
+def _declared_pages(entrypoint: Path, app_root: Path) -> list[Path]:
+    """Page scripts named by a literal string: st.Page(...) and st-pages' toml."""
+    bases = [Path(entrypoint).parent, Path(app_root)]
+    found: list[Path] = []
+
+    def add(raw: str) -> None:
+        if not isinstance(raw, str) or not raw.endswith(".py") or os.path.isabs(raw):
+            return
+        for base in bases:
+            candidate = base / raw
+            if candidate.is_file():
+                found.append(candidate)
+                return
+
+    try:
+        tree = ast.parse(Path(entrypoint).read_text("utf-8", errors="replace"))
+    except (OSError, SyntaxError):
+        tree = None                       # preflight reports the syntax error itself
+    if tree is not None:
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not node.args:
+                continue
+            func = node.func
+            name = (func.attr if isinstance(func, ast.Attribute)
+                    else func.id if isinstance(func, ast.Name) else "")
+            if name not in ("Page", "StreamlitPage"):
+                continue
+            first = node.args[0]
+            if isinstance(first, ast.Constant):
+                add(first.value)
+
+    toml_path = Path(app_root) / ".streamlit" / "pages.toml"
+    if toml_path.is_file():
+        try:
+            import tomllib                      # stdlib on the shipped cp311 runtime
+        except ImportError:                     # pragma: no cover - older runtime
+            return found
+        try:
+            data = tomllib.loads(toml_path.read_text("utf-8", errors="replace"))
+        except (OSError, ValueError):
+            return found
+        for entry in data.get("pages") or []:
+            if isinstance(entry, dict):
+                add(entry.get("path"))
+    return found
+
+
 def preflight(entrypoint: Path, app_root: Path) -> tuple[list[str], str | None]:
     """(missing third-party modules, syntax error) — reachable from the entrypoint.
 
     Follows first-party imports transitively, so a module the app never touches
     cannot fail the check (CV_Viewer ships a `verify/` folder that imports
     playwright; the app does not, and must not be blamed for it).
+
+    The queue starts at the entrypoint *and* at every page Streamlit will run on
+    its own (see _page_scripts) — a page is reachable for the user even though it
+    is unreachable for an import walk.
     """
     roots = _import_roots(entrypoint, app_root)
+    pages_dir = _pages_dir(entrypoint)
+    if pages_dir.is_dir():
+        # A .py next to a page IS a page, not a PyPI package. Treat the folder as
+        # first-party so a sibling import is followed instead of being reported
+        # as "please pip install 2_report" — the misdiagnosis that made a working
+        # CV_Viewer refuse to start.
+        roots = roots + [pages_dir]
     missing: list[str] = []
     seen_files: set[Path] = set()
-    queue = [Path(entrypoint)]
+    queue = [Path(entrypoint), *_page_scripts(entrypoint, app_root)]
     while queue:
         source = queue.pop()
         source = source.resolve()
@@ -367,6 +498,15 @@ class StreamlitExited(Exception):
     """Streamlit died before it became healthy — never open an empty shell."""
 
 
+# How long after Streamlit answers /_stcore/health an error still counts as "the
+# app failed on arrival" rather than "the app broke while it was being used".
+# The portal iframes the app the moment our /control/start answers, so the first
+# script run happens a second or two later; 20s is that, with room for a slow
+# machine. Generous on purpose: the cost of calling a late error early is a
+# version wrongly marked dead.
+APP_ARRIVAL_SECONDS = 20.0
+
+
 class StreamlitSupervisor:
     """Owns exactly one Streamlit process tree: the one it spawned."""
 
@@ -387,6 +527,11 @@ class StreamlitSupervisor:
         self._port = None
         self._log_file = None
         self._log_path = None
+        # When Streamlit became healthy (monotonic), and how many bytes of its
+        # log had been written by the time the app stopped "arriving". See
+        # note_arrival_window().
+        self._healthy_at = None
+        self._arrival_offset = None
 
     # -- state ---------------------------------------------------------------
 
@@ -432,6 +577,8 @@ class StreamlitSupervisor:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         log_path = self.log_dir / f"streamlit-{stamp}-{port}.log"
         self._log_path = log_path
+        self._healthy_at = None
+        self._arrival_offset = None       # a fresh run, a fresh arrival window
         self._log_file = log_path.open("ab")
         cmd = streamlit_command(self.manifest["_python"], self.manifest["_entrypoint"], port, self.host)
         log.info("spawning Streamlit on port %d -> %s", port, log_path.name)
@@ -477,6 +624,7 @@ class StreamlitSupervisor:
                 )
             if http_ok(health):
                 log.info("Streamlit healthy at %s", self.url)
+                self._healthy_at = time.monotonic()
                 return self.url
             time.sleep(0.25)
         self._terminate_tree()
@@ -484,6 +632,13 @@ class StreamlitSupervisor:
 
     # Errors Streamlit prints to its own log when the app script blows up. The
     # health endpoint knows nothing about any of them.
+    #
+    # CAREFUL — every one of these is also what a *survivable* error looks like.
+    # Streamlit logs a traceback for EVERY uncaught exception a script raises
+    # (error_util.py -> _log_uncaught_app_exception), draws it as a red box, and
+    # carries on: the user re-runs with a sane input and works for another hour.
+    # So the presence of a marker means "an exception happened", never "this
+    # version is broken". WHEN it happened is what decides that — see below.
     _APP_ERRORS = ("ModuleNotFoundError", "ImportError", "Traceback (most recent call last)",
                    "SyntaxError", "IndentationError")
 
@@ -491,25 +646,78 @@ class StreamlitSupervisor:
     def log_path(self) -> Path | None:
         return self._log_path
 
-    def app_error_in_log(self) -> str | None:
-        """Did the app script blow up while the user had it open?
+    def note_arrival_window(self) -> None:
+        """Freeze how much of the log belongs to "the app arriving".
 
-        Read once, cheaply, from the log Streamlit writes. This is only
-        meaningful AFTER a session existed — Streamlit does not execute the
-        script until a browser opens a websocket, which happens when the portal
-        iframes the app. So we ask at shell exit, not at boot.
+        Called on a tick while the shell is up (run_shell). Streamlit runs the
+        script only once a session opens, and the portal iframes the app the
+        moment /control/start answers — so the first render happens within a
+        second or two of the health check. Once APP_ARRIVAL_SECONDS have passed,
+        whatever the app logs from here on happened to an app that had already
+        rendered for the user.
+
+        Honest about the limits: Streamlit logs NOTHING on a successful run, so
+        we cannot observe a render. "It became usable" is inferred from "it was
+        up, and quiet, past the arrival window". That means an app that blows up
+        on a page the user opens 30 seconds in is reported as a warning, not a
+        failed version — which is the direction we want to be wrong in: a red box
+        the user can retry is not worth silently downgrading a machine over.
         """
+        if self._arrival_offset is not None:
+            return
+        healthy_at, log_path = self._healthy_at, self._log_path
+        if healthy_at is None or log_path is None:
+            return
+        if time.monotonic() - healthy_at < APP_ARRIVAL_SECONDS:
+            return
+        try:
+            self._arrival_offset = log_path.stat().st_size
+        except OSError:
+            return                       # try again on the next tick
+
+    def _split_log(self) -> tuple[str, str] | None:
+        """(what the app logged on arrival, what it logged once it was working)."""
         if self._log_path is None:
             return None
         try:
-            text = self._log_path.read_text("utf-8", errors="replace")
+            raw = self._log_path.read_bytes()
         except OSError:
             return None
-        for marker in self._APP_ERRORS:
-            if marker in text:
-                lines = [ln for ln in text.splitlines() if ln.strip()]
-                return "\n".join(lines[-12:])
-        return None
+        offset = self._arrival_offset
+        if offset is None:
+            # The arrival window never closed — the user shut the app down inside
+            # it. Nothing in this log had time to be "an app that already worked".
+            offset = len(raw)
+        return (raw[:offset].decode("utf-8", errors="replace"),
+                raw[offset:].decode("utf-8", errors="replace"))
+
+    @classmethod
+    def _error_tail(cls, text: str) -> str | None:
+        if not any(marker in text for marker in cls._APP_ERRORS):
+            return None
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        return "\n".join(lines[-12:])
+
+    def app_error_in_log(self) -> str | None:
+        """The app FAILED ON ARRIVAL: the user never got a working app.
+
+        A missing module, a syntax error, a raise at module level — the script
+        dies on its first run, the user stares at a red box where the app should
+        be. THAT is a broken version: exit 3, revoke the marker, roll back.
+        """
+        parts = self._split_log()
+        return self._error_tail(parts[0]) if parts else None
+
+    def late_app_error_in_log(self) -> str | None:
+        """The app worked, and only later did something raise.
+
+        Bad input, a file that vanished, a bug on one screen: the user saw a red
+        box, re-ran, and kept working. Reporting the version as failed here is
+        how an hour of successful work ends in an unwanted downgrade. Warn, keep
+        the healthy marker, exit 0.
+        """
+        parts = self._split_log()
+        return self._error_tail(parts[1]) if parts else None
 
     def stop(self) -> bool:
         """Terminate our tree and wait until the port is actually released."""
@@ -660,7 +868,16 @@ def shell_env(manifest: dict, control: ControlServer, data_dir: Path) -> dict:
     )
 
 
-SHELL_ALIVE_SECONDS = 12.0   # a shell that cannot open a window dies within ~1s
+# The window-creation watch. A shell that cannot create a window (no WebView2,
+# antivirus ate the .exe) dies within ~1s AND dies non-zero — so watch for a
+# fast death instead of blocking every normal start for 12 seconds before we are
+# willing to believe the window is there. We poll at 0.1s, so the operator sees
+# the "install WebView2" message just as fast as before.
+SHELL_ALIVE_SECONDS = 3.0
+_WINDOW_POLL_SECONDS = 0.1
+# While the shell is up we do nothing but wait for it — tick often enough to
+# close the app's arrival window on time, rarely enough to cost nothing.
+_SHELL_TICK_SECONDS = 0.5
 
 # Printed whenever the window itself will not come up. Say what to DO — an
 # operator on a factory floor cannot act on "the shell exited with code 1".
@@ -673,7 +890,7 @@ _MACHINE_HINT = (
 
 
 def run_shell(manifest: dict, control: ControlServer, data_dir: Path,
-              *, on_window_ready=None) -> int:
+              *, on_window_ready=None, on_tick=None) -> int:
     # cwd = data dir so the prebuilt shell (which may predate CIM_LOG_DIR support)
     # resolves its log dir to data\logs anyway.
     try:
@@ -687,22 +904,47 @@ def run_shell(manifest: dict, control: ControlServer, data_dir: Path,
         return EXIT_MACHINE_BROKEN
     log.info("shell started pid=%s", proc.pid)
 
+    # Watch the window-creation phase, and READ THE RETURN CODE. The two things
+    # that can happen here look identical to a `poll() is not None` check and
+    # could not be further apart:
+    #
+    #   non-zero  the shell could not create a window (WebView2 missing, the exe
+    #             quarantined). The window never existed -> the MACHINE is broken.
+    #   zero      the window opened, and the user closed it. People do glance at
+    #             an app and shut it — and being told "your computer is broken"
+    #             for it, while bootstrap files an environment failure, is a lie
+    #             about a session that worked. The window came up and exited
+    #             cleanly: that IS the health signal. Marker, exit 0.
+    deadline = time.monotonic() + SHELL_ALIVE_SECONDS
+    while time.monotonic() < deadline:
+        code = proc.poll()
+        if code is None:
+            time.sleep(_WINDOW_POLL_SECONDS)
+            continue
+        if code != 0:
+            log.error("shell exited during window creation with code %s", code)
+            print("\n[start][ERROR] 應用視窗一開就關閉了。\n" + _MACHINE_HINT +
+                  f"\n  詳細記錄:{data_dir / 'logs'}", file=sys.stderr, flush=True)
+            # The shell is SHARED by every version of every app in this store.
+            # Blaming the version would mark a good release dead and "roll back"
+            # to something that fails in exactly the same way.
+            return EXIT_MACHINE_BROKEN
+        log.info("shell exited cleanly inside the window-creation watch "
+                 "(the user closed the window)")
+        if on_window_ready is not None:
+            on_window_ready()
+        return EXIT_OK
+
+    # It survived its creation phase: the window is really there.
     if on_window_ready is not None:
-        # Survive the window-creation phase before declaring the version good.
-        deadline = time.monotonic() + SHELL_ALIVE_SECONDS
-        while time.monotonic() < deadline:
-            if proc.poll() is not None:
-                log.error("shell exited immediately with code %s", proc.returncode)
-                print("\n[start][ERROR] 應用視窗一開就關閉了。\n" + _MACHINE_HINT +
-                      f"\n  詳細記錄:{data_dir / 'logs'}", file=sys.stderr, flush=True)
-                # The shell is SHARED by every version of every app in this
-                # store. Blaming the version would mark a good release dead and
-                # "roll back" to something that fails in exactly the same way.
-                return EXIT_MACHINE_BROKEN
-            time.sleep(0.5)
         on_window_ready()
 
-    return proc.wait()
+    while True:
+        try:
+            return proc.wait(timeout=_SHELL_TICK_SECONDS)
+        except subprocess.TimeoutExpired:
+            if on_tick is not None:
+                on_tick()
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -722,11 +964,14 @@ def _write_marker(url: str) -> None:
 def _revoke_marker() -> None:
     """Take the "this version works" claim back.
 
-    We write the marker once the window has survived its first seconds, because
+    We write the marker once the window has survived its creation phase, because
     that is what proves the machine can host it. But the app script only runs
-    when the user presses Start — minutes later. If it dies then, the version is
-    NOT good, and a marker left behind would promote it to last-known-good: the
-    very version rollback would later fall back to.
+    when the user presses Start — minutes later. If it turns out it never became
+    usable, the version is NOT good, and a marker left behind would promote it to
+    last-known-good: the very version rollback would later fall back to.
+
+    Revoked ONLY when the app is proven broken (app_error_in_log), never for an
+    error the app survived — see finish_session.
     """
     marker = os.environ.get("CIM_HEALTHY_MARKER")
     if not marker:
@@ -735,6 +980,44 @@ def _revoke_marker() -> None:
         Path(marker).unlink(missing_ok=True)
     except OSError as exc:
         log.warning("could not revoke healthy marker %s: %s", marker, exc)
+
+
+def finish_session(supervisor: StreamlitSupervisor, shell_code: int) -> int:
+    """(shell exit code x what the app's log says) -> OUR exit code.
+
+    The one place the marker and the exit code are made to tell the same story:
+
+      app failed on arrival  -> revoke the marker, exit 3 (version failed)
+      app raised LATER       -> keep the marker, warn loudly, exit 0
+      the window never came  -> exit 5 (machine); the marker was never written
+      clean close            -> keep the marker, exit 0
+    """
+    fatal = supervisor.app_error_in_log()
+    if fatal:
+        _revoke_marker()
+        log.error("the app failed on arrival: %s", fatal)
+        print("\n[start][ERROR] 這個版本的 App 一啟動就出錯,使用者根本看不到畫面:\n"
+              f"{fatal}\n  完整記錄:{supervisor.log_path}", file=sys.stderr, flush=True)
+        return EXIT_APP_BROKEN
+
+    late = supervisor.late_app_error_in_log()
+    if late:
+        # It rendered, it worked, and then something raised: a bad input, a file
+        # that vanished, a bug on one screen. The user saw a red box and carried
+        # on — an hour of successful work must not end in「這個版本壞了」and an
+        # unasked-for downgrade. Tell them, keep the marker, exit 0.
+        log.warning("the app raised AFTER it was already working: %s", late)
+        print("\n[start][WARN] App 執行中出現錯誤訊息(App 有正常開起來,"
+              "使用者當下可能看到紅色錯誤方塊):\n"
+              f"{late}\n"
+              "  這不算版本失敗,不會退版,也不影響下次啟動。\n"
+              f"  若這個錯誤會重複出現,請把這份記錄交給開發者:{supervisor.log_path}",
+              flush=True)
+
+    if shell_code == EXIT_MACHINE_BROKEN:
+        return EXIT_MACHINE_BROKEN
+    # Any other non-zero code from the SHARED shell: not this version's fault.
+    return EXIT_OK if shell_code == EXIT_OK else EXIT_MACHINE_BROKEN
 
 
 def setup_logging(log_dir: Path) -> Path:
@@ -821,23 +1104,18 @@ def main(argv: list[str] | None = None) -> int:
 
         # The marker means "this version WORKS", so it must not be written until
         # the window is really up: a missing WebView2 runtime kills the shell in
-        # a second, and that is exactly the case rollback exists for.
-        code = run_shell(manifest, control, data_dir, on_window_ready=lambda: _write_marker(url))
+        # a second, and that is exactly the case rollback exists for. The tick
+        # closes the app's arrival window while the user is working (see
+        # StreamlitSupervisor.note_arrival_window).
+        code = run_shell(manifest, control, data_dir,
+                         on_window_ready=lambda: _write_marker(url),
+                         on_tick=supervisor.note_arrival_window)
         log.info("shell exited with code %s", code)
 
         # The user has now actually used the app (or tried to). Streamlit only
         # executes the script once a session opens, so THIS is the first moment
         # its log can tell us the truth.
-        app_error = supervisor.app_error_in_log()
-        if app_error:
-            _revoke_marker()
-            log.error("app raised during the session: %s", app_error)
-            print(f"\n[start][ERROR] 這個版本的 App 在執行中出錯:\n{app_error}\n"
-                  f"  完整記錄:{supervisor.log_path}", file=sys.stderr, flush=True)
-            return EXIT_APP_BROKEN
-        if code == EXIT_MACHINE_BROKEN:
-            return EXIT_MACHINE_BROKEN
-        return EXIT_OK if code == 0 else EXIT_MACHINE_BROKEN
+        return finish_session(supervisor, code)
     finally:
         supervisor.stop()
         control.shutdown()

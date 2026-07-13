@@ -32,7 +32,11 @@ from provision_builder.streamlit_desktop import build_into_store as build_stream
 from provision_builder.streamlit_desktop import export_update as export_streamlit_update  # noqa: E402
 from provision_builder.streamlit_desktop import export_full_tree as export_streamlit_full  # noqa: E402
 from provision_builder.streamlit_desktop import warnings_for as streamlit_warnings_for  # noqa: E402
-from provision_builder.streamlit_desktop.store_builder import update_needs_runtime  # noqa: E402
+from provision_builder.streamlit_desktop.store_builder import (  # noqa: E402
+    list_versions as list_store_versions,
+    newest_version as newest_store_version,
+    update_needs_runtime,
+)
 from provision_builder.streamlit_desktop.device.gc import run_gc as streamlit_gc  # noqa: E402
 from provision_builder.streamlit_desktop import (  # noqa: E402
     default_output,
@@ -117,6 +121,9 @@ class ProvisionApp(tk.Tk):
         self.sd_advanced_var = tk.BooleanVar(value=False)
         self.sd_lock_var = tk.StringVar()      # 指定 lock 檔（兩個 App 想共用 runtime 就靠它）
         self.sd_exclude_var = tk.StringVar()   # 額外排除樣式，分號分隔
+        self.sd_extras_var = tk.StringVar()    # pyproject 的 optional-dependencies 群組
+        self.sd_webview2_var = tk.StringVar()  # WebView2 離線安裝檔（無網目標機必備）
+        self.sd_deliver_version_var = tk.StringVar()   # 要交付/更新的是哪一版
         self.sd_store_var = tk.BooleanVar(value=False)
         self.sd_version_var = tk.StringVar(value="v1.0.0")
         self.sd_update_source_var = tk.StringVar()
@@ -310,8 +317,27 @@ class ProvisionApp(tk.Tk):
                                     "也可以在專案根目錄放 .provisionignore）",
                   foreground="#666", wraplength=520, justify="left").pack(side="left", padx=(8, 0))
 
+        extras_row = ttk.Frame(self.sd_advanced)
+        extras_row.grid(row=len(advanced_rows) + 2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        ttk.Label(extras_row, text="選用相依群組").pack(side="left")
+        ttk.Entry(extras_row, textvariable=self.sd_extras_var, width=30).pack(side="left", padx=(8, 0))
+        ttk.Label(extras_row, text="（pyproject 的 [project.optional-dependencies]，逗號分隔，"
+                                   "例：llm,dev。不填 = 只裝必要相依）",
+                  foreground="#666", wraplength=520, justify="left").pack(side="left", padx=(8, 0))
+
+        # WebView2 是這整個交付包裡「唯一」需要事先裝在目標機上的東西。無網工廠機
+        # 沒有它就開不起來，而我們的自救 bat 需要這個離線安裝檔——不附，那條路是死的。
+        wv_row = ttk.Frame(self.sd_advanced)
+        wv_row.grid(row=len(advanced_rows) + 3, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        ttk.Label(wv_row, text="WebView2 離線安裝檔").pack(side="left")
+        ttk.Entry(wv_row, textvariable=self.sd_webview2_var, width=30).pack(side="left", padx=(8, 0))
+        ttk.Button(wv_row, text="瀏覽…", command=self._browse_webview2).pack(side="left", padx=(4, 0))
+        ttk.Label(wv_row, text="（目標機不能上網時必附。到 go.microsoft.com/fwlink/?LinkId=2124701 "
+                              "下載 Evergreen Standalone Installer）",
+                  foreground="#666", wraplength=460, justify="left").pack(side="left", padx=(8, 0))
+
         port_row = ttk.Frame(self.sd_advanced)
-        port_row.grid(row=len(advanced_rows) + 2, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        port_row.grid(row=len(advanced_rows) + 4, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         ttk.Label(port_row, text="偏好連接埠").pack(side="left")
         ttk.Entry(port_row, textvariable=self.sd_port_var, width=8).pack(side="left", padx=(8, 0))
         ttk.Label(port_row, text="（0 = 每次啟動隨機挑一個 8000–9000 之間、確認沒被占用的埠；"
@@ -360,6 +386,19 @@ class ProvisionApp(tk.Tk):
 
         # 交付與維護：這些路徑本來只有 API，GUI 完全沒有入口——管理員只好手打指令。
         self.sd_deliver = ttk.LabelFrame(parent, text="2. 交付與維護（Store 佈局）", padding=8)
+        # 「要發哪一版」不能用猜的。建置機建完新版是設成「待套用」而不是 current
+        # （建置機自己不會去啟動它），所以拿 current 去匯出，發出去的正是產線
+        # 已經在跑的那一版——走一趟工廠，裝了個寂寞。
+        version_row = ttk.Frame(self.sd_deliver)
+        version_row.pack(fill="x", pady=(0, 6))
+        ttk.Label(version_row, text="要交付的版本").pack(side="left")
+        self.sd_deliver_version = ttk.Combobox(version_row, textvariable=self.sd_deliver_version_var,
+                                               width=18, state="readonly", values=())
+        self.sd_deliver_version.pack(side="left", padx=(8, 0))
+        self.sd_deliver_version_hint = ttk.Label(version_row, text="", foreground="#666",
+                                                 wraplength=560, justify="left")
+        self.sd_deliver_version_hint.pack(side="left", padx=(10, 0))
+
         deliver_row = ttk.Frame(self.sd_deliver)
         deliver_row.pack(fill="x")
         # 兩個按鈕、兩件不同的事。上一版把它們塞進同一個「是／否」對話框，
@@ -423,13 +462,15 @@ class ProvisionApp(tk.Tk):
             folder = Path(folder)
             hits = self._find_plugin_yamls(folder)
             if hits:
-                # 真的是模組集合，只是「模組根目錄」指錯了一層——那就直接告訴他
-                # 該指哪裡，而不是把他趕去別的分頁。
+                # 這個資料夾底下真的有模組。要嘛是「模組根目錄」指高了一層（那就告訴他
+                # 該指哪裡），要嘛他已經指對了、錯的是別的東西（那就閉嘴，不要生一句
+                # 「請把欄位改成它現在的值」——那是上一版真的會講出來的話）。
                 roots = sorted({h.parent.parent for h in hits if h.parent.parent != folder})
-                where = roots[0] if roots else hits[0].parent.parent
+                if not roots:
+                    return ""              # 已經指在對的那一層；問題不在這裡
                 return ("\n\n這個資料夾底下其實有 plugin.yaml"
                         f"（例：{hits[0].relative_to(folder)}），只是不在掃描的那一層。\n"
-                        f"請把「模組根目錄」改指到：{where}\n"
+                        f"請把「模組根目錄」改指到：{roots[0]}\n"
                         "（模組根目錄 = 直接裝著各個模組資料夾的那一層。）")
             if not looks_like_streamlit(folder):
                 return ""
@@ -441,7 +482,8 @@ class ProvisionApp(tk.Tk):
         return (f"\n\n這看起來是一個 Streamlit 專案{which}，不是 CIM 平台模組"
                 "（本頁需要 plugin.yaml）。\n"
                 "請改用上方的「Streamlit 專案 → 桌面 App」分頁——"
-                "它會把這個專案打成 User 可直接執行的資料夾。")
+                "它會把這個專案打成 User 可直接執行的資料夾。\n"
+                f"（那一頁的「專案資料夾」填：{folder}）")
 
     def _detect_environment(self) -> None:
         """殼與 runtime 每次建置都一樣，是我們找得到的東西——別叫人來輸入。
@@ -577,6 +619,49 @@ class ProvisionApp(tk.Tk):
         if value:
             self.sd_output_var.set(value)
 
+    def _browse_webview2(self) -> None:
+        value = filedialog.askopenfilename(
+            title="選擇 WebView2 離線安裝檔（MicrosoftEdgeWebView2RuntimeInstaller*.exe）",
+            filetypes=[("Executable", "*.exe"), ("All", "*.*")])
+        if value:
+            self.sd_webview2_var.set(value)
+
+    def _refresh_deliver_versions(self) -> None:
+        """把這棵樹上「裝得起來」的版本列出來，預設選最新的那一版。
+
+        預設值很重要:管理員按「匯出更新包」時心裡想的是「發最新的」，而 state 的
+        current 在建置機上是「上一版」（新版是 pending，因為建置機自己不會去啟動它）。
+        預設給 current 就會發出產線已經在跑的那一版。"""
+        self.sd_deliver_version.configure(values=())
+        self.sd_deliver_version_hint.configure(text="")
+        if not (self._sd_last_store and self._sd_last_app):
+            return
+        try:
+            versions = list_store_versions(self._sd_last_store, self._sd_last_app)
+        except Exception as exc:  # GUI 邊界
+            self.sd_deliver_version_hint.configure(text=f"讀不到版本清單:{exc}")
+            return
+        installable = [v for v in versions if getattr(v, "is_complete", True)]
+        labels = [v.version for v in installable]
+        self.sd_deliver_version.configure(values=labels)
+        if not labels:
+            self.sd_deliver_version_hint.configure(text="這個 App 還沒有任何完整的版本。")
+            return
+        # 預設 = 最新的完整版本。不是 state.current(那是產線已經在跑的那一版),
+        # 也不是「這個 session 剛好碰過的那一版」。
+        try:
+            default = newest_store_version(self._sd_last_store, self._sd_last_app)
+        except Exception:
+            default = None
+        chosen = default if default in labels else labels[0]
+        self.sd_deliver_version_var.set(chosen)
+        roles = {v.version: (getattr(v, "role", "") or "") for v in installable}
+        role_text = {"current": "產線目前跑的版本", "pending": "已建好、待套用",
+                     "previous": "上一版", "last_known_good": "最後確認可用"}
+        described = "、".join(
+            f"{v}（{role_text.get(roles[v], '未使用')}）" for v in labels[:4])
+        self.sd_deliver_version_hint.configure(text=f"這棵樹上:{described}")
+
     def _browse_sd_lock(self) -> None:
         value = filedialog.askopenfilename(
             title="選擇相依 lock 檔（requirements.lock.txt）",
@@ -601,6 +686,8 @@ class ProvisionApp(tk.Tk):
             raise ValueError(f"偏好連接埠不是數字：{self.sd_port_var.get()}") from exc
         lock = self.sd_lock_var.get().strip()
         extra = tuple(p.strip() for p in self.sd_exclude_var.get().split(";") if p.strip())
+        extras = tuple(e.strip() for e in self.sd_extras_var.get().split(",") if e.strip())
+        webview2 = self.sd_webview2_var.get().strip()
         return BuildRequest(
             project_dir=Path(project),
             entrypoint=Path(entry),
@@ -611,6 +698,8 @@ class ProvisionApp(tk.Tk):
             preferred_port=port,
             requirements=Path(lock) if lock else None,
             extra_excludes=extra,
+            extras=extras,
+            webview2_installer=Path(webview2) if webview2 else None,
         )
 
     def _set_desktop_busy(self, busy: bool) -> None:
@@ -697,7 +786,9 @@ class ProvisionApp(tk.Tk):
         self._sd_last_store = root
         self._sd_last_app = chosen["app_id"]
         # 匯出的預設對象是「目前版本」——那才是產線上正在跑的東西。
-        self._sd_last_version = chosen["current"] or chosen["pending"]
+        # 預設值交給 _refresh_deliver_versions()（它挑最新的完整版本）；current 只是
+        # 「產線目前跑的」，拿它當匯出預設值，發出去的就是他們已經有的那一版。
+        self._sd_last_version = chosen["pending"] or chosen["current"]
         self._sd_last_package = root
         self.sd_store_var.set(True)
         self._on_store_mode_toggled()
@@ -710,6 +801,7 @@ class ProvisionApp(tk.Tk):
             f"{a['app_id']}(目前 {a['current'] or '未設定'}"
             + (f",待套用 {a['pending']}" if a["pending"] else "") + ")"
             for a in apps)
+        self._refresh_deliver_versions()
         self.sd_store_info.configure(
             text=f"已開啟 Store 樹:{root}\n"
                  f"這棵樹上的 App:{summary}\n"
@@ -721,8 +813,14 @@ class ProvisionApp(tk.Tk):
 
         上一版兩者都走 export_update()，於是「首次部署」匯出的東西沒有 bootstrap/、
         沒有 start.bat、沒有 state/——目標機拿到一個永遠打不開的資料夾。"""
-        if not (self._sd_last_store and self._sd_last_app and self._sd_last_version):
+        if not (self._sd_last_store and self._sd_last_app):
             return
+        # 使用者在下拉裡選的那一版才算數（預設是最新的完整版本，不是 state.current）。
+        chosen = self.sd_deliver_version_var.get().strip() or self._sd_last_version
+        if not chosen:
+            messagebox.showerror("還沒有可交付的版本", "這棵樹上找不到任何完整的版本。")
+            return
+        self._sd_last_version = chosen
 
         # 更新包預設不含 runtime(那正是它只有十幾 MB 的原因)。但如果這一版換了
         # Python 相依或換了殼,不帶 runtime 的包在目標機上是裝不起來的。與其讓
@@ -995,7 +1093,11 @@ class ProvisionApp(tk.Tk):
                 result = discover_source_modules(module_root, gateway.python_cmd)
                 self._events.put(("scan_ok", result))
             except Exception as exc:  # GUI 邊界需顯示可行動錯誤
-                self._events.put(("error", f"掃描失敗：{exc}{self._wrong_tab_hint(module_root)}"))
+                # 救援要看「兩個欄位」。上一版只看 module_root：一個把 Streamlit 專案
+                # 填進「平台專案」、module_root 還留著預設值的人，會撞到一個關於
+                # nativeApp 的錯誤，而畫面上沒有任何一個字提到他的專案。
+                hint = self._wrong_tab_hint(module_root) or self._wrong_tab_hint(project)
+                self._events.put(("error", f"掃描失敗：{exc}{hint}"))
 
         self._worker = threading.Thread(target=work, daemon=True)
         self._worker.start()
@@ -1132,8 +1234,15 @@ class ProvisionApp(tk.Tk):
                     self.sd_status_var.set(f"已匯出：{target}")
                     self._append_desktop_log(f"✓ 匯出 {kind_text}：{target}（{result.total_mb:.0f} MB）")
                     if full:
+                        # 交付包裡「真的存在」的那個啟動檔。多 App 的樹沒有 start.bat
+                        # （它會被換成 start-<app>.bat），寫死「雙擊 start.bat」等於
+                        # 叫產線去點一個不存在的檔案。
+                        entry = getattr(result, "entry_hint", lambda: "")() or "雙擊 start.bat"
                         steps = ("把整個資料夾複製到目標機（或直接放 USB 上跑）。\n\n"
-                                 "目標機的人要做的事：\n" + USER_STEPS + "\n\n"
+                                 "目標機的人要做的事：\n"
+                                 f"  1. {entry}\n"
+                                 "  2. 視窗出現後，在上方「工作流程」下拉確認選到這個 App\n"
+                                 "  3. 按一次旁邊的「Start」按鈕\n\n"
                                  "第一次啟動會逐檔驗證共用 runtime（幾十秒），通過後才會啟用。")
                     else:
                         steps = ("這個包只能給「已經有這棵 Store 樹」的機器。兩種套用方式：\n\n"
@@ -1141,9 +1250,20 @@ class ProvisionApp(tk.Tk):
                                  "  B. 複製到目標機任一位置 → 執行 tools\\admin.bat →\n"
                                  "     選「套用已複製進來的更新包」→ 指到這個資料夾。\n\n"
                                  "（套用時會逐檔驗證；驗證不過就不會安裝，也不會動到目前版本。）")
-                    messagebox.showinfo("匯出完成",
-                                        f"{kind_text} 已匯出到：\n{target}\n"
-                                        f"大小 {result.total_mb:.0f} MB\n\n{steps}")
+                    # 匯出物自己會回報它知道的問題（最重要的是：沒附 WebView2 離線
+                    # 安裝檔，而目標機是無網工廠機——那台機器會 exit 5 開不起來，
+                    # 且沒有網路裝不了）。這種事必須在管理員「走去工廠之前」講。
+                    export_warnings = list(getattr(result, "warnings", ()) or ())
+                    for warning in export_warnings:
+                        self._append_desktop_log("⚠ " + warning)
+                    body = (f"{kind_text} 已匯出到：\n{target}\n"
+                            f"大小 {result.total_mb:.0f} MB\n\n{steps}")
+                    if export_warnings:
+                        messagebox.showwarning(
+                            "匯出完成（有需要注意的事）",
+                            body + "\n\n⚠ " + "\n⚠ ".join(export_warnings))
+                    else:
+                        messagebox.showinfo("匯出完成", body)
                 elif kind == "desktop_store_done":
                     self._set_desktop_busy(False)
                     result = payload
@@ -1162,6 +1282,7 @@ class ProvisionApp(tk.Tk):
                         self.sd_export_full_button.configure(state="normal")
                         self.sd_export_update_button.configure(state="normal")
                         self.sd_gc_button.configure(state="normal")
+                        self._refresh_deliver_versions()     # 剛建好的這一版要能被選到
                         self._append_desktop_log("")
                         self._append_desktop_log(f"✓ Store 根：{result.root}")
                         self._append_desktop_log(

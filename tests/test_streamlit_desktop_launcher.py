@@ -12,7 +12,9 @@ import importlib.util
 import json
 import re
 import socket
+import subprocess
 import threading
+import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -536,3 +538,373 @@ def test_shim_start_failure_is_not_reported_as_ready(shim):
 def test_shim_stays_within_the_shells_30s_call_budget():
     """bridge.rs times out every engine call at 30s; ours must fail sooner."""
     assert engine_shim.LAUNCHER_TIMEOUT < 30
+
+
+# ── the shell: closing the window is not a broken computer ───────────────────
+
+class FakeShell:
+    """A Tauri shell stand-in, deterministic so no test hangs on a clock.
+
+    It reports itself alive for `alive_polls` poll() calls (None = for as long as
+    the window-creation watch cares to look), then survives `alive_waits` ticks of
+    the wait loop, then exits with `code`.
+    """
+
+    def __init__(self, code: int = 0, alive_polls: int | None = 0, alive_waits: int = 0):
+        self.pid = 4242
+        self._code = code
+        self._polls = alive_polls
+        self._waits = alive_waits
+        self.returncode = None
+        self.ticks = 0
+
+    def poll(self):
+        if self.returncode is not None or self._polls is None:
+            return self.returncode
+        if self._polls > 0:
+            self._polls -= 1
+            return None
+        self.returncode = self._code
+        return self.returncode
+
+    def wait(self, timeout=None):
+        if self.returncode is not None:
+            return self.returncode
+        if self._waits > 0:
+            self._waits -= 1
+            self.ticks += 1
+            raise subprocess.TimeoutExpired("cim-light.exe", timeout)
+        self.returncode = self._code
+        return self.returncode
+
+
+class FakeControl:
+    url = "http://127.0.0.1:1"
+    token = "t"
+
+
+def _shell_manifest(tmp_path: Path) -> dict:
+    return {"_shell": tmp_path / "cim-light.exe", "_shim": tmp_path / "shim.py",
+            "_python": tmp_path / "python.exe", "app_id": "app-demo", "display_name": "Demo"}
+
+
+def test_a_user_who_closes_the_window_is_not_told_the_computer_is_broken(tmp_path, monkeypatch,
+                                                                        capsys):
+    """The S10 lie: open the app, glance at it, close it inside 12 seconds — and
+    the launcher exited 5 with a WebView2/antivirus lecture, while bootstrap filed
+    an ENVIRONMENT failure. It read `poll() is not None` and never read the code.
+    A shell that exits 0 opened a window and was closed on purpose: that IS health."""
+    shell = FakeShell(code=0)                       # exits at once, cleanly
+    monkeypatch.setattr(launch.subprocess, "Popen", lambda *_a, **_k: shell)
+
+    ready = []
+    code = launch.run_shell(_shell_manifest(tmp_path), FakeControl(), tmp_path,
+                            on_window_ready=lambda: ready.append(True))
+
+    assert code == launch.EXIT_OK                   # not EXIT_MACHINE_BROKEN
+    assert ready == [True]                          # the window opened: keep the marker
+    err = capsys.readouterr().err
+    assert "WebView2" not in err and "應用視窗一開就關閉了" not in err
+
+
+def test_a_shell_that_cannot_create_a_window_is_still_a_machine_failure(tmp_path, monkeypatch,
+                                                                       capsys):
+    """The other half must keep working: no WebView2 kills the shell in ~1s with a
+    NON-ZERO code, and that is not this version's fault — rolling back would land on
+    a version that fails identically."""
+    monkeypatch.setattr(launch.subprocess, "Popen", lambda *_a, **_k: FakeShell(code=1))
+
+    ready = []
+    code = launch.run_shell(_shell_manifest(tmp_path), FakeControl(), tmp_path,
+                            on_window_ready=lambda: ready.append(True))
+
+    assert code == launch.EXIT_MACHINE_BROKEN
+    assert ready == []                              # no marker for a version that never showed
+    err = capsys.readouterr().err
+    assert "WebView2" in err and "不是這個版本的問題" in err
+
+
+def test_the_marker_is_not_written_while_the_window_is_still_being_created(tmp_path, monkeypatch):
+    """A shell that dies half a second in (antivirus killing it as it starts) must
+    not have been called healthy first."""
+    monkeypatch.setattr(launch.subprocess, "Popen",
+                        lambda *_a, **_k: FakeShell(code=1, alive_polls=3))
+    monkeypatch.setattr(launch, "_WINDOW_POLL_SECONDS", 0.01)
+
+    ready = []
+    code = launch.run_shell(_shell_manifest(tmp_path), FakeControl(), tmp_path,
+                            on_window_ready=lambda: ready.append(True))
+    assert code == launch.EXIT_MACHINE_BROKEN and ready == []
+
+
+def test_a_normal_start_is_not_blocked_for_twelve_seconds(tmp_path, monkeypatch):
+    """The 12s wait existed to tell a dead shell from a live one — but the comment
+    itself said a shell that cannot open a window dies within ~1s. Every healthy
+    start paid 12 seconds of blindness (no marker, no arrival tick) for nothing."""
+    assert launch.SHELL_ALIVE_SECONDS <= 3.0
+
+    # alive for the whole watch, then a user session that lasts a few ticks
+    shell = FakeShell(code=0, alive_polls=None, alive_waits=3)
+    monkeypatch.setattr(launch.subprocess, "Popen", lambda *_a, **_k: shell)
+    monkeypatch.setattr(launch, "_WINDOW_POLL_SECONDS", 0.001)
+    monkeypatch.setattr(launch, "SHELL_ALIVE_SECONDS", 0.2)
+
+    started = time.monotonic()
+    ready, ticks = [], []
+    code = launch.run_shell(_shell_manifest(tmp_path), FakeControl(), tmp_path,
+                            on_window_ready=lambda: ready.append(True),
+                            on_tick=lambda: ticks.append(True))
+    elapsed = time.monotonic() - started
+
+    assert code == 0 and ready == [True]
+    assert elapsed < 2.0
+    assert len(ticks) == 3, "the shell wait must tick, or the app's arrival window never closes"
+
+
+# ── an error box the user recovered from is not a failed version ─────────────
+
+def _supervisor(tmp_path: Path, log_text: str, *, arrival_offset: int | None = None):
+    log_path = tmp_path / "streamlit.log"
+    log_path.write_bytes(log_text.encode("utf-8"))
+    supervisor = launch.StreamlitSupervisor(
+        {"_python": tmp_path / "python.exe", "_entrypoint": tmp_path / "app.py",
+         "host": "127.0.0.1", "preferred_port": 0}, tmp_path)
+    supervisor._log_path = log_path
+    supervisor._arrival_offset = arrival_offset
+    return supervisor
+
+
+_STARTUP = "  You can now view your Streamlit app in your browser.\n  URL: http://127.0.0.1:8501\n"
+_TRACEBACK = ("Uncaught app execution\n"
+              "Traceback (most recent call last):\n"
+              '  File "app.py", line 12, in <module>\n'
+              "    df = pd.read_csv(uploaded)\n"
+              "ValueError: could not convert string to float: 'abc'\n")
+
+
+def test_an_error_box_the_user_recovered_from_is_not_a_failed_version(tmp_path):
+    """S10: Streamlit logs a traceback for EVERY exception a script raises —
+    including the one the user caused with a bad upload, saw as a red box, and
+    fixed by re-running. They worked for an hour, closed the window, and were told
+    「這個版本的 App 在執行中出錯」 while bootstrap marked the version failed and
+    rolled the machine back. An app that ran cannot be a version that never ran."""
+    supervisor = _supervisor(tmp_path, _STARTUP + _TRACEBACK,
+                             arrival_offset=len(_STARTUP.encode("utf-8")))
+
+    assert supervisor.app_error_in_log() is None            # nothing failed on arrival
+    late = supervisor.late_app_error_in_log()
+    assert late and "ValueError" in late                    # …but the operator is told
+
+    assert launch.finish_session(supervisor, launch.EXIT_OK) == launch.EXIT_OK
+
+
+def test_an_app_that_never_rendered_is_still_a_failed_version(tmp_path):
+    """The gate must stay armed: a script that dies on its first run leaves the user
+    staring at a red box where the app should be. That version IS broken."""
+    supervisor = _supervisor(
+        tmp_path,
+        _STARTUP + "Traceback (most recent call last):\n"
+                   "ModuleNotFoundError: No module named 'cv2'\n",
+        arrival_offset=None)                                # the window never closed
+
+    fatal = supervisor.app_error_in_log()
+    assert fatal and "ModuleNotFoundError" in fatal
+    assert supervisor.late_app_error_in_log() is None
+
+
+def test_an_app_that_dies_seconds_after_start_is_not_excused_as_a_late_error(tmp_path):
+    """The user pressed Start, the app blew up, they closed the window at once — so
+    the arrival window never got to close. Everything in that log is 'on arrival'."""
+    supervisor = _supervisor(tmp_path, _STARTUP + _TRACEBACK, arrival_offset=None)
+    assert supervisor.app_error_in_log() is not None
+    assert launch.finish_session(supervisor, launch.EXIT_OK) == launch.EXIT_APP_BROKEN
+
+
+def test_the_arrival_window_closes_on_a_tick_not_on_a_guess(tmp_path):
+    """note_arrival_window() is what separates the two halves of the log, so it must
+    freeze the offset only once the app has really had its chance to render."""
+    supervisor = _supervisor(tmp_path, _STARTUP)
+    supervisor._healthy_at = time.monotonic()
+
+    supervisor.note_arrival_window()
+    assert supervisor._arrival_offset is None               # too early: still arriving
+
+    supervisor._healthy_at = time.monotonic() - launch.APP_ARRIVAL_SECONDS - 1
+    supervisor.note_arrival_window()
+    assert supervisor._arrival_offset == len(_STARTUP.encode("utf-8"))
+
+    (tmp_path / "streamlit.log").write_bytes((_STARTUP + _TRACEBACK).encode("utf-8"))
+    supervisor.note_arrival_window()                        # frozen: never re-opened
+    assert supervisor._arrival_offset == len(_STARTUP.encode("utf-8"))
+    assert supervisor.app_error_in_log() is None
+    assert supervisor.late_app_error_in_log() is not None
+
+
+def test_an_app_that_was_never_started_by_the_user_is_not_a_failure(tmp_path):
+    """The user opened the window and closed it without pressing Start: Streamlit
+    never ran, there is no log, and there is nothing to blame the version for."""
+    supervisor = launch.StreamlitSupervisor(
+        {"_python": tmp_path / "python.exe", "_entrypoint": tmp_path / "app.py",
+         "host": "127.0.0.1", "preferred_port": 0}, tmp_path)
+    assert supervisor.app_error_in_log() is None
+    assert supervisor.late_app_error_in_log() is None
+    assert launch.finish_session(supervisor, launch.EXIT_OK) == launch.EXIT_OK
+
+
+# ── the marker contract with bootstrap ───────────────────────────────────────
+
+class LogSupervisor:
+    """Answers only the question finish_session asks: what did the app's log say?"""
+
+    def __init__(self, fatal=None, late=None):
+        self._fatal, self._late = fatal, late
+        self.log_path = Path("streamlit.log")
+
+    def app_error_in_log(self):
+        return self._fatal
+
+    def late_app_error_in_log(self):
+        return self._late
+
+
+def test_a_session_that_only_showed_an_error_box_keeps_its_healthy_marker(tmp_path, monkeypatch,
+                                                                          capsys):
+    """The marker means "this version opened a window and the app did not fail on
+    arrival". A survivable exception does not revoke that — bootstrap commits the
+    version it has been running successfully all along."""
+    marker = tmp_path / "healthy"
+    marker.write_text("http://127.0.0.1:8501", encoding="utf-8")
+    monkeypatch.setenv("CIM_HEALTHY_MARKER", str(marker))
+
+    code = launch.finish_session(LogSupervisor(late=_TRACEBACK), launch.EXIT_OK)
+
+    assert code == launch.EXIT_OK
+    assert marker.exists()                                  # the version stays good
+    out = capsys.readouterr().out
+    assert "[start][WARN]" in out and "不會退版" in out      # said out loud, not swallowed
+
+
+def test_a_version_whose_app_never_rendered_loses_its_healthy_marker(tmp_path, monkeypatch):
+    """The other side of the same contract: the marker was written when the window
+    came up, and the app later proved it never worked. A marker left behind would
+    promote a broken version to last-known-good — the one rollback falls back to."""
+    marker = tmp_path / "healthy"
+    marker.write_text("http://127.0.0.1:8501", encoding="utf-8")
+    monkeypatch.setenv("CIM_HEALTHY_MARKER", str(marker))
+
+    code = launch.finish_session(LogSupervisor(fatal="ModuleNotFoundError: no cv2"),
+                                 launch.EXIT_OK)
+
+    assert code == launch.EXIT_APP_BROKEN
+    assert not marker.exists()
+
+
+def test_a_dead_window_is_never_blamed_on_the_version(tmp_path, monkeypatch):
+    marker = tmp_path / "healthy"
+    monkeypatch.setenv("CIM_HEALTHY_MARKER", str(marker))
+    assert launch.finish_session(LogSupervisor(), launch.EXIT_MACHINE_BROKEN) == \
+        launch.EXIT_MACHINE_BROKEN
+    assert not marker.exists()
+
+
+def test_the_operator_text_survives_a_cp950_console(tmp_path, monkeypatch, capsys):
+    """A zh-TW Windows console is cp950. A message that cannot be encoded is a
+    UnicodeEncodeError instead of an explanation."""
+    monkeypatch.setenv("CIM_HEALTHY_MARKER", str(tmp_path / "healthy"))
+    launch.finish_session(LogSupervisor(late="ValueError: x"), launch.EXIT_OK)
+    launch.finish_session(LogSupervisor(fatal="ModuleNotFoundError: cv2"), launch.EXIT_OK)
+    captured = capsys.readouterr()
+    (captured.out + captured.err).encode("cp950")
+    launch._MACHINE_HINT.encode("cp950")
+
+
+# ── the preflight gate must see the pages the user can click ─────────────────
+
+def _multipage(tmp_path: Path) -> tuple[Path, Path]:
+    app_root = tmp_path / "application"
+    (app_root / "pages").mkdir(parents=True)
+    (app_root / "app.py").write_text("import streamlit as st\nst.title('home')\n",
+                                     encoding="utf-8")
+    return app_root / "app.py", app_root
+
+
+def test_a_missing_package_in_a_pages_file_is_caught_before_the_user_clicks_it(tmp_path):
+    """S3: Streamlit runs pages/*.py itself — nothing imports them (script_runner
+    ._mpa_v1). A closure seeded with the entrypoint alone never opened the folder,
+    so the missing dependency in pages/2_report.py passed the gate and met the user
+    as a red box the first time they clicked 'report'."""
+    entry, app_root = _multipage(tmp_path)
+    (app_root / "pages" / "2_report.py").write_text(
+        "import streamlit as st\nimport definitely_not_installed_pkg\n", encoding="utf-8")
+
+    missing, syntax_error = launch.preflight(entry, app_root)
+    assert syntax_error is None
+    assert missing == ["definitely_not_installed_pkg"]
+
+
+def test_streamlits_own_page_rules_are_followed_not_invented(tmp_path):
+    """`pages/__init__.py` and dotfiles are NOT pages (script_runner._mpa_v1), and
+    a `pages/` folder somewhere else in the tree is not a pages folder at all: it
+    must sit next to the entry script."""
+    entry, app_root = _multipage(tmp_path)
+    (app_root / "pages" / "__init__.py").write_text("import not_a_page_pkg\n", encoding="utf-8")
+    (app_root / "pages" / ".hidden.py").write_text("import not_a_page_pkg\n", encoding="utf-8")
+    (app_root / "elsewhere" / "pages").mkdir(parents=True)
+    (app_root / "elsewhere" / "pages" / "x.py").write_text("import not_a_page_pkg\n",
+                                                           encoding="utf-8")
+
+    assert launch.preflight(entry, app_root) == ([], None)
+
+
+def test_a_page_declared_by_st_page_is_part_of_the_closure(tmp_path):
+    """st.navigation's pages are not in pages/ — but a literal path is right there
+    in the entry script's AST, so there is no excuse for missing it."""
+    app_root = tmp_path / "application"
+    (app_root / "screens").mkdir(parents=True)
+    (app_root / "app.py").write_text(
+        "import streamlit as st\n"
+        "pg = st.navigation([st.Page('screens/report.py'), st.Page('screens/home.py')])\n"
+        "pg.run()\n", encoding="utf-8")
+    (app_root / "screens" / "home.py").write_text("import streamlit as st\n", encoding="utf-8")
+    (app_root / "screens" / "report.py").write_text(
+        "import streamlit as st\nimport definitely_not_installed_pkg\n", encoding="utf-8")
+
+    missing, _ = launch.preflight(app_root / "app.py", app_root)
+    assert missing == ["definitely_not_installed_pkg"]
+
+
+def test_pages_declared_in_a_pages_toml_are_part_of_the_closure(tmp_path):
+    """st-pages' .streamlit/pages.toml: literal paths, tomllib reads them."""
+    entry, app_root = _multipage(tmp_path)
+    (app_root / "screens").mkdir()
+    (app_root / "screens" / "report.py").write_text(
+        "import definitely_not_installed_pkg\n", encoding="utf-8")
+    (app_root / ".streamlit").mkdir()
+    (app_root / ".streamlit" / "pages.toml").write_text(
+        '[[pages]]\npath = "app.py"\nname = "Home"\n\n'
+        '[[pages]]\npath = "screens/report.py"\nname = "Report"\n', encoding="utf-8")
+
+    missing, _ = launch.preflight(entry, app_root)
+    assert missing == ["definitely_not_installed_pkg"]
+
+
+def test_a_module_next_to_a_page_is_not_reported_as_a_missing_pypi_package(tmp_path):
+    """The CV_Viewer misdiagnosis, one folder deeper: a .py sitting in pages/ is the
+    app's own code (it is a page!). Telling the admin to `pip install shared_widgets`
+    would refuse to start a package that works."""
+    entry, app_root = _multipage(tmp_path)
+    (app_root / "pages" / "1_shared_widgets.py").write_text("import json\n", encoding="utf-8")
+    (app_root / "pages" / "2_report.py").write_text(
+        "import streamlit as st\nimport shared_helper\n", encoding="utf-8")
+    (app_root / "pages" / "shared_helper.py").write_text("import json\n", encoding="utf-8")
+
+    missing, syntax_error = launch.preflight(entry, app_root)
+    assert missing == [] and syntax_error is None
+
+
+def test_a_syntax_error_in_a_page_is_reported_with_the_page_name(tmp_path):
+    entry, app_root = _multipage(tmp_path)
+    (app_root / "pages" / "2_report.py").write_text("def broken(\n", encoding="utf-8")
+
+    _missing, syntax_error = launch.preflight(entry, app_root)
+    assert syntax_error and "2_report.py" in syntax_error

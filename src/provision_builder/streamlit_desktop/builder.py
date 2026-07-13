@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -26,7 +27,8 @@ from . import requirements as requirements_mod
 from . import runtime as runtime_mod
 from .models import (
     DEFAULT_STARTUP_TIMEOUT,
-    EXCLUDED_DIRS,
+    EXCLUDED_DIRS_ANY_DEPTH,
+    EXCLUDED_DIRS_ROOT_ONLY,
     EXCLUDED_FILES,
     PROVISIONIGNORE,
     SCHEMA_VERSION,
@@ -39,6 +41,18 @@ from .validate import validate_request
 TEMPLATES = Path(__file__).resolve().parent / "templates"
 # 同一個檔名,兩種佈局共用——GUI 的完成對話框會叫使用者去看它。
 README_NAME = "讀我-使用說明.txt"
+
+# The build succeeds, the folder is complete, and on the machine it was built FOR
+# — an air-gapped factory PC — it cannot open a window. start.bat detects that and
+# exits 5; tools\安裝WebView2.bat offers to fix it and then finds no installer to
+# run and no network to fetch one. A clean "完成" on top of that is a lie, so the
+# result carries this. Set BuildRequest.webview2_installer and it goes away.
+WEBVIEW2_MISSING_WARNING = (
+    "未附 WebView2 離線安裝檔;目標機若沒有 WebView2,App 開不起來(exit 5),"
+    "而且沒有網路就裝不了。"
+    "請在建置時指定 WebView2 離線安裝檔(MicrosoftEdgeWebview2Setup.exe),"
+    "它會被放進交付包的 prereq\\ 底下。"
+)
 Progress = Callable[[str], None]
 ShouldCancel = Callable[[], bool]
 MB = 1024 ** 2
@@ -56,6 +70,32 @@ def _noop(_message: str) -> None:
 # was told 700 MB and got 640 MB, and neither number could be trusted. One rule,
 # one answer.
 
+def _at_project_root(rel: str | None) -> bool:
+    """Is this entry a direct child of the project root?
+
+    `rel is None` means the caller did not tell us where the entry sits. We then
+    assume the root, i.e. the conservative, drop-it answer — every caller inside
+    this module DOES pass `rel`, so the depth-aware behaviour is what actually
+    runs; this only keeps a naive external caller from silently shipping a 124 MB
+    root wheelhouse.
+    """
+    return rel is None or "/" not in rel.replace("\\", "/").lstrip("./")
+
+
+def _builtin_reason(name: str, is_dir: bool, rel: str | None = None) -> str | None:
+    """The built-in exclusions, applied at the depth where they actually mean what
+    their name says. See EXCLUDED_DIRS_ANY_DEPTH / EXCLUDED_DIRS_ROOT_ONLY."""
+    if is_dir:
+        if name in EXCLUDED_DIRS_ANY_DEPTH:
+            return f"{name}/"
+        if name in EXCLUDED_DIRS_ROOT_ONLY and _at_project_root(rel):
+            return f"{name}/"                      # the PROJECT's build junk, at its root
+    for pattern in EXCLUDED_FILES:                 # `*.egg-info` is a DIRECTORY: match both
+        if fnmatch(name, pattern):
+            return pattern
+    return None
+
+
 def ignore_reason(name: str, is_dir: bool, extra: Sequence[str] = (),
                   rel: str | None = None) -> str | None:
     """Why this entry is excluded, as a label for the report — or None to keep it.
@@ -64,22 +104,38 @@ def ignore_reason(name: str, is_dir: bool, extra: Sequence[str] = (),
     contain a slash are matched against it; patterns without one are matched
     against the bare name, at any depth. That is what gitignore does, and getting
     it wrong here is not a cosmetic bug — see _matches_ignore.
+
+    LAST MATCHING PATTERN WINS, gitignore-style, and a `!pattern` re-includes.
+    The built-in rules are only the STARTING position: they used to be checked
+    first and returned immediately, so nothing the operator could write in
+    .provisionignore was able to rescue a file we had decided to drop. An escape
+    hatch that cannot open is not an escape hatch. `!` lines were worse than
+    absent — they were loaded, kept in the pattern list, and then quietly treated
+    as "not a pattern", so a .provisionignore full of `!keep/this` looked honoured
+    and did nothing at all.
     """
-    if is_dir and name in EXCLUDED_DIRS:
-        return f"{name}/"
-    for pattern in EXCLUDED_FILES:                 # `*.egg-info` is a DIRECTORY: match both
-        if fnmatch(name, pattern):
-            return pattern
-    for pattern in extra:
-        if _matches_ignore(pattern, name, is_dir, rel):
-            return f"{pattern}(排除樣式)"
-    return None
+    reason = _builtin_reason(name, is_dir, rel)
+    for raw in extra:
+        pattern = raw.strip()
+        if not pattern or pattern.startswith("#"):
+            continue
+        negated = pattern.startswith("!")
+        body = pattern[1:].strip() if negated else pattern
+        if not body:
+            continue
+        if _matches_ignore(body, name, is_dir, rel):
+            reason = None if negated else f"{pattern}(排除樣式)"
+    return reason
 
 
 def should_ignore(name: str, is_dir: bool, extra: Sequence[str] = (),
                   rel: str | None = None) -> bool:
     """The single source of truth for 'does this entry travel into the package'."""
     return ignore_reason(name, is_dir, extra, rel) is not None
+
+
+# `data/*` and `data/**` name every child of data/ — which means they name data/.
+_CONTAINER = re.compile(r"/\*{1,2}$")
 
 
 def _matches_ignore(pattern: str, name: str, is_dir: bool, rel: str | None = None) -> bool:
@@ -91,10 +147,12 @@ def _matches_ignore(pattern: str, name: str, is_dir: bool, rel: str | None = Non
     exclude pattern silently excluded every file in the project. The build still
     "succeeded": it shipped a package with no application code in it.
 
-    Negation (`!`) is not supported — we say so rather than pretend.
+    A leading `!` is NOT handled here: negation is a decision about the whole
+    pattern list (last match wins), not about one pattern, so it lives in
+    ignore_reason() and this function only ever sees the pattern body.
     """
     pattern = pattern.strip()
-    if not pattern or pattern.startswith(("#", "!")):
+    if not pattern:
         return False
     dir_only = pattern.endswith("/")
     pattern = pattern.rstrip("/")
@@ -114,12 +172,25 @@ def _matches_ignore(pattern: str, name: str, is_dir: bool, rel: str | None = Non
     target = rel.replace("\\", "/").lstrip("./")
     if fnmatch(target, pattern):
         return True
+    if is_dir:
+        # `data/*` matched every child of data/ but not data/ itself, so the
+        # directory was never pruned: its children were excluded one by one and an
+        # EMPTY data/ shipped. The operator who wrote `data/*` and still finds
+        # data/ sitting in the package concludes, reasonably, that the exclusion
+        # did not work. Match the container too, and the whole subtree goes.
+        container = _CONTAINER.sub("", pattern)
+        if container and container != pattern and fnmatch(target, container):
+            return True
     # `data/*` should also drop everything beneath data/, not just its children.
     return fnmatch(target, pattern.rstrip("*").rstrip("/") + "/*")
 
 
 def ignore_patterns_for(request: BuildRequest) -> tuple[str, ...]:
-    """The project's own .provisionignore, plus whatever the caller added."""
+    """The project's own .provisionignore, plus whatever the caller added.
+
+    `!` lines are KEPT: they are re-includes and ignore_reason() honours them
+    (last match wins). They used to be kept here and dropped there.
+    """
     patterns: list[str] = []
     ignore_file = Path(request.project_dir) / PROVISIONIGNORE
     if ignore_file.is_file():
@@ -426,12 +497,17 @@ def build(request: BuildRequest, progress: Progress = _noop,
         for name in ("launch.py", "engine_shim.py"):
             shutil.copy2(TEMPLATES / name, staging / "launcher" / name)
         shutil.copy2(TEMPLATES / "start.bat", staging / "start.bat")
+        _write_messages(staging)          # the Chinese start.bat `type`s; see _write_bat
+
+        has_prereq = _stage_webview2(request, staging, progress)
+        if not has_prereq:
+            warnings.append(WEBVIEW2_MISSING_WARNING)
 
         manifest = build_manifest(request, request.shell_exe.name)
         (staging / "app-package.json").write_text(
             json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
         )
-        _write_readme(staging, manifest)
+        _write_readme(staging, manifest, has_prereq=has_prereq)
 
         progress("Smoke test:檢查交付包的完整性…")
         smoke_errors = smoke_test(staging, manifest)
@@ -502,6 +578,12 @@ def smoke_test(package: Path, manifest: dict) -> list[str]:
             problems.append(f"manifest.{key} 指向不存在的檔案:{relative}")
     if not (package / "start.bat").is_file():
         problems.append("缺少 start.bat")
+    # start.bat is ASCII and `type`s its Chinese out of messages\. Ship it without
+    # them and every error the user can actually hit prints an English tag and then
+    # silence — which is how they learn nothing at the one moment they need to.
+    for name in MESSAGES:
+        if not (package / "messages" / name).is_file():
+            problems.append(f"缺少 messages\\{name}(start.bat 靠它印中文訊息)")
     return problems
 
 
@@ -519,21 +601,42 @@ def _rescue_log(build_log: Path, output_dir: Path, name: str) -> Path | None:
         return None
 
 
-def _rename_with_retry(src: Path, dst: Path, attempts: int = 6) -> None:
+def _rename_with_retry(src: Path, dst: Path, attempts: int = 12,
+                       progress: Progress = _noop) -> None:
     """Windows hands out ERROR_ACCESS_DENIED when anything still holds a handle
     inside the directory — and Defender reliably does, right after we have just
-    written a 250 MB runtime into it. The lock is transient, so back off and
-    retry instead of failing a build that actually succeeded."""
+    written a 500 MB runtime into it. The lock is transient, so back off and
+    retry instead of failing a build that actually succeeded.
+
+    Six attempts (~15s) was not enough: a real build of CV_Viewer's runtime lost
+    this race on a machine with real-time protection on. Defender's scan of a
+    freshly written tree that size takes as long as it takes, so we wait for it —
+    and if we do give up, we say what actually happened, because "[WinError 5]
+    存取被拒。" in front of two .staging paths tells the operator nothing they can act on.
+    """
     delay = 0.5
+    waited = 0.0
     for attempt in range(1, attempts + 1):
         try:
             os.rename(src, dst)
+            if waited:
+                progress(f"（防毒掃描讓這一步多等了 {waited:.0f} 秒）")
             return
-        except PermissionError:
+        except PermissionError as exc:
             if attempt == attempts:
-                raise
+                raise runtime_mod.RuntimeError_(
+                    f"搬移建置好的檔案時被系統擋住(等了 {waited:.0f} 秒仍未放行):{dst}\n"
+                    "  幾乎都是防毒軟體(Windows Defender / 公司防毒)還在掃描剛寫好的\n"
+                    "  幾百 MB 檔案,暫時鎖住了它們。東西其實已經建好了。\n"
+                    "  解法(擇一):\n"
+                    "    · 直接重跑一次建置(通常第二次就過了,掃描已經做完)\n"
+                    "    · 請 IT 把輸出資料夾加進防毒的排除清單,之後就不會再遇到\n"
+                    f"  原始錯誤:{exc}") from exc
+            if attempt == 3:      # 等到這裡才吭聲:前兩次通常瞬間就過了
+                progress("防毒正在掃描剛寫好的檔案,等它放行…（這很正常,不用理它）")
             time.sleep(delay)
-            delay = min(delay * 2, 8.0)
+            waited += delay
+            delay = min(delay * 2, 10.0)
 
 
 def _swap_into_place(staging: Path, final: Path) -> None:
@@ -553,11 +656,43 @@ def _swap_into_place(staging: Path, final: Path) -> None:
         shutil.rmtree(backup, ignore_errors=True)
 
 
-def _write_readme(staging: Path, manifest: dict) -> None:
+def _stage_webview2(request: BuildRequest, staging: Path,
+                    progress: Progress = _noop) -> bool:
+    """Put the WebView2 offline installer where tools\\安裝WebView2.bat looks for it.
+
+    NOTHING else in this repo ever creates prereq/ — the store builder only copies
+    one if it already exists, and it never does. So the fat package has been
+    telling the user to run 安裝WebView2.bat, whose offline branch needs
+    prereq\\MicrosoftEdgeWebview2Setup.exe, on a machine with no network. Returns
+    True if the package now carries an installer.
+    """
+    installer = getattr(request, "webview2_installer", None)
+    if installer is None:
+        return False
+    source = Path(installer)
+    if not source.is_file():
+        # Loud, at build time, on the machine that can still fix it — never a
+        # silent downgrade to "no prereq" on a package we promised one for.
+        raise runtime_mod.RuntimeError_(f"找不到指定的 WebView2 離線安裝檔:{source}")
+    prereq = staging / "prereq"
+    prereq.mkdir(exist_ok=True)
+    shutil.copy2(source, prereq / source.name)
+    progress(f"附上 WebView2 離線安裝檔:prereq\\{source.name}")
+    return True
+
+
+def _write_readme(staging: Path, manifest: dict, has_prereq: bool = False) -> None:
     port = manifest.get("preferred_port") or 0
     port_line = ("* 啟動程式每次會自動挑一個沒被占用的埠(8000–9000),不需手動處理。"
                  if not port else
                  f"* 若 {port} 埠被其他程式占用,啟動程式會自動改用其他可用埠,不需手動處理。")
+    # 這一段曾經無條件叫離線的使用者「向提供者索取 prereq\ 資料夾」——而 prereq\
+    # 從來沒有人產生過。現在它只講這個交付包裡真的有的東西。
+    webview2_line = (
+        "離線安裝檔已附在這個資料夾的 prereq\\ 底下,不需要網路。"
+        if has_prereq else
+        "這個交付包「沒有」附離線安裝檔:安裝 WebView2 需要網路。若目標機不能連網,\n"
+        "請回頭向提供者索取 MicrosoftEdgeWebview2Setup.exe,放進這個資料夾的 prereq\\ 底下。")
     # 檔名與 GUI 完成對話框講的那個檔名必須是同一個。它們一度不同(對話框說
     # 「讀我-使用說明.txt」,資料夾裡卻只有 README.txt),於是管理員在資料夾裡
     # 找不到對話框叫他看的東西。步驟也只寫一次:曾經一份說兩步、一份說三步,
@@ -578,8 +713,9 @@ def _write_readme(staging: Path, manifest: dict) -> None:
 唯一的例外:Microsoft Edge WebView2 Runtime
 ------------------------------------------
 應用視窗是用 WebView2 畫出來的。Windows 10/11 大多已內建;若沒有,start.bat 會
-在啟動前就告訴你,並要你先執行 tools\\安裝WebView2.bat(可用一般使用者權限安裝,
-不需系統管理員)。離線機器請向提供者索取 prereq\\ 資料夾。
+在啟動前就告訴你(代碼 5),並要你先執行 tools\\安裝WebView2.bat(可用一般使用者
+權限安裝,不需系統管理員)。
+{webview2_line}
 
 第一次執行時的安全性提示
 ------------------------
@@ -605,33 +741,148 @@ def _write_readme(staging: Path, manifest: dict) -> None:
 def _write_webview2_helper(staging: Path) -> None:
     """The fat package told the user to run tools\\安裝WebView2.bat — a file that
     only the store layout ever produced. Pointing at a file you did not ship is
-    worse than saying nothing."""
+    worse than saying nothing.
+
+    It ran ONE hard-coded name, prereq\\MicrosoftEdgeWebview2Setup.exe. Microsoft
+    ships the offline runtime as MicrosoftEdgeWebView2RuntimeInstallerX64.exe, and
+    both take `/silent /install`, so an operator who did the right thing with the
+    right file got "沒有附安裝檔". Take whatever .exe is in prereq\\.
+
+    No `goto`, no `:label` — see _write_bat. The control flow here is if/else and
+    a captured RC, which needs neither.
+    """
     tools = staging / "tools"
     tools.mkdir(exist_ok=True)
-    (tools / "安裝WebView2.bat").write_text(
-        """@echo off
+    _write_bat(tools / "安裝WebView2.bat", r"""@echo off
+rem PURE ASCII, on purpose -- see builder._write_bat. The Chinese this prints lives
+rem in messages\*.txt and is `type`d, because cmd.exe mis-seeks a non-ASCII .bat.
 chcp 65001 >nul 2>&1
-title 安裝 Microsoft Edge WebView2 Runtime
-pushd "%~dp0.." || (echo [ERROR] 無法進入程式資料夾。& pause & exit /b 1)
+title Install Microsoft Edge WebView2 Runtime
+pushd "%~dp0.." || (echo [ERROR] cannot enter the program folder. & pause & exit /b 1)
 
-if exist "prereq\\MicrosoftEdgeWebview2Setup.exe" (
-  echo 正在安裝 WebView2 Runtime(不需系統管理員權限)…
-  "prereq\\MicrosoftEdgeWebview2Setup.exe" /silent /install
-  goto done
+rem There is more than one legitimate file name: the Evergreen Bootstrapper ships as
+rem MicrosoftEdgeWebview2Setup.exe and the offline runtime as
+rem MicrosoftEdgeWebView2RuntimeInstallerX64.exe. Both take /silent /install. This
+rem used to run ONE hard-coded name, so an operator who supplied the right file was
+rem told the package had no installer. Take whatever .exe is in prereq\.
+set "WV2SETUP="
+for %%F in ("prereq\*.exe") do if not defined WV2SETUP set "WV2SETUP=prereq\%%~nxF"
+
+if not defined WV2SETUP (
+  type "messages\webview2-none.txt" 2>nul
+  popd
+  pause
+  exit /b 1
 )
 
-echo 這個交付包裡沒有附安裝檔。請用以下任一方式:
-echo.
-echo   1. 有網路的話,開啟這個網址下載「Evergreen Bootstrapper」並執行:
-echo      https://go.microsoft.com/fwlink/p/?LinkId=2124703
-echo   2. 沒網路的話,請向提供者索取 prereq\\MicrosoftEdgeWebview2Setup.exe,
-echo      放進這個資料夾的 prereq\\ 底下,再執行一次本檔案。
-echo.
-echo 它可以用一般使用者權限安裝,不需要系統管理員。
+type "messages\webview2-installing.txt" 2>nul
+echo   %WV2SETUP%
+"%WV2SETUP%" /silent /install
+rem Capture RC OUTSIDE a block: %errorlevel% inside `if (...)` is expanded when the
+rem block is read, which is before the installer has run, so it prints a stale value.
+set "RC=%errorlevel%"
 
-:done
+if not "%RC%"=="0" (
+  echo [ERROR] exit code %RC%
+  type "messages\webview2-failed.txt" 2>nul
+) else (
+  type "messages\webview2-done.txt" 2>nul
+)
 popd
 pause
-""",
-        encoding="utf-8",
-    )
+exit /b %RC%
+""")
+
+
+def _write_bat(path: Path, text: str) -> None:
+    """Write a batch file cmd.exe can actually parse. ASCII only, CRLF, no BOM.
+
+    The em-dash rule everyone knows ("U+2014 breaks cmd") is a special case of a
+    much worse one, and chasing the special case let the general one ship.
+
+    Under `chcp 65001` cmd tracks its position in a .bat as a BYTE offset but
+    computes it by counting CHARACTERS. While it only moves forward one line at a
+    time, nothing goes wrong. The moment it has to RE-READ the file — after a
+    `for /f`, a pipe, an external command, a `goto` — it seeks to an offset that is
+    wrong by however many multi-byte characters came before it, lands in the MIDDLE
+    of a line, and executes whatever it finds there. We watched a real cmd.exe
+    execute the tail of a Chinese `rem` comment in start.bat. It happens on roughly
+    1 run in 20, which is precisely how it passed review and shipped: a .bat that
+    works nineteen times looks like a .bat that works.
+
+    In an ASCII-only file, byte offset == character offset, so the seek cannot miss.
+    That is the entire fix, it is mechanical, and it subsumes the em-dash rule.
+    Operator-facing Traditional Chinese goes in messages\\*.txt and is printed with
+    `type`, which hands the bytes to the console and never parses them.
+    """
+    problems = bat_problems(text)
+    if problems:
+        raise ValueError(f"{path.name}: " + "; ".join(problems))
+    path.write_bytes(text.replace("\r\n", "\n").replace("\n", "\r\n").encode("ascii"))
+
+
+def bat_problems(text: str) -> list[str]:
+    """Everything we know cmd.exe gets wrong, checked mechanically. Used by
+    _write_bat for the files we generate and by the tests for the static template."""
+    problems = []
+    if not text.isascii():
+        stray = sorted({ch for ch in text if not ch.isascii()})
+        problems.append(
+            f"不是純 ASCII:{stray[:8]};cmd.exe 在 chcp 65001 下會 seek 到行中間"
+            "(約 1/20 機率)。中文請放 messages\\*.txt,用 type 印")
+    for line in text.splitlines():
+        stripped = line.strip()
+        # An unescaped ( or ) in an echo INSIDE a block closes the block early. The
+        # WebView2 gate said `echo ... (exit 5)`, the `)` ended the `if`, and the
+        # error printed UNCONDITIONALLY: every machine was turned away, WebView2 or
+        # not. We never need a literal paren in a .bat echo; the .txt messages can.
+        if re.match(r"(?i)^echo\b", stripped) and ("(" in stripped or ")" in stripped):
+            problems.append(f"echo 行裡有括號,會把外層區塊提早關掉:{stripped!r}")
+    return problems
+
+
+# The Chinese start.bat and 安裝WebView2.bat print. cmd `type`s these; it never
+# parses them, so they can hold anything a cp950 console can render.
+MESSAGES: dict[str, str] = {
+    "title.txt": "應用程式啟動中 - 請不要關閉這個視窗",
+    "start-nofolder.txt":
+        "無法進入程式資料夾。\n"
+        "若是從網路磁碟機執行,請先把整個資料夾複製到本機磁碟,再試一次。\n",
+    "start-incomplete.txt":
+        "這個資料夾不完整:找不到 runtime\\python.exe。\n"
+        "請向提供者重新索取完整的資料夾。\n",
+    "start-webview2.txt":
+        "這台電腦缺 Microsoft Edge WebView2 Runtime,應用視窗開不起來。\n"
+        "\n"
+        "  請先執行:tools\\安裝WebView2.bat\n"
+        "  (可用一般使用者權限安裝,不需要系統管理員。裝完再跑一次 start.bat。)\n"
+        "\n"
+        "  沒有網路的話,安裝檔必須事先附在 prereq\\ 底下;若 prereq\\ 是空的,\n"
+        "  請向提供者索取 MicrosoftEdgeWebview2Setup.exe。\n",
+    "start-failed.txt":
+        "啟動失敗。詳細記錄在 data\\logs\\ 資料夾裡:\n"
+        "    launcher-*.log    啟動流程\n"
+        "    streamlit-*.log   應用本身的輸出\n",
+    "webview2-none.txt":
+        "這個交付包裡沒有附安裝檔(prereq\\ 是空的或不存在)。請用以下任一方式:\n"
+        "\n"
+        "  1. 有網路的話,開啟這個網址下載「Evergreen Bootstrapper」並執行:\n"
+        "     https://go.microsoft.com/fwlink/p/?LinkId=2124703\n"
+        "  2. 沒網路的話,請向提供者索取 MicrosoftEdgeWebview2Setup.exe,\n"
+        "     放進這個資料夾的 prereq\\ 底下,再執行一次本檔案。\n"
+        "\n"
+        "它可以用一般使用者權限安裝,不需要系統管理員。\n",
+    "webview2-installing.txt": "正在安裝 WebView2 Runtime(不需系統管理員權限)…\n",
+    "webview2-done.txt": "安裝完成。請再執行一次 start.bat。\n",
+    "webview2-failed.txt": "安裝失敗。請把上面的訊息回報給提供者。\n",
+}
+
+
+def _write_messages(staging: Path) -> None:
+    """The Chinese that start.bat and the WebView2 helper print, as DATA. cmd `type`s
+    these files; it never parses them, so no seek bug can reach them."""
+    messages = staging / "messages"
+    messages.mkdir(exist_ok=True)
+    for name, body in MESSAGES.items():
+        body.encode("cp950")                # a zh-TW console must be able to render it
+        (messages / name).write_bytes(body.replace("\n", "\r\n").encode("utf-8"))

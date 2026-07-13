@@ -9,6 +9,7 @@ promise that it neither crashes on a zh-TW console nor lies about what it freed.
 from __future__ import annotations
 
 import errno
+import io
 import json
 import os
 import threading
@@ -296,6 +297,7 @@ def test_sentinel_is_last_and_removal_is_first(payload):
 APP = "demo"
 FP1 = "cp311-aaaaaaaaaaaa"
 FP2 = "cp311-bbbbbbbbbbbb"
+FP3 = "cp311-cccccccccccc"
 
 
 def build_runtime(root: Path, fingerprint: str, *, complete: bool = True) -> Path:
@@ -650,20 +652,28 @@ def test_rollback_to_current_is_a_no_op(tree):
 # ── launcher exit-code contract ──────────────────────────────────────────────
 
 class FakeLauncher:
-    def __init__(self, env, *, healthy: bool, exit_code: int = 0, polls: int = 1):
+    """`healthy` writes the marker the way launch.py does once its WINDOW has stood
+    for ~12s. `revoke` deletes it again on the way out — which is exactly what the
+    real launcher's _revoke_marker() does when the app it was hosting dies."""
+
+    def __init__(self, env, *, healthy: bool, exit_code: int = 0, polls: int = 1,
+                 revoke: bool = False):
         self.pid = 4242
         self.returncode = None
         self._exit_code = exit_code
         self._polls_left = polls
+        self._revoke = revoke
+        self.marker = Path(env["CIM_HEALTHY_MARKER"])
         if healthy:
-            marker = Path(env["CIM_HEALTHY_MARKER"])
-            marker.parent.mkdir(parents=True, exist_ok=True)
-            marker.write_text("http://127.0.0.1:9999", encoding="utf-8")
+            self.marker.parent.mkdir(parents=True, exist_ok=True)
+            self.marker.write_text("http://127.0.0.1:9999", encoding="utf-8")
 
     def poll(self):
         if self._polls_left > 0:
             self._polls_left -= 1
             return None
+        if self._revoke:
+            self.marker.unlink(missing_ok=True)
         self.returncode = self._exit_code
         return self.returncode
 
@@ -722,6 +732,247 @@ def test_shell_environment_exit_does_not_touch_state_or_claim_a_rollback(
     err = capsys.readouterr().err
     assert "WebView2" in err and "防毒" in err
     assert "退回舊版也不會好" in err
+
+
+# ── what actually COMMITS a candidate to last-known-good ─────────────────────
+#
+# The healthy marker appearing is NOT it. launch.py writes the marker once its
+# window has survived ~12 seconds, but the Streamlit app script only runs when the
+# user presses Start — minutes later. commit_candidate() fired on the marker, so:
+#
+#   * a build that came up and then died was latched as last_known_good BEFORE it
+#     died, and stayed the machine's idea of "the version to fall back to"; and
+#   * commit_candidate() had cleared `candidate`, so start_app's post-exit guard
+#     (`refreshed.candidate != version`) was always true and the ENTIRE rollback
+#     block was skipped — the version that just failed was neither marked failed
+#     nor rolled back.
+#
+# The commit signal is the process EXITING CLEANLY with the marker still present.
+
+def test_a_marker_seen_mid_session_does_not_latch_a_broken_version_as_last_known_good(
+        tree, monkeypatch):
+    """S3 blocker. Window up (marker written), user presses Start minutes later, the
+    app dies, launch.py revokes the marker and exits 3. The broken build must not be
+    last_known_good, and the rollback must actually happen."""
+    arm_candidate(tree)                                # v1 = LKG, v2 = pending
+    monkeypatch.setattr(bootstrap.time, "sleep", lambda _s: None)
+    notified = []
+    popen = popen_factory([
+        dict(healthy=True, exit_code=bootstrap.EXIT_APP_FAILURE, revoke=True),  # v2
+        dict(healthy=True),                                                     # v1 again
+    ])
+
+    code = bootstrap.start_app(paths_of(tree), [], notify=lambda *a: notified.append(a),
+                               popen=popen)
+    assert code == 0
+    assert len(popen.calls) == 2                       # v2 died, v1 was relaunched
+
+    final = store_of(tree).load()
+    assert final.is_failed("v2")                       # the broken build IS blamed
+    assert final.last_known_good == "v1"               # and is NOT the fallback
+    assert final.current == "v1" and final.candidate is None
+    assert notified                                    # the user was told about it
+
+
+def test_a_version_that_dies_after_going_healthy_rolls_back_even_with_the_marker_left(
+        tree, monkeypatch):
+    """The harder half: the app crashes so hard the launcher never gets to delete the
+    marker, so it is STILL on disk at exit. A leftover marker must not save a version
+    that exited 3 — the exit code decides, the marker only corroborates a clean one."""
+    arm_candidate(tree)
+    monkeypatch.setattr(bootstrap.time, "sleep", lambda _s: None)
+    popen = popen_factory([
+        dict(healthy=True, exit_code=bootstrap.EXIT_VERSION_INTEGRITY, revoke=False),
+        dict(healthy=True),
+    ])
+
+    assert bootstrap.start_app(paths_of(tree), [], notify=lambda *a: None,
+                               popen=popen) == 0
+    final = store_of(tree).load()
+    assert final.current == "v1" and final.is_failed("v2")
+    assert final.last_known_good == "v1"
+
+
+def test_the_marker_alone_writes_no_state_while_the_app_is_still_running(tree, monkeypatch):
+    """The marker is EVIDENCE that a window appeared, nothing more. Nothing may be
+    committed while the app is up — the session is not over, and most versions die
+    after the marker, not before it."""
+    arm_candidate(tree)
+    monkeypatch.setattr(bootstrap.time, "sleep", lambda _s: None)
+    snapshots = []
+
+    class Watcher(FakeLauncher):
+        def poll(self):
+            snapshots.append(store_of(tree).load())    # what state looks like mid-session
+            return super().poll()
+
+    calls = []
+
+    def popen(cmd, cwd=None, env=None):
+        calls.append([str(c) for c in cmd])
+        if len(calls) == 1:                            # the candidate's own session
+            return Watcher(env, healthy=True, polls=3,
+                           exit_code=bootstrap.EXIT_APP_FAILURE, revoke=True)
+        return FakeLauncher(env, healthy=True)         # the v1 relaunch afterwards
+
+    bootstrap.start_app(paths_of(tree), [], notify=lambda *a: None, popen=popen)
+
+    assert len(snapshots) >= 3                         # we really did watch it run
+    assert all(s.current == "v2" and s.candidate == "v2" and s.last_known_good == "v1"
+               for s in snapshots), "state was mutated while the app was still up"
+
+
+def test_a_clean_exit_with_the_marker_still_there_commits_the_candidate(tree, monkeypatch):
+    """The other side of the line: the user used the app and closed the window. THAT
+    is what proves a version, and it must still commit it as last-known-good."""
+    arm_candidate(tree)
+    monkeypatch.setattr(bootstrap.time, "sleep", lambda _s: None)
+    popen = popen_factory([dict(healthy=True, exit_code=bootstrap.EXIT_OK)])
+
+    assert bootstrap.start_app(paths_of(tree), [], notify=lambda *a: None,
+                               popen=popen) == 0
+    assert len(popen.calls) == 1                       # nothing was rolled back
+
+    final = store_of(tree).load()
+    assert final.last_known_good == "v2" and final.candidate is None
+    assert final.current == "v2" and final.failed_versions == []
+
+
+def test_a_clean_exit_that_never_showed_a_marker_is_still_a_failure(tree, monkeypatch):
+    """Exit 0 with no marker: nothing ever came up. A 0 here is a lie, and committing
+    on it would make a version that cannot even open a window last-known-good."""
+    arm_candidate(tree)
+    monkeypatch.setattr(bootstrap.time, "sleep", lambda _s: None)
+    popen = popen_factory([dict(healthy=False, exit_code=bootstrap.EXIT_OK),
+                           dict(healthy=True)])
+
+    assert bootstrap.start_app(paths_of(tree), [], notify=lambda *a: None,
+                               popen=popen) == 0
+    final = store_of(tree).load()
+    assert final.current == "v1" and final.is_failed("v2")
+    assert final.last_known_good == "v1"
+
+
+def test_killing_a_working_app_from_task_manager_does_not_blame_the_version(
+        tree, monkeypatch, capsys):
+    """Our launcher only ever chooses 3, 4 or 5. An UNKNOWN non-zero code (1 is what
+    Task Manager's End Task leaves behind) after a healthy window means something
+    OUTSIDE ended the process — a kill, a power event, a hard crash of the shell.
+
+    failed_versions is a destructive, sticky verdict: the background updater refuses
+    to re-stage anything in it, and only --clear-failed takes it back out. 'The user
+    killed a window that had been up and working' is not evidence against the build,
+    so we do not spend it. Nor do we commit: it was not a clean exit, so the LKG
+    promotion has not been earned — the version stays ON TRIAL."""
+    arm_candidate(tree)                                # v1 = LKG, v2 = pending
+    monkeypatch.setattr(bootstrap.time, "sleep", lambda _s: None)
+    notified = []
+    popen = popen_factory([dict(healthy=True, exit_code=1, revoke=False)])
+
+    code = bootstrap.start_app(paths_of(tree), [], notify=lambda *a: notified.append(a),
+                               popen=popen)
+    assert code == 1
+    assert len(popen.calls) == 1                       # nothing was rolled back
+
+    final = store_of(tree).load()
+    assert not final.is_failed("v2")                   # NOT blamed…
+    assert final.failed_versions == []
+    assert final.current == "v2"                       # …not rolled back…
+    assert final.candidate == "v2"                     # …still on trial…
+    assert final.last_known_good == "v1"               # …and NOT promoted either
+    assert notified == []                              # no false 「已恢復前一版本」
+
+    out = capsys.readouterr().out
+    assert "非正常結束" in out and "工作管理員" in out   # one honest line about it
+    assert "沒有把它標記為失敗" in out
+    out.encode("cp950")
+
+
+def test_an_unknown_exit_from_a_window_that_never_came_up_is_still_the_versions_fault(
+        tree, monkeypatch):
+    """The other half of the same rule: an unknown code with NO marker means the app
+    died before it could even open a window. We cannot prove that was environmental,
+    and it is exactly what a bad build looks like — so it is still a 3."""
+    arm_candidate(tree)
+    monkeypatch.setattr(bootstrap.time, "sleep", lambda _s: None)
+    popen = popen_factory([dict(healthy=False, exit_code=1), dict(healthy=True)])
+
+    assert bootstrap.start_app(paths_of(tree), [], notify=lambda *a: None,
+                               popen=popen) == 0
+    assert len(popen.calls) == 2                       # rolled back and relaunched
+    final = store_of(tree).load()
+    assert final.current == "v1" and final.is_failed("v2")
+
+
+def test_unknown_failure_classification():
+    """3/4/5 are OUR launcher's verdicts; anything else came from outside it."""
+    assert bootstrap.is_unknown_failure(1)             # Task Manager / hard crash
+    assert bootstrap.is_unknown_failure(-1073741819)   # access violation
+    for known in (bootstrap.EXIT_OK, bootstrap.EXIT_APP_FAILURE,
+                  bootstrap.EXIT_VERSION_INTEGRITY, bootstrap.EXIT_SHELL_ENVIRONMENT):
+        assert not bootstrap.is_unknown_failure(known)
+
+
+def test_an_environment_exit_after_a_marker_still_blames_nobody(tree, monkeypatch):
+    """Exit 5 is the machine, not the version — and that stays true whether or not a
+    window managed to come up first."""
+    arm_candidate(tree)
+    monkeypatch.setattr(bootstrap.time, "sleep", lambda _s: None)
+    popen = popen_factory([dict(healthy=True, revoke=True,
+                                exit_code=bootstrap.EXIT_SHELL_ENVIRONMENT)])
+
+    code = bootstrap.start_app(paths_of(tree), [], notify=lambda *a: None, popen=popen)
+    assert code == bootstrap.EXIT_SHELL_ENVIRONMENT
+    assert len(popen.calls) == 1                       # no rollback, no relaunch
+    final = store_of(tree).load()
+    assert final.current == "v2" and final.candidate == "v2"   # still unproven
+    assert final.failed_versions == [] and final.last_known_good == "v1"
+
+
+# ── first-boot verification is not a hang (S4) ───────────────────────────────
+
+def test_first_boot_prints_progress_instead_of_hashing_500_mb_in_silence(
+        tree, monkeypatch, capsys):
+    """ensure_verified() takes a progress callback and bootstrap passed None, so the
+    first start on a factory machine deep-verified the whole shared runtime with ZERO
+    output — minutes of a black window, indistinguishable from a hang, on the one
+    occasion the user has never seen the product before."""
+    integrity.remove_complete(tree / "deps" / "runtimes" / FP1)   # never deep-verified
+    monkeypatch.setattr(bootstrap.time, "sleep", lambda _s: None)
+    popen = popen_factory([dict(healthy=True)])
+
+    assert bootstrap.start_app(paths_of(tree), [], notify=lambda *a: None,
+                               popen=popen) == 0
+
+    out = capsys.readouterr().out
+    assert "正在驗證共用元件" in out
+    assert "(2/2)" in out                       # x of y (python.exe + Lib/os.py), not a spinner
+    assert runtime_store.RuntimeStore(tree / "deps").is_complete(FP1)
+    out.encode("cp950")                         # a zh-TW console can print it
+
+
+def test_verify_progress_proves_life_without_scrolling_the_console():
+    """A real runtime is ~12 000 files. One line per file is not progress, it is a
+    denial of service on the console — and the LAST line must always land on y/y."""
+    ticks = iter(0.1 * i for i in range(100000))
+    sink = io.StringIO()
+    progress = bootstrap.VerifyProgress(1000, out=sink, clock=lambda: next(ticks))
+    for i in range(1000):
+        progress(f"Lib/site-packages/mod{i}.py")
+
+    lines = [line for line in sink.getvalue().splitlines() if line.strip()]
+    assert 3 <= len(lines) <= 120               # alive, not a waterfall
+    assert "(1000/1000)" in lines[-2]           # the final count is exact
+    sink.getvalue().encode("cp950")
+
+
+def test_verify_progress_is_not_built_for_an_already_verified_runtime(tree):
+    """Every start after the first must not even read files.json to build a callback
+    it will never call."""
+    rstore = runtime_store.RuntimeStore(tree / "deps")
+    assert bootstrap._verify_progress(rstore, FP1) is None      # .complete already
+    integrity.remove_complete(tree / "deps" / "runtimes" / FP1)
+    assert bootstrap._verify_progress(rstore, FP1).total == 2
 
 
 def test_exit_code_classification():
@@ -999,6 +1250,191 @@ def test_gc_reports_trees_it_could_not_delete_instead_of_claiming_the_space(
     assert "刪不掉" in text and str(orphan) in text
     assert "實際回收合計" not in text                # nothing was reclaimed
     assert "App 完全關掉" in text                    # what to DO
+    text.encode("cp950")
+
+
+# ── GC: four different failures used to exit 2 (S9) ──────────────────────────
+#
+# "I deleted 3 of the 5 trees, 2 are still open in the App" and "I could not take
+# the store lock and did nothing at all" exited identically, so tools\gc.bat had
+# exactly one story to tell — 「沒有刪掉任何東西」 — and it was false for every
+# partial run, and it blamed the store lock for a problem that was not the lock.
+
+def gc_main(tree, monkeypatch, argv):
+    """gc.main() against a temp store — the real operator entry point."""
+    monkeypatch.setattr(gc_mod, "_store_root", lambda: Path(tree))
+    return gc_mod.main(argv)
+
+
+def make_app(root: Path, app_id: str, versions: dict, *, current: str) -> None:
+    """A second app in the same store: {version: runtime_fingerprint}."""
+    for version, fingerprint in versions.items():
+        build_version(Path(root) / "apps" / app_id / "versions" / version,
+                      version, fingerprint, app=app_id, body=version)
+    state.StateStore(Path(root) / "apps" / app_id / "state").initialize(app_id, current)
+
+
+def test_gc_partial_delete_is_not_reported_as_nothing_deleted(tree, monkeypatch, capsys):
+    """Three trees went, one would not. Reporting that as 「沒有刪掉任何東西」 (and
+    exiting the same code as a lock failure) is false twice over."""
+    gone = build_runtime(tree, FP2)
+    stuck = build_runtime(tree, FP3)
+    real_rmtree = gc_mod.shutil.rmtree
+
+    def rmtree(path, *a, **kw):
+        if Path(path) == stuck:
+            raise PermissionError(32, "the file is in use by another process")
+        return real_rmtree(path, *a, **kw)
+
+    monkeypatch.setattr(gc_mod.shutil, "rmtree", rmtree)
+
+    code = gc_main(tree, monkeypatch, ["--apply"])
+    assert code == gc_mod.EXIT_PARTIAL
+    assert code not in (gc_mod.EXIT_OK, gc_mod.EXIT_NOTHING_DELETED,
+                        gc_mod.EXIT_STORE_LOCKED, gc_mod.EXIT_ABORTED)
+    assert not gone.exists() and stuck.is_dir()        # the truth on disk
+
+    captured = capsys.readouterr()
+    text = captured.out + captured.err
+    assert f"已刪除 runtime {FP2}" in text             # what DID happen
+    assert FP3 in text and "檔案使用中" in text        # which tree survived, and why
+    assert "App 完全關掉" in text                      # what to do about it
+    text.encode("cp950")
+
+
+def test_gc_that_could_not_delete_a_single_tree_has_its_own_exit_code(
+        tree, monkeypatch, capsys):
+    orphan = build_runtime(tree, FP2)
+
+    def in_use(_path, *_a, **_kw):
+        raise PermissionError(32, "the file is in use by another process")
+
+    monkeypatch.setattr(gc_mod.shutil, "rmtree", in_use)
+
+    code = gc_main(tree, monkeypatch, ["--apply"])
+    assert code == gc_mod.EXIT_NOTHING_DELETED
+    assert code != gc_mod.EXIT_PARTIAL
+    assert orphan.is_dir()
+    err = capsys.readouterr().err
+    assert "一項都沒有刪掉" in err
+    err.encode("cp950")
+
+
+def test_a_gc_that_never_took_the_store_lock_is_not_a_failed_delete(
+        tree, monkeypatch, capsys):
+    """An update is downloading: GC did not scan, did not try, did not fail to
+    delete anything. It is not the same event as 'the App is still open', and it
+    must not report — or exit — as if it were."""
+    build_runtime(tree, FP2)
+    real_acquire = locks.FileLock.acquire
+    monkeypatch.setattr(  # 30s of default timeout is not worth a green test
+        locks.FileLock, "acquire",
+        lambda self, timeout=0.4, poll=0.05: real_acquire(self, timeout, poll))
+
+    held = locks.store_gc_lock(tree / "deps").acquire(timeout=5)
+    try:
+        code = gc_main(tree, monkeypatch, ["--apply"])
+    finally:
+        held.release()
+
+    assert code == gc_mod.EXIT_STORE_LOCKED
+    assert code not in (gc_mod.EXIT_PARTIAL, gc_mod.EXIT_NOTHING_DELETED,
+                        gc_mod.EXIT_ABORTED)
+    assert (tree / "deps" / "runtimes" / FP2).is_dir()     # untouched, unscanned
+    err = capsys.readouterr().err
+    assert "連掃描都沒有做" in err and "沒有刪除任何東西" in err
+    err.encode("cp950")
+
+
+def test_gc_refusing_up_front_is_reported_as_nothing_deleted_never_as_partial(
+        tree, monkeypatch, capsys):
+    """GC aborted before touching a single tree. Zero bytes came back — so it must
+    NOT exit the code that means 「有些刪掉了,有些還在用」."""
+    build_runtime(tree, FP2)
+    code = gc_main(tree, monkeypatch, ["--apply", "--app", "nosuchapp"])
+
+    assert code == gc_mod.EXIT_ABORTED == gc_mod.EXIT_NOTHING_DELETED
+    assert code not in (gc_mod.EXIT_OK, gc_mod.EXIT_PARTIAL, gc_mod.EXIT_STORE_LOCKED)
+    assert (tree / "deps" / "runtimes" / FP2).is_dir()     # nothing was deleted
+    err = capsys.readouterr().err
+    assert "找不到 app" in err and "一項都沒有刪" in err
+    err.encode("cp950")
+
+
+def test_gc_exit_codes_are_the_ones_the_generated_bat_actually_branches_on():
+    """A CONTRACT across two modules: gc.py produces these numbers, store_builder
+    bakes them into tools\\gc.bat. Renumber one side and the bat cheerfully prints
+    「部分回收…已經刪掉的不會再刪一次」 for a run that deleted nothing at all — the
+    exact class of lie the separate codes were introduced to kill."""
+    from provision_builder.streamlit_desktop import store_builder
+
+    assert gc_mod.EXIT_OK == store_builder.GC_EXIT_OK
+    assert gc_mod.EXIT_PARTIAL == store_builder.GC_EXIT_PARTIAL
+    assert gc_mod.EXIT_NOTHING_DELETED == store_builder.GC_EXIT_NOTHING
+    assert gc_mod.EXIT_STORE_LOCKED == store_builder.GC_EXIT_LOCKED
+    # …and they must stay distinguishable from each other, which was the whole point.
+    assert len({gc_mod.EXIT_OK, gc_mod.EXIT_PARTIAL, gc_mod.EXIT_NOTHING_DELETED,
+                gc_mod.EXIT_STORE_LOCKED}) == 4
+
+
+def test_gc_can_scope_a_reclaim_to_one_app_and_says_which_apps_it_looked_at(
+        tree, monkeypatch, capsys):
+    """S9. gc.py had no --app at all, so on a two-app store an operator who wanted
+    to reclaim one app's old versions could only reclaim BOTH apps' — or neither."""
+    make_version(tree, "v0", body="zero")                      # demo's garbage
+    build_runtime(tree, FP2)
+    make_app(tree, "other", {"v1": FP2, "vold": FP2}, current="v1")
+
+    code = gc_main(tree, monkeypatch, ["--apply", "--app", APP])
+    assert code == gc_mod.EXIT_OK
+    assert not (tree / "apps" / APP / "versions" / "v0").exists()     # in scope
+    assert (tree / "apps" / "other" / "versions" / "vold").is_dir()   # out of scope
+
+    out = capsys.readouterr().out
+    assert "掃描的 app:demo、other" in out      # both were considered…
+    assert "不動的 app:other" in out            # …and it says which one it left alone
+    out.encode("cp950")
+
+
+def test_a_scoped_reclaim_never_deletes_the_runtime_another_apps_tree_still_needs(
+        tree, monkeypatch):
+    """The trap under --app: no SLOT of any app names FP3, but the other app's
+    leftover version tree does — and a scoped run is not deleting that tree. Freeing
+    the shared runtime under it would leave an intact-looking version that cannot
+    start, and that --rollback-to would happily offer."""
+    build_runtime(tree, FP2)
+    build_runtime(tree, FP3)
+    make_app(tree, "other", {"v1": FP2, "vold": FP3}, current="v1")
+
+    plan = gc_mod.run_gc(tree, apps=[APP], apply=True, log=lambda *_a: None)
+    assert not plan.delete_runtimes
+    assert (tree / "deps" / "runtimes" / FP3).is_dir()      # other/vold still points at it
+
+    # …and a FULL run still reclaims both together: the version tree AND its runtime.
+    gc_mod.run_gc(tree, apply=True, log=lambda *_a: None)
+    assert not (tree / "apps" / "other" / "versions" / "vold").exists()
+    assert not (tree / "deps" / "runtimes" / FP3).exists()
+
+
+def test_gc_prints_why_each_version_is_kept(tree, capsys):
+    """plan.keep_versions was computed on every run and printed on none of them. The
+    operator's first question when GC frees less than they expected is 「為什麼那個
+    版本還在?」 — and the answer was sitting in memory, unsaid."""
+    make_version(tree, "v2", body="two")
+    store_of(tree).mutate(state.commit_candidate)                  # v1 = LKG
+    store_of(tree).mutate(lambda s: state.set_pending(s, "v2"))
+    lease = leases.create_lease(paths_of(tree).data_dir / "leases", app_id=APP,
+                                version="v1", runtime_fingerprint=FP1)
+    lines: list[str] = []
+    try:
+        gc_mod.run_gc(tree, apply=False, log=lines.append)
+    finally:
+        lease.release()
+
+    text = "\n".join(lines)
+    assert f"{APP}/v1:目前版本" in text          # …and every other reason it is pinned
+    assert "LKG" in text and "正在執行中" in text
+    assert f"{APP}/v2:待套用的更新" in text
     text.encode("cp950")
 
 

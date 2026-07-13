@@ -17,21 +17,57 @@ SCHEMA_VERSION = 1
 DEFAULT_PREFERRED_PORT = 0
 DEFAULT_STARTUP_TIMEOUT = 60
 
-# Directories that are never part of a deliverable: build machine state, caches,
-# virtualenvs that would be wrong on the user's machine anyway, and the build
-# artifacts of the project itself. `wheels`/`wheelhouse`/`vendor` are the big
-# ones: CV_Viewer's wheelhouse alone was 124 MB of .whl files that the user's
-# machine would never open — the dependencies are already installed into the
-# packaged runtime.
-EXCLUDED_DIRS = (
+# Directories that are never part of a deliverable — split by DEPTH, because a
+# bare name means two different things depending on where it sits.
+#
+# The rule, and the reason for it:
+#
+#   ANY DEPTH  — only names that cannot possibly BE the application. Every one of
+#   these is either machine state (a VCS database, a virtualenv full of absolute
+#   paths from the build box), a regenerable tool cache, or an install tree the
+#   packaged runtime already replaces. None of them is ever read at run time by a
+#   packaged Streamlit app, and none of them is a name a Python package can carry
+#   (a leading dot or a hyphen is not an importable identifier; `__pycache__` is
+#   reserved by CPython; nothing in a Python app opens `node_modules`). Dropping
+#   one of these at depth cannot break an app — it can only make the package
+#   smaller, which is the whole point: AI4BI's component carries a 200 MB nested
+#   `node_modules/` that exists only to BUILD its frontend.
+#
+#   ROOT ONLY  — names that mean "the project's own build junk" at the project
+#   root and mean something completely different one level down. `dist/` is the
+#   case that cost us a delivered app: a Streamlit custom component ships its
+#   COMPILED frontend in `<component>/frontend/dist/` and points
+#   `components.declare_component(path=...)` straight at it. AI4BI's
+#   `ai4bi/ui/components/field_well/frontend/dist/` IS the component. Deleting it
+#   by name, at any depth, built a package that ran, reported success, and
+#   rendered a blank box where the component should have been. Same story for
+#   `build/` (a legitimate subpackage name), `vendor/` (vendored SOURCE that gets
+#   imported), `wheels`/`wheelhouse` (a package's data directory), and
+#   `venv`/`env` (`config/env/` is a normal thing to have). At the root they are
+#   unambiguously the operator's own junk — CV_Viewer's root `wheels/` alone was
+#   124 MB of .whl files the user's machine would never open. One level down we
+#   have no business guessing, so we keep them: a package that is too big is a
+#   complaint, a package that is missing its component is a broken delivery.
+EXCLUDED_DIRS_ANY_DEPTH = (
     ".git", ".hg", ".svn",
-    ".venv", "venv", "env",
+    ".venv",
     "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
-    "node_modules",
     ".streamlit_cache",
-    "wheels", "wheelhouse", "vendor",
-    "dist", "build", "site-packages",
+    "node_modules",
+    "site-packages",
 )
+
+EXCLUDED_DIRS_ROOT_ONLY = (
+    "venv", "env",
+    "wheels", "wheelhouse", "vendor",
+    "dist", "build",
+)
+
+# Kept as the union so `x in EXCLUDED_DIRS` still answers "is this name ever junk"
+# for the callers that only need a cheap name filter (imports.py's local-module
+# walk). The DEPTH-aware decision lives in builder.ignore_reason() and nowhere
+# else — that is the one that decides what travels.
+EXCLUDED_DIRS = EXCLUDED_DIRS_ANY_DEPTH + EXCLUDED_DIRS_ROOT_ONLY
 
 # Build-time artifacts that a running app never reads. Archives are here for the
 # same reason as the wheelhouse: a 200 MB dataset.zip beside the app is payload
@@ -77,6 +113,15 @@ class BuildRequest:
     # [project.optional-dependencies] groups the admin opted in, e.g. ("llm",).
     # Only meaningful when the deps come from pyproject: a lock file is the truth.
     extras: tuple[str, ...] = ()
+    # The WebView2 offline installer (MicrosoftEdgeWebview2Setup.exe, or the
+    # standalone x64 runtime installer). Set it and build() copies it into
+    # <package>/prereq/, which is the ONLY place tools\安裝WebView2.bat looks.
+    # Leave it None and the build still succeeds — but it emits a warning saying
+    # so, because the package we just handed the operator cannot start on an
+    # air-gapped machine that lacks WebView2, and that machine is the whole point
+    # of shipping a folder instead of a URL. Nothing else in the tree ever
+    # CREATES prereq/: the store builder only copies one if it already exists.
+    webview2_installer: Path | None = None
 
     def __post_init__(self) -> None:
         self.project_dir = Path(self.project_dir).expanduser().resolve()
@@ -86,6 +131,8 @@ class BuildRequest:
         self.runtime_template = Path(self.runtime_template).expanduser().resolve()
         if self.requirements is not None:
             self.requirements = Path(self.requirements).expanduser().resolve()
+        if self.webview2_installer is not None:
+            self.webview2_installer = Path(self.webview2_installer).expanduser().resolve()
         self.extra_excludes = tuple(self.extra_excludes)
         self.extras = tuple(self.extras)
 

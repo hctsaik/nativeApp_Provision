@@ -4,12 +4,44 @@ Per start (spec §8.1):
     promote pending (verify first; quarantine on failure)
   → deep-verify the runtime on its first use
   → lease → spawn the CURRENT version's launcher with the CORRECT runtime
-  → commit candidate→LKG when the launcher signals health
-  → if a candidate dies before ever being healthy: roll back and relaunch once.
+  → commit candidate→LKG when the launcher EXITS CLEANLY, still healthy
+  → if a candidate dies: roll back and relaunch once.
 
 Runs under ANY runtime found in deps/ (all modules stdlib-only); the app itself
 always runs under the runtime its manifest names. Never touches a running
 instance; never scans process names.
+
+
+WHAT COMMITS A CANDIDATE TO last-known-good
+===========================================
+The healthy marker APPEARING is not the commit signal. The launcher writes it
+once its window has survived ~12 seconds — but the Streamlit app script only
+runs when the user presses Start, minutes later. A version that then dies takes
+the launcher down with it (_revoke_marker deletes the marker, exit 3), and the
+old code had already latched it as last_known_good the moment the marker showed
+up. The broken build was the machine's idea of "the version to fall back to",
+and the post-exit rollback never fired because commit_candidate() had cleared
+`candidate`. Tomorrow morning it starts, breaks, and is STILL last-known-good.
+
+The commit signal is the process EXITING CLEANLY with the marker still present:
+
+    marker after exit | exit code | what happens to state
+    ------------------+-----------+---------------------------------------------
+    present           | 0         | commit candidate -> last_known_good
+    absent            | 0         | never came up (or the launcher revoked the
+                      |           | marker on its way out) -> treated as 3
+    either            | 3 / 4     | fail_candidate + roll back to the resolved
+                      |           | target, marker or no marker
+    never seen        | other !=0 | it never came up: treated as 3 (fail + roll back)
+    SEEN              | other !=0 | NOTHING. Something outside our launcher ended a
+                      |           | working window (Task Manager, a power event, a
+                      |           | hard crash of the shell). Not committed either —
+                      |           | it was not a clean exit — so the version stays
+                      |           | ON TRIAL and gets to prove itself next launch.
+    either            | 5         | NOTHING. Not the version's fault.
+
+A marker seen mid-session is only ever *recorded* (it starts the background
+update check, which is what it is genuinely evidence for: a window that came up).
 
 
 LAUNCHER EXIT-CODE CONTRACT (bootstrap <-> launcher/launch.py)
@@ -41,9 +73,21 @@ DO about it. That is why runtime_store raises SharedComponentError for a missing
 or corrupt SHARED tree: the shell and the runtime belong to the machine, not to
 the version that happened to trip over them.
 
-Any other non-zero code (a hard crash, an access violation, a code we have never
-heard of) is treated as 3: we cannot prove it is environmental, and the app dying
-without ever reaching a healthy state is what a bad version looks like.
+Any other non-zero code did NOT come out of our launcher's decision logic — 3, 4
+and 5 are the only failures it ever chooses. An unknown code means something
+OUTSIDE ended the process: Task Manager, a power event, a hard crash of the shell.
+What we do with it depends on the one piece of evidence we have, the marker:
+
+  * marker NEVER seen — nothing ever came up. We cannot prove it was environmental,
+    and an app that dies before it can even open a window is what a bad version
+    looks like. Treat it as 3: fail the candidate and roll back.
+  * marker SEEN — a window came up, stood for its 12 seconds, and was then killed
+    from outside. That is NOT evidence against the build. Marking a version failed
+    is destructive and STICKY: the background updater then refuses to re-stage it,
+    and the operator has to run --clear-failed to undo. We only pay that price on
+    evidence we actually have. So: no fail_candidate, no rollback — and no commit
+    either, because it was not a clean exit and the LKG promotion has not been
+    earned. The version stays the candidate and gets another chance next launch.
 """
 
 from __future__ import annotations
@@ -65,6 +109,7 @@ import subprocess
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -110,8 +155,40 @@ def is_environment_failure(code: int) -> bool:
 
 
 def is_version_failure(code: int) -> bool:
-    """True when this version is the suspect: 3, 4, and any unknown non-zero code."""
+    """True when this version COULD be the suspect: 3, 4, and any unknown non-zero.
+
+    "Could". For an unknown code, whether it actually IS the suspect depends on the
+    marker (see is_unknown_failure and the module docstring): a window that came up
+    and was then killed from outside is not evidence against the build.
+    """
     return code != EXIT_OK and not is_environment_failure(code)
+
+
+def is_unknown_failure(code: int) -> bool:
+    """Non-zero, and NOT a code our launcher would ever choose.
+
+    launch.py owns 3 (the app died), 4 (this version's tree is wrong) and 5 (the
+    machine is broken); anything else — 1 from Task Manager, an access violation,
+    a code we have never heard of — means the process was ended by something
+    OUTSIDE our decision logic. It is the only class of failure whose meaning
+    depends on whether a healthy window was ever seen.
+    """
+    return code not in (EXIT_OK, EXIT_APP_FAILURE, EXIT_VERSION_INTEGRITY,
+                        EXIT_SHELL_ENVIRONMENT)
+
+
+@dataclass(frozen=True)
+class LaunchOutcome:
+    """What one launcher session actually did — the exit code AND the evidence.
+
+    start_app cannot decide an unknown non-zero code from the number alone: an
+    app that never opened a window is a broken build, and an app that ran for two
+    hours and was killed from Task Manager is not. Only run_version watches the
+    marker, so the evidence has to travel back with the code.
+    """
+    code: int
+    marker_seen: bool = False       # a healthy window came up at some point
+    marker_at_exit: bool = False    # …and was still healthy when the process ended
 
 
 _SHELL_ENVIRONMENT_HELP = (
@@ -146,6 +223,67 @@ def _report_shared_component(paths: paths_mod.AppPaths, exc: SharedComponentErro
 
 # ── pending promotion (spec §8.1 top half) ───────────────────────────────────
 
+class VerifyProgress:
+    """「正在驗證共用元件…(x/y)」 while ensure_verified() hashes the shared runtime.
+
+    First boot on a factory machine deep-verifies ~500 MB of python-build-standalone
+    + site-packages. With progress=None that is a black window for minutes, on the
+    one occasion the user has never seen the product before — indistinguishable from
+    a hang. They power-cycle the PC, and now the verification restarts from zero.
+
+    Throttled: a 12 000-file runtime must prove it is alive, not scroll the console.
+    Printing can never break the run (cp950 consoles cannot encode everything, and a
+    dead stdout must not cost the user their app), so _emit swallows what it cannot say.
+    """
+
+    INTERVAL = 1.0        # seconds between lines: enough to prove life, not spam
+
+    def __init__(self, total: int = 0, *, out=None, clock=time.monotonic):
+        self.total = max(int(total), 0)
+        self.done = 0
+        self._out = out
+        self._clock = clock
+        self._last = 0.0
+
+    def _emit(self, message: str) -> None:
+        try:
+            print(message, file=self._out or sys.stdout, flush=True)
+        except (UnicodeEncodeError, OSError, ValueError):
+            pass
+
+    def __call__(self, _rel: str) -> None:
+        self.done += 1
+        if self.done == 1:
+            self._emit("[bootstrap] 正在驗證共用元件(第一次啟動要逐檔檢查,請稍候,不要關掉視窗)…")
+        now = self._clock()
+        final = bool(self.total) and self.done >= self.total
+        if not final and (now - self._last) < self.INTERVAL:
+            return
+        self._last = now
+        counted = f"{self.done}/{self.total}" if self.total else f"{self.done}"
+        self._emit(f"  正在驗證共用元件…({counted})")
+        if final:
+            self._emit("[bootstrap] 共用元件驗證完成,正在啟動…")
+
+
+def _verify_progress(rstore: RuntimeStore, fingerprint: str) -> VerifyProgress | None:
+    """A progress callback ONLY when a deep verification is actually going to run.
+
+    is_complete() is the same gate ensure_verified() uses, so an already-verified
+    runtime (every start after the first) costs one stat() and prints nothing.
+    """
+    try:
+        if rstore.is_complete(fingerprint):
+            return None
+        manifest = integrity.load_files_json(rstore.path_for(fingerprint))
+        total = len(manifest.get("files") or [])
+    except (integrity.IntegrityError, RuntimeStoreError, OSError, ValueError):
+        # No file count available (a missing/corrupt files.json is ensure_verified's
+        # problem to report, not ours) — count up instead of counting down.
+        return VerifyProgress(0)
+    return VerifyProgress(total)
+
+
 def promote_if_pending(paths: paths_mod.AppPaths, store: state_mod.StateStore,
                        rstore: RuntimeStore) -> state_mod.AppState:
     """One locked critical section: load → verify pending → flip or quarantine."""
@@ -157,8 +295,12 @@ def promote_if_pending(paths: paths_mod.AppPaths, store: state_mod.StateStore,
         problems = paths_mod.verify_version(paths, current.pending, deep=True)
         if not problems:
             manifest = paths_mod.load_manifest(paths.version_dir(current.pending))
+            fingerprint = manifest["runtime_fingerprint"]
             try:
-                rstore.ensure_verified(manifest["runtime_fingerprint"])
+                # An update that ships a NEW runtime deep-verifies it here — the
+                # same minutes of silence as a first boot, so the same progress.
+                rstore.ensure_verified(fingerprint,
+                                       progress=_verify_progress(rstore, fingerprint))
             except SharedComponentError as exc:
                 # The SHARED runtime is missing/corrupt — that says nothing about
                 # the pending version's own tree, which just verified byte for
@@ -205,10 +347,32 @@ def _launch_env(paths: paths_mod.AppPaths, marker: Path, shell_exe: Path | None)
     return env
 
 
+def commit_if_still_candidate(store: state_mod.StateStore, version: str) -> bool:
+    """candidate → last_known_good, but only if `version` is still THE candidate.
+
+    Re-read under the lock: while the app was open (hours), another process may
+    have rolled back, promoted, or already resolved this candidate. Committing
+    blind would set last_known_good=current for whatever `current` had become.
+    """
+    def commit(state: state_mod.AppState) -> state_mod.AppState:
+        if state.candidate != version or state.current != version:
+            return state
+        return state_mod.commit_candidate(state)
+
+    before = store.load()
+    if before.candidate != version or before.current != version:
+        log.info("不提交 %s:它已經不是 candidate(current=%s candidate=%s)",
+                 version, before.current, before.candidate)
+        return False
+    store.mutate(commit)
+    log.info("乾淨結束且健康:%s 已成為 last-known-good", version)
+    return True
+
+
 def run_version(paths: paths_mod.AppPaths, store: state_mod.StateStore,
                 rstore: RuntimeStore, version: str, launcher_args: list[str], *,
                 is_candidate: bool, notify=None,
-                popen=subprocess.Popen) -> int:
+                popen=subprocess.Popen) -> LaunchOutcome:
     # Resolved at call time, not bound as a default: a default freezes the real
     # MessageBox into the signature, where no test can get at it.
     notify = notify or notifications.notify
@@ -220,7 +384,7 @@ def run_version(paths: paths_mod.AppPaths, store: state_mod.StateStore,
     fingerprint = manifest["runtime_fingerprint"]
 
     log.info("驗證 runtime %s(首次啟動會逐檔檢查,可能需要幾分鐘)…", fingerprint)
-    rstore.ensure_verified(fingerprint, progress=None)
+    rstore.ensure_verified(fingerprint, progress=_verify_progress(rstore, fingerprint))
 
     shell_exe = None
     if manifest.get("shell_fingerprint"):
@@ -231,7 +395,6 @@ def run_version(paths: paths_mod.AppPaths, store: state_mod.StateStore,
     marker = paths.data_dir / "tmp" / f"healthy-{uuid.uuid4().hex}"
     lease = leases.create_lease(paths.data_dir / "leases", app_id=paths.app_id,
                                 version=version, runtime_fingerprint=fingerprint)
-    committed = not is_candidate
     updater_started = False
     try:
         proc = popen(
@@ -241,14 +404,15 @@ def run_version(paths: paths_mod.AppPaths, store: state_mod.StateStore,
         )
         log.info("launcher 已啟動 pid=%s(版本 %s)", proc.pid, version)
 
-        healthy = False
+        # The marker appearing is NOT the commit signal — see the module docstring.
+        # All it proves is that a window came up, which is exactly what the update
+        # check needs to know and nothing more. RECORD it; mutate no state.
+        marker_seen = False
         while proc.poll() is None:
-            if not healthy and marker.exists():
-                healthy = True
-                if not committed:
-                    store.mutate(state_mod.commit_candidate)
-                    committed = True
-                    log.info("health check 通過:%s 已成為 last-known-good", version)
+            if not marker_seen and marker.exists():
+                marker_seen = True
+                log.info("healthy marker 出現:%s 的視窗起來了"
+                         "(尚未提交為 last-known-good:要等乾淨結束)", version)
                 if not updater_started:
                     updater_started = True
                     threading.Thread(
@@ -257,14 +421,35 @@ def run_version(paths: paths_mod.AppPaths, store: state_mod.StateStore,
                         kwargs={"notify": notify, "log": log},
                     ).start()
             time.sleep(0.5)
-        healthy = healthy or marker.exists()
+
         code = proc.returncode
-        log.info("launcher 結束 code=%s healthy=%s", code, healthy)
-        if healthy:
-            return code
-        # Died without ever becoming healthy. A 0 here is a lie the caller must
-        # not act on (nothing ever came up), so call it what it is: an app failure.
-        return code if code != EXIT_OK else EXIT_APP_FAILURE
+        # Re-read the marker AFTER the exit: the launcher deletes it (_revoke_marker)
+        # when the app it was hosting dies, so its presence here — together with a
+        # clean exit — is the only evidence that this version actually worked.
+        marker_now = marker.exists()
+        log.info("launcher 結束 code=%s marker=%s(啟動途中曾經健康=%s)",
+                 code, marker_now, marker_seen)
+
+        seen = LaunchOutcome(code, marker_seen=marker_seen, marker_at_exit=marker_now)
+        if code == EXIT_OK and marker_now:
+            if is_candidate:
+                commit_if_still_candidate(store, version)
+            return seen
+        if code == EXIT_OK:
+            # Exit 0 with no marker: it never came up, or it came up and then the
+            # app died and the launcher revoked the marker. Either way nothing
+            # proved healthy, and a 0 here is a lie the caller must not act on.
+            log.warning("launcher exit 0 但 marker 不在(曾經出現過=%s):"
+                        "視為 app 啟動失敗", marker_seen)
+            return LaunchOutcome(EXIT_APP_FAILURE, marker_seen=marker_seen,
+                                 marker_at_exit=marker_now)
+        # Non-zero. 3 and 4 blame the version and 5 blames the machine, marker or
+        # no marker — a version that came up and THEN died is exactly the failure
+        # the LKG latch used to hide. An unknown code is the one case the marker
+        # decides (start_app): our launcher never chose it, so something outside
+        # ended the process, and a window that was working is not evidence of a
+        # bad build.
+        return seen
     finally:
         lease.release()
         try:
@@ -338,6 +523,29 @@ def _report_environment_failure(paths: paths_mod.AppPaths, version: str, code: i
     return code
 
 
+def _report_abnormal_session(paths: paths_mod.AppPaths, version: str, code: int) -> int:
+    """A working window was ended from OUTSIDE. Blame nobody; promote nobody.
+
+    Our launcher only ever chooses 3, 4 or 5, so an unknown code after a healthy
+    window means Task Manager, a power event, or a hard crash of the shell took the
+    process down. Marking a version failed is destructive and sticky — the updater
+    then refuses to re-stage it and the operator must run --clear-failed to undo —
+    so we do not pay that price for "the user killed a window that was working".
+
+    Nor do we commit it: the session did not end cleanly, so the LKG promotion has
+    not been earned. The version stays the candidate and proves itself next launch.
+    """
+    log.warning("launcher exit %s(非我們的 launcher 會選的代碼,而且視窗曾經正常起來):"
+                "版本 %s 未被標記為失敗、未回退、也未提交為 last-known-good", code, version)
+    print(f"\n[bootstrap][注意] App 這次是「非正常結束」的(代碼 {code}),"
+          f"但它先前已經正常開啟過視窗。\n"
+          f"  常見原因:從工作管理員強制結束、電腦直接斷電、外殼當掉。\n"
+          f"  這不算 {version} 的錯:沒有把它標記為失敗,也沒有退回任何版本。\n"
+          f"  但它也還沒通過驗證(要「正常關閉視窗」才算),下次啟動會再試一次。\n"
+          f"  記錄:{paths.data_dir / 'logs'}\n", flush=True)
+    return code
+
+
 def start_app(paths: paths_mod.AppPaths, launcher_args: list[str], *,
               notify=None, popen=subprocess.Popen) -> int:
     notify = notify or notifications.notify
@@ -349,8 +557,8 @@ def start_app(paths: paths_mod.AppPaths, launcher_args: list[str], *,
     is_candidate = current_state.candidate == version
 
     try:
-        code = run_version(paths, store, rstore, version, launcher_args,
-                           is_candidate=is_candidate, notify=notify, popen=popen)
+        outcome = run_version(paths, store, rstore, version, launcher_args,
+                              is_candidate=is_candidate, notify=notify, popen=popen)
     except SharedComponentError:
         # NOT this version's fault: the shared runtime/shell belongs to the
         # machine and every version points at the same one. main() turns this
@@ -362,10 +570,12 @@ def start_app(paths: paths_mod.AppPaths, launcher_args: list[str], *,
             raise  # a stable version failing is an environment problem: fail loud
         # We could not even get to the launcher and it was NOT a shared component:
         # this version's own tree did not check out (bad manifest, files.json
-        # mismatch under versions/<ver>/). That is version-specific.
-        code = EXIT_VERSION_INTEGRITY
+        # mismatch under versions/<ver>/). That is version-specific. No launcher
+        # ever ran, so no window ever came up: no marker, no evidence, code 4.
+        outcome = LaunchOutcome(EXIT_VERSION_INTEGRITY)
         log.error("candidate %s 無法啟動:%s", version, exc)
 
+    code = outcome.code
     if code == EXIT_OK:
         return code
     if is_environment_failure(code):
@@ -374,8 +584,22 @@ def start_app(paths: paths_mod.AppPaths, launcher_args: list[str], *,
         return _report_environment_failure(paths, version, code)
     if not is_candidate:
         return code
+    if is_unknown_failure(code) and outcome.marker_seen:
+        # A working window, ended from outside our launcher (Task Manager, power
+        # cut, a hard crash of the shell). failed_versions is a destructive, sticky
+        # verdict — the updater will not re-stage a version that is in it, and only
+        # --clear-failed takes it back out — so we spend it only on evidence we
+        # actually have. This is not it. Nothing is failed, nothing is rolled back,
+        # and nothing is committed either: the version is still on trial.
+        return _report_abnormal_session(paths, version, code)
 
-    # The candidate died before ever becoming healthy: roll back once (spec §8.2).
+    # The candidate died (spec §8.2). "Died" is a version-failure exit (3, 4, or an
+    # unknown code from a session that never once came up) — NOT merely "a non-zero
+    # exit". A version whose window came up and whose app then blew up 20 minutes
+    # later, when the user pressed Start, IS a broken version and lands here; it
+    # used to become last_known_good on the strength of that marker and then skip
+    # this entire block, because commit_candidate() had cleared `candidate` and the
+    # check below therefore always fell through.
     refreshed = store.load()
     if refreshed.candidate != version:
         return code  # someone else already resolved it
@@ -391,7 +615,7 @@ def start_app(paths: paths_mod.AppPaths, launcher_args: list[str], *,
            f"詳細記錄:{paths.data_dir / 'logs'}")
     log.warning("rollback:%s 啟動失敗,改起 %s", version, target)
     return run_version(paths, store, rstore, target, launcher_args,
-                       is_candidate=False, notify=notify, popen=popen)
+                       is_candidate=False, notify=notify, popen=popen).code
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -843,7 +1067,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[bootstrap] 診斷模式:直接跑 {args.slot}={version}(不改狀態)")
             return run_version(paths, state_mod.StateStore(paths.state_dir),
                                RuntimeStore(paths.deps_dir), version, passthrough,
-                               is_candidate=False)
+                               is_candidate=False).code
 
         return start_app(paths, passthrough)
     except SharedComponentError as exc:
