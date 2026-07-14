@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -47,10 +48,15 @@ from . import builder
 # (ASCII-only, CRLF, no BOM, no paren in an echo). One mechanism, in builder.py,
 # used by both packagers — a second copy would drift, and this is not a bug you get
 # to find twice.
-from .builder import _rename_with_retry, _write_bat, bat_problems, scan_project
+from .builder import (_rename_with_retry, _rmtree_with_retry, _write_bat,
+                      bat_problems, scan_project)
 from .device import gc as gc_mod
-from .device import integrity
+from .device import integrity, locks as locks_mod
 from .device.identifiers import validate_identifier
+# hardlinks_unsupported(): the FAT/exFAT lesson, learned once in locks.py and reused
+# here rather than re-derived. A USB stick cannot do hard links, and spec §9.3 promises
+# USB sticks work.
+from .device.locks import LockTimeout, hardlinks_unsupported
 from .device.paths import MANIFEST_NAME, MANIFEST_SCHEMA, AppPaths, list_app_ids
 from .device.runtime_store import (
     BUILDER_FORMAT_VERSION,
@@ -157,8 +163,13 @@ class StoreBuildResult:
     is_first_app: bool = True          # False when the tree already had another app
     entry_bats: list[str] = field(default_factory=list)
     removed_start_bat: bool = False    # a second app deletes the generic start.bat
-    version_mb: float = 0.0
+    version_mb: float = 0.0            # how big the slot LOOKS (what `dir` reports)
     added_mb: float = 0.0              # what this build actually cost on disk
+    # Bytes an existing version slot already held, byte for byte, so this build got them
+    # for a hardlink instead of a second copy. The store layout promises that an update
+    # costs 「十幾 MB」; for an app with an 84 MB model file that was simply untrue until
+    # the slots started sharing. version_mb - deduped_mb is the part that is really new.
+    deduped_mb: float = 0.0
     duration_seconds: float = 0.0
     cancelled: bool = False            # operator pressed cancel; no debris left behind
     errors: list[str] = field(default_factory=list)
@@ -167,8 +178,10 @@ class StoreBuildResult:
     def summary(self) -> str:
         if self.ok:
             reuse = "runtime 重用" if self.runtime_reused else "runtime 新建"
+            shared = (f",跟舊版本共用 {self.deduped_mb:.0f} MB" if self.deduped_mb >= 1
+                      else "")
             return (f"OK — {self.root} @ {self.version}"
-                    f"(本次新增 {self.added_mb:.0f} MB,{reuse}:{self.fingerprint})")
+                    f"(本次新增 {self.added_mb:.0f} MB{shared},{reuse}:{self.fingerprint})")
         if self.cancelled:
             return "已取消 — 沒有留下半成品版本"
         return "FAILED — " + "; ".join(self.errors)
@@ -202,6 +215,12 @@ class ExportResult:
     kind: str = "full"                 # "full" = 完整交付 / "update" = 自動更新來源
     entry_bats: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # OF `total_mb`, HOW MUCH IS THE SAME BYTES AGAIN. A version directory is a whole
+    # copy of the app, so a release that changed 10 MB of code still ships CV_Viewer's
+    # 84 MB DINOv2 weight one more time. The operator calls that "an incremental
+    # update"; the wire does not. See _unchanged_bytes() for why this is reported
+    # rather than deduplicated.
+    redundant_mb: float = 0.0
 
     def __truediv__(self, other) -> Path:
         return self.out_dir / other
@@ -326,26 +345,53 @@ def _runtime_pins(root: Path) -> dict[str, list[str]]:
     return found
 
 
-def _pin_differences(ours: list[str], theirs: list[str]) -> list[str]:
-    """The lines two locks disagree on, in the operator's terms."""
+def _pin_differences(ours: list[str], theirs: list[str]) -> list[tuple[str, str]]:
+    """(distribution name, the line the operator reads) for every pin two locks
+    disagree on. The NAME is carried alongside the sentence because the caller has to
+    ask a second question about it — 「does this app actually import that?」 — and
+    parsing the name back out of a Chinese sentence is how that answer goes wrong."""
     def by_name(pins: list[str]) -> dict[str, str]:
         return {p.partition("==")[0]: p.partition("==")[2] for p in pins}
 
     mine, other = by_name(ours), by_name(theirs)
-    lines: list[str] = []
+    lines: list[tuple[str, str]] = []
     for name in sorted(set(mine) | set(other)):
         if name in mine and name in other:
             if mine[name] != other[name]:
-                lines.append(f"{name}:這次是 {mine[name]},那一份是 {other[name]}")
+                lines.append((name, f"{name}:這次是 {mine[name]},那一份是 {other[name]}"))
         elif name in mine:
-            lines.append(f"{name}=={mine[name]}:只有這次的 lock 有")
+            lines.append((name, f"{name}=={mine[name]}:只有這次的 lock 有"))
         else:
-            lines.append(f"{name}=={other[name]}:只有那一份 runtime 有")
+            lines.append((name, f"{name}=={other[name]}:只有那一份 runtime 有"))
     return lines
 
 
-def runtime_divergence_warning(root: Path, fingerprint: str,
-                               pins: list[str]) -> str | None:
+def _normalize_dist(name: str) -> str:
+    return name.strip().lower().replace("_", "-")
+
+
+def _app_distributions(request: BuildRequest) -> set[str] | None:
+    """Every distribution this app could be importing DIRECTLY — its own imports,
+    mapped through the same alias resolution the import gate uses.
+
+    None means 「we could not tell」 (an unparseable project, a missing entrypoint).
+    Not knowing is not the same as knowing the answer is empty: an empty set would
+    claim that EVERY differing pin is unreachable, which is the one thing this must
+    never say when it has not looked.
+    """
+    try:
+        required, optional = imports_mod.classify(request.project_dir, request.entrypoint)
+    except Exception:                      # noqa: BLE001 - an advisory, never a gate
+        return None
+    found: set[str] = set()
+    for module in set(required) | set(optional):
+        found |= {_normalize_dist(d)
+                  for d in imports_mod.candidate_distributions(module)}
+    return found
+
+
+def runtime_divergence_warning(root: Path, fingerprint: str, pins: list[str],
+                               *, request: BuildRequest | None = None) -> str | None:
     """A SECOND ~450 MB runtime is about to land on a store that already has one,
     because compute_fingerprint() hashes the ENTIRE pin set: one unrelated pin apart
     and the two apps share nothing.
@@ -354,6 +400,13 @@ def runtime_divergence_warning(root: Path, fingerprint: str,
     are not getting it, and — since the difference is usually two or three lines —
     exactly which pins to align to get it. Silence here costs 450 MB of a factory
     PC's disk and nobody ever finds out why.
+
+    `request` (optional) turns the warning from 「these pins differ」 into 「these pins
+    differ AND YOUR APP NEVER IMPORTS THEM」. That is the sentence the operator of a
+    two-app factory PC actually needs: a lock that differs only in pins nothing in
+    this app reaches is a 450 MB runtime bought for nothing, and aligning it is a
+    one-line edit. Without `request` the warning still names the pins — it simply
+    cannot say whether they matter.
 
     None when the runtime will be reused, or when this is the first runtime in the
     tree (nothing to share with, nothing to say).
@@ -382,13 +435,52 @@ def runtime_divergence_warning(root: Path, fingerprint: str,
     lines = [f"這棵樹已經有一份共用 runtime({closest}),但這次的 lock 指紋不一樣,"
              "所以會「再建一份」約 450 MB 的 runtime,兩個 App 共用不到。",
              "  兩份 lock 的差別只有這幾筆:"]
-    lines += [f"  · {line}" for line in shown]
+    lines += [f"  · {line}" for _name, line in shown]
     if len(differences) > len(shown):
         lines.append(f"  (還有 {len(differences) - len(shown)} 筆差異)")
-    lines += ["  把它們對齊成同一個版本,兩個 App 就能共用同一份 runtime"
-              "(省下約 450 MB)。",
-              "  (要共用就得在「建這個版本之前」對齊:版本目錄一旦完成就不可變,"
-              "之後只能改用新的版本號重建。)"]
+
+    # WHICH of those differing pins does this app actually reach? A pin the app never
+    # imports is 450 MB of factory-PC disk bought to satisfy a version number nothing
+    # in the code asks for — and that is a one-line lock edit away from being free.
+    reachable = _app_distributions(request) if request is not None else None
+    unreached = ([name for name, _line in differences
+                  if _normalize_dist(name) not in reachable]
+                 if reachable is not None else [])
+    reached = ([name for name, _line in differences
+                if _normalize_dist(name) in reachable]
+               if reachable is not None else [])
+    if reachable is None:
+        # We could not read the project, so we cannot say whether the pins matter.
+        lines.append("  把它們對齊成同一個版本,兩個 App 就能共用同一份 runtime"
+                     "(省下約 450 MB)。")
+    elif unreached and not reached:
+        lines += [
+            "  而這幾個套件,這個 App 的程式碼從頭到尾沒有 import 過"
+            "(它們是別的套件帶進來的相依):"
+            f"{'、'.join(unreached)}。",
+            "  也就是說:這兩個 App 其實可以共用同一份 runtime,只差這幾個版本號。"
+            "把兩邊的 lock 對齊成同一版,就能省下約 450 MB。",
+        ]
+    elif unreached:
+        lines += [
+            f"  這幾個是這個 App 沒有直接 import 的:{'、'.join(unreached)} —— "
+            "先把它們對齊,通常就足以讓兩個 App 共用同一份 runtime(省下約 450 MB)。",
+            f"  這幾個則是這個 App 真的會 import 的:{'、'.join(reached)},"
+            "對齊之前要先確認新版本相容。",
+        ]
+    else:
+        lines.append(
+            f"  這幾個都是這個 App 真的會 import 的:{'、'.join(reached)}。"
+            "對齊成同一個版本就能共用同一份 runtime(省下約 450 MB),"
+            "但這是 App 直接用到的套件,換版本前要先確認相容。")
+    if unreached:
+        # Honest about the limit of what we just claimed: 「你沒有 import 它」 is not
+        # 「改它不會有事」. numpy is imported by nobody in this project and by pandas
+        # in every line of it.
+        lines.append("  (對齊之後請在專案環境重跑一次 pip install 與 pip freeze:"
+                     "沒有直接 import,不代表沒有別的套件在背後用它。)")
+    lines.append("  (要共用就得在「建這個版本之前」對齊:版本目錄一旦完成就不可變,"
+                 "之後只能改用新的版本號重建。)")
     return "\n".join(lines)
 
 
@@ -410,6 +502,66 @@ def ensure_runtime(root: Path, request: BuildRequest, pins: list[str],
         return fingerprint, True
 
     store.runtimes.mkdir(parents=True, exist_ok=True)
+    # A runtime takes minutes to build.  Two GUI/build workers asking for the same
+    # fingerprint must not both create it, and the copy fallback below briefly makes
+    # an incomplete target directory visible (without .complete, therefore unusable).
+    # Hold the same per-fingerprint lock the device uses for first-use verification.
+    with locks_mod.held(locks_mod.runtime_lock(store.runtimes, fingerprint), timeout=1800):
+        if store.is_complete(fingerprint):       # another builder won while we waited
+            progress(f"runtime {fingerprint} 已由另一個建置完成,直接共用")
+            return fingerprint, True
+        target = store.runtimes / fingerprint
+        if target.exists():
+            # A killed copy-fallback leaves an incomplete target.  It has no sentinel,
+            # so nothing may use it; remove it before trying the build again.
+            if not _rmtree_with_retry(target, progress=progress):
+                raise StoreBuildError(
+                    f"未完成的 runtime 還被系統鎖住,無法重新建置:{target}\n"
+                    "  請關閉仍在使用這個資料夾的程式後重試。")
+        return _build_runtime_under_lock(
+            store, target, request, pins, fingerprint, python_version, abi, progress)
+
+
+def _publish_completed_tree(staging: Path, target: Path, *,
+                            extra_excluded: set[str] | None = None,
+                            progress: Progress = _noop) -> None:
+    """Publish a fully hashed tree and write `.complete` last.
+
+    Directory rename is the fast/atomic path.  On real Windows machines Defender can
+    keep a freshly installed 450 MB Python tree pinned for minutes; the tree is fully
+    built, but renaming its directory repeatedly returns WinError 5.  After the normal
+    retry window, copy the already-verified bytes into their final fingerprint path,
+    verify the COPY against files.json, then write `.complete` as the commit record.
+
+    A crash during the fallback leaves a target without `.complete`, so readers fail
+    closed and the next build removes it while holding the fingerprint lock.
+    """
+    try:
+        _rename_with_retry(staging, target, progress=progress)
+    except runtime_mod.RuntimeError_ as rename_error:
+        progress("防毒長時間鎖住暫存目錄,改用安全複製完成 runtime…")
+        try:
+            shutil.copytree(staging, target)
+            problems = integrity.verify_tree(
+                target, extra_excluded=extra_excluded or set())
+            if problems:
+                raise StoreBuildError(
+                    "安全複製後完整性驗證失敗:\n  " + "\n  ".join(problems[:10]))
+        except Exception as copy_error:
+            _rmtree_with_retry(target, progress=progress)
+            raise StoreBuildError(
+                f"runtime 目錄無法 rename,安全複製也失敗:{target}\n"
+                f"  rename:{rename_error}\n  copy:{copy_error}") from copy_error
+        if not _rmtree_with_retry(staging, progress=progress):
+            progress(f"注意:舊暫存目錄仍被防毒鎖住,下次建置會清理:{staging}")
+    integrity.write_complete(target)
+
+
+def _build_runtime_under_lock(store: RuntimeStore, target: Path,
+                              request: BuildRequest, pins: list[str],
+                              fingerprint: str, python_version: str, abi: str,
+                              progress: Progress) -> tuple[str, bool]:
+    """Build one runtime while its per-fingerprint lock is held."""
     staging = store.runtimes / f".staging-{uuid.uuid4().hex[:8]}"
     build_log = staging / "build.log"
     try:
@@ -445,9 +597,8 @@ def ensure_runtime(root: Path, request: BuildRequest, pins: list[str],
         integrity.write_files_json(staging, integrity.build_files_json(
             staging, extra_excluded={RUNTIME_META}))
 
-        target = store.runtimes / fingerprint
-        _rename_with_retry(staging, target)  # Defender may briefly pin the fresh tree
-        integrity.write_complete(target)     # build machine counts as verified
+        _publish_completed_tree(
+            staging, target, extra_excluded={RUNTIME_META}, progress=progress)
         return fingerprint, False
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
@@ -565,9 +716,146 @@ def _next_version(version: str) -> str:
     return f"{prefix}{int(number) + 1}{suffix}"
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _prior_slot_index(paths: AppPaths, exclude: str) -> dict[str, tuple[Path, int, str]]:
+    """relpath -> (that file in an existing COMPLETE version slot, size, sha256).
+
+    Newest slot wins, because that is the one most likely to hold the file we are
+    about to write. The digests are FREE: every completed version already carries a
+    files.json with a sha256 per file (that is how the device verifies it), so this
+    index costs one small JSON read per slot and hashes nothing.
+    """
+    index: dict[str, tuple[Path, int, str]] = {}
+    if not paths.versions_dir.is_dir():
+        return index
+    slots = [p for p in paths.versions_dir.iterdir()
+             if p.is_dir() and not p.name.startswith(".") and p.name != exclude
+             and integrity.is_complete(p)]
+    slots.sort(key=lambda p: _natural_key(p.name), reverse=True)
+    for slot in slots:
+        for rel, (size, digest) in _files_index(slot).items():
+            if digest and rel not in index:
+                index[rel] = (slot / rel, size, digest)
+    return index
+
+
+class _SlotLinker:
+    """copytree's copy_function: HARDLINK a file an existing version slot already holds,
+    byte for byte; copy it only when it is genuinely new.
+
+    THE PROMISE THIS KEEPS. The store layout exists to make an update cost 「十幾 MB」.
+    It did not: a version directory is a whole copy of the app, so CV_Viewer's 84 MB
+    DINOv2 weight — which has not changed in a year — was written again into every
+    single version slot. Five releases cost 481 MB of a factory PC's disk to ship five
+    copies of one unchanged file. A hardlink makes the copy free: two directory entries,
+    one inode, one lot of bytes.
+
+    WHY THIS IS SAFE HERE, AND EXACTLY WHAT WOULD BREAK IT.
+    A hardlink is dangerous only if somebody writes THROUGH one of the names into the
+    shared inode — then every version sharing that file changes at once, behind the
+    back of the files.json each of them is verified against. Nothing does, and it is not
+    an accident:
+      * a completed version directory is IMMUTABLE by contract. _build_version_dir()
+        refuses to rebuild one (「版本目錄一旦完成就不可變」); the updater only ever
+        stages into a NEW directory and renames it into place; the exporter reads.
+      * the app itself runs OUT of a slot and never writes back into it — bootstrap.py
+        sets `sys.dont_write_bytecode` and puts PYTHONDONTWRITEBYTECODE=1 into the
+        launcher's environment (bootstrap.py:114/396, launch.py:862), so not even a
+        .pyc lands next to the code it imports.
+      * the only writes into a published slot are CREATIONS of new names —
+        integrity.write_complete()'s `.complete` — which touch no existing inode.
+    If a future change ever opens a file inside a completed version directory for
+    writing, it breaks every other version that shares that file, and this is the
+    comment it should have read first.
+
+    Deletion is safe without any of that reasoning: unlinking a name only frees the
+    bytes when the LAST name goes, so gc.py rmtree-ing one slot cannot take a byte that
+    another slot still points at. (What gc.py does get wrong is the SIZE it reports —
+    it sums st_size, so it will claim to have freed bytes that are still linked. That is
+    a message bug in a file this change does not own; it is reported, not silently left.)
+
+    FAT/exFAT (a USB stick, and spec §9.3 promises they work) cannot do hard links at
+    all. locks.py already learned that lesson, so we reuse its errno/winerror table and
+    degrade to a plain copy — once, for the whole build, rather than failing per file.
+    """
+
+    def __init__(self, index: dict[str, tuple[Path, int, str]], staging: Path):
+        self.index = index
+        self.staging = Path(staging)
+        self.linked = 0
+        self.linked_bytes = 0
+        self.supported = bool(index)      # nothing to link against = nothing to try
+
+    def __call__(self, src, dst):
+        prior = None
+        if self.supported:
+            try:
+                rel = Path(dst).relative_to(self.staging).as_posix()
+            except ValueError:            # not under staging: not ours to dedup
+                rel = ""
+            prior = self.index.get(rel) if rel else None
+        if prior is not None:
+            slot_file, size, digest = prior
+            # Size first: it is a stat, and it settles almost every file for free. Only
+            # a same-path, same-size candidate is worth reading 84 MB to hash — and that
+            # read replaces the copy's read+WRITE, so the linked file is cheaper than
+            # the copy it displaces even before counting the disk it saves.
+            if os.path.getsize(src) == size and _sha256_file(src) == digest:
+                try:
+                    os.link(slot_file, dst)
+                except OSError as exc:
+                    # Not a failure: a file we could not link is a file we copy.
+                    if hardlinks_unsupported(exc):
+                        self.supported = False     # FAT/exFAT: stop asking, this build
+                else:
+                    self.linked += 1
+                    self.linked_bytes += size
+                    return dst
+        return shutil.copy2(src, dst)
+
+
+def _version_slot_note(scan) -> str:
+    """What a big-file project REALLY costs in the store layout, now that version slots
+    share their unchanged files.
+
+    Triggered by builder.version_slot_warning() (its thresholds decide when one big file
+    dominates a project enough to be worth saying anything at all), but it says something
+    else, because the answer changed: the DISK no longer pays twice — a byte-identical
+    file in an existing slot is a hardlink. What still travels whole is the PACKAGE. An
+    update payload and a delivery are real copies by construction (they have to be: the
+    machine on the other end has none of these bytes yet, and a USB stick is usually
+    FAT/exFAT, which has no hard links at all). So the honest split is:
+
+        disk on both machines — paid once, whatever the file is.
+        the stick / the share  — pays in full, on every release.
+    """
+    biggest, biggest_size = scan.heavy_files[0]
+    return (
+        f"Store 佈局:「{biggest}」有 {biggest_size / 1024 ** 2:.0f} MB,"
+        f"佔了 application\\({scan.application_mb:.0f} MB)的大半。\n"
+        "  磁碟:不用擔心 —— 版本之間「一模一樣的檔案會用硬連結共用」,"
+        "第二版之後這個檔案不會再吃一次磁碟(建置機與現場機器都一樣)。\n"
+        "  但「更新包」與「交付資料夾」是實體複本(對方機器上還沒有這些位元組,"
+        "而且 USB 多半是 FAT/exFAT,根本不支援硬連結),"
+        f"所以每發一版,這 {biggest_size / 1024 ** 2:.0f} MB 就要再搬一次。\n"
+        f"  如果「{biggest}」不隨版本改變、而且你在意每次要搬多少:"
+        "把它移出專案目錄(改由外部資料夾或共用磁碟提供),"
+        "或在 .provisionignore 排除它,更新包才會真的只剩下改過的東西。"
+    )
+
+
 def _build_version_dir(paths: AppPaths, request: BuildRequest, version: str,
                        fingerprint: str, shell_fingerprint: str,
-                       progress: Progress) -> Path:
+                       progress: Progress) -> tuple[Path, int]:
+    """Returns (the published version dir, bytes that cost nothing because an existing
+    version slot already held them byte-for-byte)."""
     target = paths.version_dir(version)
     if integrity.is_complete(target):
         raise StoreBuildError(
@@ -582,6 +870,10 @@ def _build_version_dir(paths: AppPaths, request: BuildRequest, version: str,
     staging = paths.versions_dir / f".staging-{uuid.uuid4().hex[:8]}"
     try:
         progress(f"組裝版本 {version} …")
+        # Everything an EXISTING version slot already holds, byte for byte, gets a
+        # hardlink instead of a second copy — same volume by construction (the staging
+        # dir is a sibling of the slots), and the slots are immutable. See _SlotLinker.
+        linker = _SlotLinker(_prior_slot_index(paths, version), staging)
         # The SAME rule as the fat builder — not a re-implementation of it. This
         # line used to call shutil.ignore_patterns(EXCLUDED_*) directly, which
         # ignored .provisionignore and the GUI's 額外排除 field entirely: the same
@@ -589,7 +881,14 @@ def _build_version_dir(paths: AppPaths, request: BuildRequest, version: str,
         # the store slot is the thing that travels on every single update.
         shutil.copytree(request.project_dir, staging / "application",
                         ignore=builder.copytree_ignore(
-                            builder.ignore_patterns_for(request), request.project_dir))
+                            builder.ignore_patterns_for(request), request.project_dir),
+                        copy_function=linker)
+        if linker.linked:
+            progress(f"版本 {version}:{linker.linked} 個檔案跟舊版本一模一樣,"
+                     f"改用硬連結共用,省下 {linker.linked_bytes / 1024 ** 2:.0f} MB"
+                     "(沒有重複複製)")
+        elif not linker.supported and linker.index:
+            progress("這個磁碟不支援硬連結(FAT/exFAT),版本之間只能各存一份完整的複本。")
         (staging / "launcher").mkdir()
         for name in ("launch.py", "engine_shim.py"):
             shutil.copy2(TEMPLATES / name, staging / "launcher" / name)
@@ -605,10 +904,15 @@ def _build_version_dir(paths: AppPaths, request: BuildRequest, version: str,
         manifest = build_version_manifest(request, version, fingerprint, shell_fingerprint)
         (staging / MANIFEST_NAME).write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        # files.json is computed from WHAT ACTUALLY LANDED ON DISK, by the same code the
+        # device verifies with — never from our own bookkeeping about what we linked.
+        # A manifest assembled from the linker's intentions would agree with the linker
+        # rather than with the bytes, and a linking bug would then ship a version that
+        # every machine accepts and no machine can run. This pass is what catches it.
         integrity.write_files_json(staging)
         _rename_with_retry(staging, target)
         integrity.write_complete(target)
-        return target
+        return target, linker.linked_bytes
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
         raise
@@ -1872,8 +2176,32 @@ def build_into_store(request: BuildRequest, root: Path, *, version: str,
         # Big files / auto-exclusions: the fat path has always reported these, the
         # store path declared a `warnings` field and then never filled it, so in
         # Store mode the operator was told nothing. Scan BEFORE copying anything.
+        #
+        # versioned=True is the STORE's own question, and only the store may ask it:
+        # every release copies application\ WHOLE into a new version slot, so a project
+        # dominated by one 84 MB model file costs 84 MB per version — five releases is
+        # 420 MB, and the shared thing between versions is the runtime, not the
+        # project's own files. (Fat mode rebuilds one folder in place, so it stays
+        # silent; an unconditional warning there would be a false alarm.) See the
+        # hardlink note above _files_index() for why that duplication is REPORTED
+        # rather than deduplicated, and _redundancy_warning() for the same truth told
+        # again at export time, when the operator is choosing what to put on the stick.
         try:
-            warnings.extend(scan_project(request).warnings)
+            scan = scan_project(request, versioned=True)
+            # builder.version_slot_warning() decides WHEN this project's big files are
+            # worth interrupting someone about (its thresholds, its heavy-file list —
+            # not re-derived here). But its TEXT still says 「沒有硬連結、沒有去重」, and
+            # as of this change that is false: version slots share their unchanged files.
+            # Forwarding it verbatim would ship an operator-facing warning that
+            # contradicts what the code now does — the same class of bug as the export's
+            # 「原封不動」 that had just deleted start.bat. So its trigger is used and its
+            # sentence is replaced with what actually happens. THE MOMENT builder.py's
+            # wording is corrected, this seam collapses back to a plain forward of
+            # scan.warnings; see _version_slot_note().
+            stale = scan.version_slot_warning
+            warnings.extend(w for w in scan.warnings if w != stale)
+            if stale:
+                warnings.append(_version_slot_note(scan))
         except Exception as exc:            # a scan must never kill a build
             warnings.append(f"專案掃描失敗,這次沒有大檔警告:{exc}")
 
@@ -1889,7 +2217,9 @@ def build_into_store(request: BuildRequest, root: Path, *, version: str,
         except StoreBuildError:
             planned = None                 # the interpreter probe is ensure_runtime's
         if planned is not None:            # job to fail on, not this warning's
-            divergence = runtime_divergence_warning(root, planned, pins)
+            # `request` lets the warning say WHICH of the differing pins the app never
+            # imports — i.e. 「這兩個 App 其實可以共用同一份 runtime,只差 pandas」.
+            divergence = runtime_divergence_warning(root, planned, pins, request=request)
             if divergence:
                 warnings.append(divergence)
                 progress("注意:" + divergence)
@@ -1913,7 +2243,8 @@ def build_into_store(request: BuildRequest, root: Path, *, version: str,
 
         _check_cancel(should_cancel)
         paths = AppPaths(root, app_id)
-        _build_version_dir(paths, request, version, fingerprint, shell_fingerprint, progress)
+        _vdir, deduped = _build_version_dir(paths, request, version, fingerprint,
+                                            shell_fingerprint, progress)
 
         # The revision travels with the version from here to failed_versions: a
         # rollback that records revision=None blocks EVERY future build of that
@@ -1978,9 +2309,15 @@ def build_into_store(request: BuildRequest, root: Path, *, version: str,
                 encoding="utf-8")
             progress(f"已設定更新來源:{update_source}")
 
+        # WHAT THIS BUILD REALLY COST THE DISK. `version_mb` is how big the slot looks
+        # (what a `dir` reports, and what the operator sees); `added_mb` is what the
+        # volume actually lost — and hardlinked bytes cost it nothing, because they are
+        # a second name for bytes that were already there. Reporting the slot's apparent
+        # size as the cost was exactly the lie this change exists to end.
         version_bytes = _directory_size(paths.version_dir(version))
-        added = version_bytes if reused else version_bytes + _directory_size(
-            RuntimeStore(root / "deps").path_for(fingerprint))
+        added = version_bytes - deduped
+        if not reused:
+            added += _directory_size(RuntimeStore(root / "deps").path_for(fingerprint))
         progress(f"完成:{root}(本次新增 {added / 1024 ** 2:.0f} MB)")
 
         return StoreBuildResult(
@@ -1989,6 +2326,7 @@ def build_into_store(request: BuildRequest, root: Path, *, version: str,
             pending_set=pending_set, is_first_app=len(apps) <= 1,
             entry_bats=bats, removed_start_bat=removed_start_bat,
             version_mb=version_bytes / 1024 ** 2, added_mb=added / 1024 ** 2,
+            deduped_mb=deduped / 1024 ** 2,
             duration_seconds=time.monotonic() - started, warnings=warnings)
     except _Cancelled:
         # Never leave a half-written version dir carrying a .complete: the tree
@@ -2179,56 +2517,159 @@ def _rollback_target_for(paths: AppPaths, state: AppState, deliver: str) -> str 
     return None
 
 
+def _intact_in(dst: AppPaths, version: str | None) -> bool:
+    """Is this version really on the destination's disk, complete, right now?"""
+    if not version:
+        return False
+    try:
+        return integrity.is_complete(dst.version_dir(version))
+    except Exception:                      # noqa: BLE001 - an invalid name is a "no"
+        return False
+
+
+def _deliver_op() -> dict:
+    return {"id": uuid.uuid4().hex, "kind": "deliver", "status": "completed",
+            "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
+
 def _write_target_state(dst: AppPaths, app_id: str, current: str,
-                        previous: str | None, *, revision: str | None = None) -> None:
-    """A FRESH state.json for the machine that receives this delivery.
+                        previous: str | None, *,
+                        revision: str | None = None) -> list[str]:
+    """The state.json the machine that receives this delivery must end up with.
 
-    The exporter used to copy the build machine's state.json verbatim, which
-    handed the factory:
-      * `pending` — a version the target was never meant to run. It is not inert:
-        bootstrap PROMOTES pending on the next start, so the delivery silently
-        installed a different version from the one the operator delivered, on
-        first boot, in the factory.
-      * the build machine's `candidate` — a half-proven version belonging to a
-        machine it never met.
-      * `failed_versions` — a failure history from THIS build machine, which
-        blocks the target from ever auto-applying those versions.
-      * `last_known_good` — a claim that some version once started successfully.
-        Nothing on the build machine ever started anything.
-    None of that is true of the target. So we write what IS true.
+    TWO CASES, AND THEY ARE NOT THE SAME DELIVERY.
 
-    AND WHAT IS TRUE IS THAT THE DELIVERED VERSION IS ON TRIAL. `candidate=current`,
-    with its revision. This is not a leak of the build machine's candidate (that one
-    is dropped, above); it is the fact that this version has NEVER STARTED HERE.
+    B. THE DESTINATION ALREADY RUNS THIS APP — that is an UPDATE, and an update may
+       not erase what the machine learned about ITSELF. This function used to write
+       case A over case B unconditionally, which threw away, from a live factory PC:
+         * `failed_versions` — v2.0.0 started, died, and was rolled back ON THIS
+           MACHINE. Wipe that and the background updater finds v2.0.0 on the share,
+           finds no failure entry, and re-stages the very build this machine already
+           proved is bad. That is the crash loop the revision machinery exists to
+           prevent, re-armed by the delivery.
+         * `last_known_good` — the one version this machine has ever PROVEN it can
+           start. resolve_rollback_target() reaches for it first, so erasing it takes
+           the floor out from under the version we are about to put on trial.
+         * `generation` — an anti-rollback counter, reset to 1 under a state that had
+           reached 47.
+       Those three are the MACHINE's property, not the build machine's, and they now
+       survive a delivery. What the delivery does decide is what runs next: current =
+       the delivered version, candidate = the delivered version (it has never started
+       HERE either, so it is on trial exactly like a first install), pending = cleared
+       and said out loud — a machine that had staged its own update would otherwise
+       promote it on the next boot, straight over the version the operator just walked
+       across the factory to hand-deliver.
 
-    We used to write candidate=None, which switched the safety net OFF at the single
-    most dangerous moment in the product's life — a version's very first launch on a
-    machine it has never run on. bootstrap only auto-rolls-back a version that is the
-    candidate (`is_candidate`), so a first boot that died got no rollback at all, and
-    the 讀我 we ship with the folder promises 「萬一新版啟動失敗,系統會自動退回上一個
-    能用的版本」. StateStore.initialize() has always said this in as many words —
-    「a fresh install is itself an unproven candidate」 — and it is the exporter, not
-    the state module, that disagreed.
+    A. THE DESTINATION HAS NEVER SEEN THIS APP — a fresh state, written from scratch.
+       The exporter used to copy the build machine's state.json verbatim, which
+       handed the factory:
+         * `pending` — a version the target was never meant to run. It is not inert:
+           bootstrap PROMOTES pending on the next start, so the delivery silently
+           installed a different version from the one the operator delivered, on
+           first boot, in the factory.
+         * the build machine's `candidate` — a half-proven version belonging to a
+           machine it never met.
+         * `failed_versions` — a failure history from THIS BUILD MACHINE, which
+           blocks the target from ever auto-applying those versions.
+         * `last_known_good` — a claim that some version once started successfully.
+           Nothing on the build machine ever started anything.
+       None of that is true of the target. So we write what IS true.
 
-    last_known_good stays None (nothing has started here yet, so nothing has earned
-    it) and `previous` stays: resolve_rollback_target() falls through LKG to
-    `previous`, so the first-boot rollback lands on the version we shipped for
-    exactly that purpose. On a one-version delivery `previous` is None and there is
-    genuinely nowhere to go — bootstrap says so and changes nothing, which is the
-    honest answer and the reason export_full_tree() warns about it at export time.
+       AND WHAT IS TRUE IS THAT THE DELIVERED VERSION IS ON TRIAL. `candidate=current`,
+       with its revision. This is not a leak of the build machine's candidate (that one
+       is dropped, above); it is the fact that this version has NEVER STARTED HERE.
+       We used to write candidate=None, which switched the safety net OFF at the single
+       most dangerous moment in the product's life — a version's very first launch on a
+       machine it has never run on. bootstrap only auto-rolls-back a version that is the
+       candidate (`is_candidate`), so a first boot that died got no rollback at all, and
+       the 讀我 we ship with the folder promises 「萬一新版啟動失敗,系統會自動退回上一個
+       能用的版本」. StateStore.initialize() has always said this in as many words —
+       「a fresh install is itself an unproven candidate」 — and it is the exporter, not
+       the state module, that disagreed.
+
+    `previous` — the version to fall back TO — prefers the machine's OWN current: that
+    is the build it was really running five minutes ago, it is sitting on its disk, and
+    it is a better rollback target than anything the build machine can nominate. We
+    fall through to the exporter's choice only when the machine has nothing to offer.
+    On a first, one-version delivery it stays None and there is genuinely nowhere to go
+    — bootstrap says so and changes nothing, which is the honest answer and the reason
+    export_full_tree() warns about it at export time.
+
+    Returns the warnings the operator has to hear. A silent merge would be its own bug.
     """
-    state = AppState(
-        app_id=app_id, current=current, previous=previous,
-        pending=None, pending_revision=None,
-        candidate=current, candidate_revision=revision,
-        last_known_good=None, failed_versions=[], generation=0,
-        last_operation={"id": uuid.uuid4().hex, "kind": "deliver",
-                        "status": "completed",
-                        "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ",
-                                                       time.gmtime())})
-    # write_locked(): atomic replace + read-back, and it leaves no .lock behind
-    # (a fresh export folder has nobody to contend with).
-    StateStore(dst.state_dir).write_locked(state)
+    store = StateStore(dst.state_dir)
+    warnings: list[str] = []
+
+    old: AppState | None = None
+    if store.exists():
+        try:
+            old = store.load()
+        except Exception as exc:           # noqa: BLE001 - corrupt / hand-edited
+            warnings.append(
+                f"{app_id}:目的地原本的 state.json 讀不出來({exc}),已經改寫成全新的。"
+                "這台機器原本的失敗記錄與「最後可用版本」沒辦法保留 —— "
+                "如果它以前退回過某一版,自動更新可能會再把那一版裝回來。")
+        if old is not None and old.app_id != app_id:
+            warnings.append(
+                f"{app_id}:目的地的 state.json 說它是 {old.app_id!r} 的,不是這個 App 的,"
+                "所以不採用它的內容,改寫成全新的狀態。")
+            old = None
+
+    if old is None:
+        state = AppState(
+            app_id=app_id, current=current, previous=previous,
+            pending=None, pending_revision=None,
+            candidate=current, candidate_revision=revision,
+            last_known_good=None, failed_versions=[], generation=0,
+            last_operation=_deliver_op())
+        # write_locked(): atomic replace + read-back, and it leaves no .lock behind
+        # (a folder that has no state for this app has nobody to contend with).
+        store.write_locked(state)
+        return warnings
+
+    # ── an update onto a machine that already runs this app ──────────────────
+    if old.pending and old.pending != current:
+        warnings.append(
+            f"{app_id}:目的地原本有一個已經裝好、還沒套用的版本({old.pending}),"
+            f"這次交付把它取消了 —— 下次啟動會直接用這次交付的 {current}。"
+            f"({old.pending} 的檔案還留在磁碟上。)")
+    if old.is_failed(current, revision):
+        warnings.append(
+            f"{app_id}:目的地這台機器的記錄裡,{current} 曾經在「這台機器上」啟動失敗過,"
+            "而且是同一份內容(revision 一樣)。這次交付還是會把它設成目前版本,"
+            "但它一啟動失敗就會再退回去。要讓它重新有機會,"
+            "請先在目標機上用 tools\\admin.bat →「清除失敗記錄」。")
+
+    def merge(seen: AppState) -> AppState:
+        # The rollback floor, best first: the version this machine was really running,
+        # then the one the exporter shipped for exactly this purpose, then its older
+        # `previous`. Whatever we pick must be COMPLETE ON THE DESTINATION'S DISK —
+        # a rollback target that is not there is not a rollback target.
+        fallback = next((v for v in (seen.current, previous, seen.previous)
+                         if v and v != current and _intact_in(dst, v)), None)
+        return AppState(
+            app_id=app_id, current=current, previous=fallback,
+            # Cleared: bootstrap PROMOTES pending on the next start, so a pending the
+            # machine staged for itself would silently overrule this delivery.
+            pending=None, pending_revision=None,
+            # On trial here too: it has never started on THIS machine either.
+            candidate=current, candidate_revision=revision,
+            # THE MACHINE'S OWN HARD-WON KNOWLEDGE. Not ours to throw away.
+            last_known_good=seen.last_known_good,
+            failed_versions=list(seen.failed_versions),
+            generation=seen.generation,        # write_locked() bumps it: never back
+            last_operation=_deliver_op())
+
+    # mutate(): takes the app update lock, so an export into the folder of a machine
+    # whose updater or launcher is mid-write waits for it instead of racing it. The
+    # lock file is removed on release, so the delivered folder carries no debris.
+    try:
+        store.mutate(merge)
+    except LockTimeout as exc:
+        raise StoreBuildError(
+            f"{app_id}:目的地那個 App 的狀態檔正被別的程式鎖住,這次沒有動它({exc})。\n"
+            "  如果目標機上的 App 或更新程式正在跑,請先把它完全關掉,再匯出一次。") from exc
+    return warnings
 
 
 def _version_manifests(paths: AppPaths) -> dict[str, dict]:
@@ -2252,67 +2693,186 @@ def _deliverable_versions(root: Path, app_id: str) -> str:
     return "、".join(listed) or "(一個完整的版本都沒有)"
 
 
+# ── WHY THE VERSION SLOTS ARE NOT HARDLINKED ─────────────────────────────────
+#
+# Every version directory is a full copy of the app. CV_Viewer's 84 MB DINOv2 weight
+# is byte-identical in v1.0.0 and v1.1.0, and it is copied into both — on the build
+# machine, into the delivery, and into the update package that the operator believes
+# is a "10 MB incremental update". `os.link` between two slots on the same volume
+# would make that duplicate free, and locks.py already knows how to degrade on
+# FAT/exFAT (hardlinks_unsupported()). We are NOT doing it. The reasons, so that the
+# next person does not have to rediscover them:
+#
+#   1. IT DOES NOT SOLVE THE OPERATOR'S PROBLEM. Both exports go out through
+#      shutil.copytree/_copy_with_progress, which reads content and writes new files:
+#      links inside the store do not survive the copy. The delivery is the same size,
+#      the update package is the same size, and the factory PC's disk is the same
+#      size. The only thing that would shrink is the build machine's own store — the
+#      one disk in this story that nobody is short of.
+#   2. IT WOULD MAKE gc.py LIE. GC reports the bytes it reclaimed by summing file
+#      sizes. Delete a version slot whose big files are shared with another slot and
+#      it frees nothing while announcing that it freed 84 MB — the same class of bug
+#      as the 「回收完成」 message for a plan that deleted nothing, which this repo has
+#      already had to fix once.
+#   3. IT TURNS ONE CORRUPTION INTO EVERY CORRUPTION. A completed version directory is
+#      immutable and integrity-verified precisely because a shipped version may never
+#      change under us. With shared inodes, an antivirus that quarantines-and-restores
+#      one file, or an operator who "just fixes" one file in one slot, silently mutates
+#      every other version that shares it, and each of them fails its own files.json.
+#      The atomic stage→rename→.complete guarantee is the core of the product.
+#
+# What was actually costing the operator is that NOBODY EVER TOLD THEM. So the size is
+# made honest instead: _unchanged_bytes() measures exactly how much of a package is
+# the same bytes travelling again, and export_update()/export_full_tree() say so, with
+# the files named, at the moment the operator is choosing what to send.
+
+def _files_index(vdir: Path) -> dict[str, tuple[int, str]]:
+    """path -> (size, sha256), straight out of the version's own files.json.
+
+    Free: integrity.build_files_json already hashed every byte at build time. Nothing
+    here re-reads the tree.
+    """
+    try:
+        data = json.loads((Path(vdir) / integrity.FILES_NAME).read_text("utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return {str(entry["path"]): (int(entry.get("size", 0)), str(entry.get("sha256", "")))
+            for entry in data.get("files", []) if entry.get("path")}
+
+
+def _unchanged_bytes(previous: Path, current: Path) -> tuple[int, list[tuple[str, int]]]:
+    """(bytes `current` re-ships byte-for-byte identical to `previous`, biggest first).
+
+    The honest measure of an "incremental" package: same path, same sha256 = the target
+    machine already has this exact file, in the version directory it is running right
+    now, and we are about to send it again anyway.
+    """
+    old, new = _files_index(previous), _files_index(current)
+    same = [(path, size) for path, (size, digest) in new.items()
+            if digest and old.get(path, (0, ""))[1] == digest]
+    same.sort(key=lambda item: (-item[1], item[0]))
+    return sum(size for _path, size in same), same
+
+
+# Below this, saying 「N MB 是重複的」 is noise: it is smaller than the noise in the
+# operator's own estimate of how long a copy takes.
+_REDUNDANT_WARNING_BYTES = 16 * 1024 ** 2
+
+
+def _redundancy_warning(previous_version: str, redundant: int,
+                        biggest: list[tuple[str, int]], total: int, *,
+                        what: str) -> str | None:
+    """What this package really costs, and why — or None when it is not worth saying."""
+    if redundant < _REDUNDANT_WARNING_BYTES:
+        return None
+    lines = [
+        f"{what} {total / 1024 ** 2:.0f} MB,其中大約 {redundant / 1024 ** 2:.0f} MB 是"
+        f"「跟 {previous_version} 一模一樣、但還是會再送一次」的檔案:",
+    ]
+    lines += [f"  · {path}({size / 1024 ** 2:.0f} MB)" for path, size in biggest[:3]]
+    lines.append(
+        "  磁碟不會多付:目標機上「一模一樣的檔案會跟舊版本用硬連結共用」。"
+        "但這個「包」本身是實體複本 —— 對方機器上還沒有這些位元組,而且 USB 多半是 "
+        "FAT/exFAT、根本不支援硬連結 —— 所以要「搬」的量就是上面這個數字,"
+        "不是「只搬改過的那幾 MB」。")
+    lines.append(
+        "  如果你在意每次要搬多少:把這種「不隨版本改變」的大檔移出 App 專案目錄"
+        "(或用 .provisionignore 排除),改成放在版本目錄之外、由 App 自己去讀。"
+        "留在專案目錄裡,它就是每一版的一部分。")
+    return "\n".join(lines)
+
+
+def _source_entry_bat(root: Path, app_id: str) -> Path | None:
+    """The bat in the SOURCE store that starts `app_id` — whatever it is called there.
+
+    A one-app store calls it start.bat; a two-app store calls it start-<id>.bat. The
+    file name cannot answer 「whose is this?」, so we ask the bat (see _entry_bat_app)
+    and never assume that the source's start.bat belongs to the app we are exporting.
+    """
+    named = Path(root) / f"start-{app_id}.bat"
+    if named.is_file():
+        return named
+    generic = Path(root) / "start.bat"
+    if generic.is_file() and _entry_bat_app(generic) == app_id:
+        return generic
+    return None
+
+
 def _export_entry_bats(root: Path, out: Path, exported: list[str],
-                       installed: list[str]) -> list[str]:
-    """Every app installed in `out` ends up with exactly one entry point.
+                       installed: list[str]) -> tuple[list[str], list[tuple[str, str, str]]]:
+    """Every app installed in `out` ends up with exactly ONE entry point, and no app
+    that is still installed in `out` ever loses the one file that starts it.
 
-    Three rules, and the middle one is the S8 blocker:
+    Returns (entry bats, renames) where a rename is (app_id, old name, new name) — the
+    operator MUST be told about those, because a rename is exactly what a user who has
+    been taught 「雙擊 start.bat」 experiences as 「the program is gone」.
 
-      * the apps THIS export delivered get their bat from the source tree (the same
-        file the store root has, so the name the operator has been taught is the name
-        they get);
-      * an app that is ALREADY in `out` and that this export did not touch KEEPS its
-        entry bat. It is still installed, its versions and its runtime are still on
-        the disk, and deleting the one file that starts it is not a cleanup, it is
-        breaking a delivered app;
-      * a start bat belonging to no installed app goes (the true stale case: an app
-        that is not in this folder at all).
+    THE ORDER HERE IS THE FIX. The old version copied the source tree's start*.bat into
+    `out` FIRST and reasoned about ownership afterwards — so exporting App B (whose
+    one-app store calls its bat start.bat) into a folder that already held App A landed
+    B's start.bat ON TOP OF A's, destroying the file, and then unlinked it. A only kept
+    an entry point because _start_bat_text() happens to be identical for every app, so
+    the regeneration at the bottom could reconstruct it. That is not a design, it is a
+    coincidence that would end the day a bat carries anything app-specific.
 
-    And `start.bat` is only unambiguous while the folder holds ONE app. When a second
-    app lands in it, start.bat becomes 「which one?」 and is replaced by its owner's
-    own start-<app_id>.bat — the same rule _write_entry_bats() applies to a store.
+    So now: read who owns what in the destination BEFORE writing anything, decide the
+    ONE name each installed app should have, and write only into those names.
+
+      * `start.bat` is unambiguous only while the folder holds ONE app. The moment a
+        second app lands, every app moves to its own start-<app_id>.bat — the same rule
+        _write_entry_bats() applies inside a store — and THAT MOVE IS REPORTED.
+      * an app that is installed in `out` but was not delivered by THIS export keeps
+        its own bat (copied to its new name if the name had to change). Its versions,
+        its runtime and its state are all still on that disk; deleting the one file
+        that starts it is not a cleanup, it is breaking a delivered app.
+      * a start bat belonging to no installed app goes — the true stale case.
     """
     root, out = Path(root), Path(out)
-    entry_bats: list[str] = []
+    multi = len(installed) > 1
 
-    wanted = {"start.bat"} | {f"start-{a}.bat" for a in exported}
-    for bat in sorted(root.glob("start*.bat")):
-        if bat.name in wanted:
-            shutil.copy2(bat, out / bat.name)
-            entry_bats.append(bat.name)
+    def name_for(app_id: str) -> str:
+        return f"start-{app_id}.bat" if multi else "start.bat"
 
+    # WHOSE IS WHAT, read from the destination BEFORE a single byte is written over it.
+    existing: dict[str, Path] = {}
     for bat in sorted(out.glob("start*.bat")):
-        if bat.name in entry_bats:
-            continue
         owner = _entry_bat_app(bat)
-        if owner is None or owner not in installed:
-            bat.unlink()          # belongs to no app in this folder: really stale
+        if owner in installed and owner not in existing:
+            existing[owner] = bat
+
+    entry_bats: list[str] = []
+    renames: list[tuple[str, str, str]] = []
+    for app_id in sorted(installed):
+        want = out / name_for(app_id)
+        have = existing.get(app_id)
+        if have is not None and have.name != want.name:
+            renames.append((app_id, have.name, want.name))
+
+        if app_id in exported:
+            source = _source_entry_bat(root, app_id)
+            if source is not None:
+                shutil.copy2(source, want)
+            else:
+                _write_bat(want, _start_bat_text(out, app_id,
+                                                 _display_name_of(root, app_id)))
+        elif have is not None:
+            if have.name != want.name:
+                shutil.copy2(have, want)      # copy FIRST; the old name is unlinked below
         else:
-            entry_bats.append(bat.name)      # still installed: it keeps its entry
+            # Installed in the destination, no bat to keep (an old tree, a bat someone
+            # deleted). Generate one rather than leave an installed app nobody can
+            # start. Its name comes from the DESTINATION's own manifests: the source
+            # store has never heard of this app.
+            _write_bat(want, _start_bat_text(out, app_id, _display_name_of(out, app_id)))
+        entry_bats.append(want.name)
 
-    if len(installed) > 1:
-        generic = out / "start.bat"
-        if generic.is_file():
-            owner = _entry_bat_app(generic)
-            if owner:
-                named = f"start-{owner}.bat"
-                if not (out / named).is_file():
-                    shutil.copy2(generic, out / named)
-                    entry_bats.append(named)
-            generic.unlink()
-            if "start.bat" in entry_bats:
-                entry_bats.remove("start.bat")
-
-    missing = [a for a in installed
-               if not any(_entry_bat_app(out / b) == a for b in entry_bats)]
-    for app in missing:
-        # An app with no bat to copy (an old tree, a deleted bat, an app that only
-        # ever existed in the destination). Generate one rather than deliver a folder
-        # with an app nobody can start.
-        name = "start.bat" if len(installed) == 1 else f"start-{app}.bat"
-        _write_bat(out / name, _start_bat_text(out, app, _display_name_of(root, app)))
-        entry_bats.append(name)
-    return sorted(set(entry_bats))
+    # Anything left over starts nothing that is installed here — a ghost app's bat, or
+    # the now-ambiguous start.bat whose owner was just given its own name above.
+    keep = set(entry_bats)
+    for bat in sorted(out.glob("start*.bat")):
+        if bat.name not in keep:
+            bat.unlink()
+    return sorted(keep), renames
 
 
 def export_full_tree(root: Path, out_dir: Path, *, app_id: str | None = None,
@@ -2376,6 +2936,7 @@ def export_full_tree(root: Path, out_dir: Path, *, app_id: str | None = None,
     warnings: list[str] = []
     runtime_fps: set[str] = set()
     shell_fps: set[str] = set()
+    redundant = 0
     for a in apps:
         src = AppPaths(root, a)
         dst = AppPaths(out, a)
@@ -2420,6 +2981,24 @@ def export_full_tree(root: Path, out_dir: Path, *, app_id: str | None = None,
                             ignore=_ignore_staging, dirs_exist_ok=True)
             versions.append(f"{a}/{name}" if len(apps) > 1 else name)
 
+        # A delivery carries the version AND its rollback target — two full copies of
+        # the same app. Every byte they share travels twice, and for an app with an
+        # 84 MB model file that is most of the folder. Say it, with the files named.
+        if rollback:
+            try:
+                same, biggest = _unchanged_bytes(src.version_dir(rollback),
+                                                 src.version_dir(deliver))
+            except Exception:              # noqa: BLE001 - an accounting note, not a gate
+                same, biggest = 0, []
+            redundant += same
+            note = _redundancy_warning(rollback, same, biggest,
+                                       _directory_size(dst.version_dir(deliver)),
+                                       what=f"{a}:這次交付的版本目錄")
+            if note:
+                warnings.append(
+                    note + f"\n  (這份交付同時帶了可以退回的 {rollback},"
+                           "所以這些位元組會在這個資料夾裡各存一份。)")
+
         # The revision of the version the target is about to boot ON TRIAL. It is the
         # same content id release.json carries (sha256 of files.json), and it is what
         # travels into failed_versions if that first boot dies — a failure recorded
@@ -2429,7 +3008,9 @@ def export_full_tree(root: Path, out_dir: Path, *, app_id: str | None = None,
             revision = version_revision(src, deliver)
         except OSError:                       # unreadable files.json: it was verified
             revision = None                   # complete above, so this is near-impossible
-        _write_target_state(dst, a, deliver, rollback, revision=revision)
+        # An UPDATE onto a machine that already runs this app keeps that machine's
+        # failed_versions / last_known_good / generation — see _write_target_state.
+        warnings.extend(_write_target_state(dst, a, deliver, rollback, revision=revision))
 
         config = src.app_dir / "config.json"
         if config.is_file():
@@ -2518,13 +3099,31 @@ def export_full_tree(root: Path, out_dir: Path, *, app_id: str | None = None,
     # only thing a user can double-click did not.
     installed = sorted(set(apps) | set(list_app_ids(out)))
     extra = [a for a in installed if a not in apps]
-    if extra:
-        warnings.append(
-            f"目的地資料夾裡本來就有其他 App({'、'.join(extra)}),這次沒有動它們:"
-            "它們的版本、啟動檔與管理主控台都原封不動留著。"
-            f"這個資料夾現在總共有 {len(installed)} 個 App。")
 
-    entry_bats = _export_entry_bats(root, out, apps, installed)
+    entry_bats, renames = _export_entry_bats(root, out, apps, installed)
+
+    if extra:
+        # WHAT REALLY HAPPENED, not what we wish had happened. This warning used to say
+        # 「它們的版本、啟動檔與管理主控台都原封不動留著」 while the very next call
+        # unlinked start.bat — the ONE file the operator of App A had been taught to
+        # double-click. A warning that denies the thing it is warning about is worse
+        # than no warning: it sends the operator away to look for another explanation.
+        warnings.append(
+            f"目的地資料夾裡本來就有其他 App({'、'.join(extra)})。"
+            "它們的版本、狀態(state.json)與管理主控台都留著,這次沒有動 —— "
+            f"這個資料夾現在總共有 {len(installed)} 個 App。")
+    if renames:
+        # start.bat cannot survive a second app: it no longer says WHICH app. Whoever
+        # owned it keeps their entry point, under a name that answers that question —
+        # and the person who has been double-clicking the old name has to hear it.
+        lines = [f"這個資料夾現在有 {len(installed)} 個 App,start.bat 已經沒辦法表示"
+                 "「要開哪一個」,所以每個 App 改用自己的啟動檔。啟動檔改名如下:"]
+        lines += [f"  · {_display_name_of(out, app_id)}({app_id}):{old} → {new}"
+                  for app_id, old, new in renames]
+        lines.append("  原本雙擊 start.bat 的人要改雙擊自己那一個;"
+                     "桌面捷徑或排程如果指向 start.bat,請一併改掉。")
+        lines.append("  (每個 App 的版本、狀態與資料都沒有動,改的只有啟動檔的檔名。)")
+        warnings.append("\n".join(lines))
 
     # Regenerated, not copied: tools\ must describe exactly the apps this FOLDER has
     # (a chooser offering an app that is not here is worse than useless — and one
@@ -2544,7 +3143,8 @@ def export_full_tree(root: Path, out_dir: Path, *, app_id: str | None = None,
         say(f"[注意] {warning}")
     return ExportResult(out_dir=out, total_mb=total / 1024 ** 2, apps=apps,
                         versions=versions, includes_runtime=bool(runtime_fps),
-                        kind="full", entry_bats=sorted(entry_bats), warnings=warnings)
+                        kind="full", entry_bats=sorted(entry_bats), warnings=warnings,
+                        redundant_mb=redundant / 1024 ** 2)
 
 
 def _previous_manifest(paths: AppPaths, version: str) -> dict | None:
@@ -2610,9 +3210,16 @@ def export_update(root: Path, app_id: str, version: str, out_dir: Path,
     machine and applied with `bootstrap.py --install <payload>`. Every sentinel is
     stripped: the target machine must verify before anything becomes visible.
     For a machine that has never seen this app, use export_full_tree().
+
+    "Incremental" here means ONLY 「不含 runtime」. The version directory still travels
+    whole — see the hardlink note above _files_index() — so an app with an 84 MB model
+    file ships 84 MB of unchanged bytes on every release. That is now measured and
+    reported (`redundant_mb`, and a warning naming the files), because the operator was
+    choosing between a 「10 MB 增量包」 and a 「457 MB 完整包」 that did not exist.
     """
     root = Path(root)
     say = progress or _noop
+    warnings: list[str] = []
     paths = AppPaths(root, app_id)
     vdir = paths.version_dir(version)
     if not integrity.is_complete(vdir):
@@ -2671,7 +3278,28 @@ def export_update(root: Path, app_id: str, version: str, out_dir: Path,
     }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     total = _directory_size(out_app)
+
+    # WHAT THIS PACKAGE REALLY IS. The version directory travels whole, so the honest
+    # question is "how much of it does the target machine already have, byte for byte?"
+    # — and the answer, for any app with a model file or a bundled dataset, is "most
+    # of it". Said HERE, where the operator is still deciding what to put on the stick.
+    redundant = 0
+    prior = _previous_manifest(paths, version)
+    prior_version = str(prior.get("version") or "") if prior else ""
+    if prior_version:
+        try:
+            redundant, biggest = _unchanged_bytes(paths.version_dir(prior_version), vdir)
+        except Exception:                  # noqa: BLE001 - an accounting note, not a gate
+            redundant, biggest = 0, []
+        note = _redundancy_warning(prior_version, redundant, biggest,
+                                   _directory_size(out_app / "versions" / version),
+                                   what="這個更新包裡的版本目錄")
+        if note:
+            warnings.append(note)
+            say("[注意] " + note)
+
     say(f"完成:{out_app}({total / 1024 ** 2:.0f} MB,自動更新來源)")
     return ExportResult(out_dir=out_app, total_mb=total / 1024 ** 2, apps=[app_id],
                         versions=[version], includes_runtime=bool(want_deps),
-                        kind="update")
+                        kind="update", warnings=warnings,
+                        redundant_mb=redundant / 1024 ** 2)

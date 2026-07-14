@@ -31,13 +31,30 @@ def _make_module(root: Path, tool_id: str, body: str) -> Path:
     return folder
 
 
-def test_discovers_single_module_directly(tmp_path: Path):
+def test_reads_metadata_from_the_module_root(tmp_path: Path):
     folder = _make_module(tmp_path, "module_042", "name: 甲\nversion: 1.2.3\ncategory: module\n")
     (folder / "run.py").write_text("print('ok')\n", encoding="utf-8")
-    found = discover_source_modules(folder, PY)
+    found = discover_source_modules(tmp_path, PY)
     assert [m.tool_id for m in found] == ["module_042"]
     assert found[0].version == "1.2.3" and found[0].name == "甲"
     assert found[0].enabled is True and found[0].category == "module"
+
+
+def test_pointing_at_one_module_instead_of_the_layer_above_is_refused(tmp_path: Path):
+    """「Module 資料夾」的檔案選擇器是從 modules\\ 裡面打開的,往下多點一層是最常見的手誤。
+    以前這裡照單全收,於是 18 個模組安靜地只打包到 1 個,整條流程全綠——錯誤要到工廠
+    現場才浮出來。擋下來,而且要把「該指哪一層」直接寫給他,不是只說「你錯了」。"""
+    folder = _make_module(tmp_path, "module_042", "version: 1.0.0\n")
+    _make_module(tmp_path, "module_043", "version: 1.0.0\n")   # 一起被漏掉的那些
+
+    with pytest.raises(ScanError) as exc:
+        discover_source_modules(folder, PY)
+
+    message = str(exc.value)
+    assert "一個模組" in message                  # 說出錯在哪
+    assert str(tmp_path) in message               # 說出該指到哪一層(可直接複製貼上)
+    assert "Module 資料夾" in message             # 用他螢幕上那個欄位的名字
+    message.encode("cp950")                       # GUI/主控台在 cp950 下不能炸
 
 
 def test_discovers_multiple_modules_from_root_sorted(tmp_path: Path):
@@ -61,7 +78,7 @@ def test_missing_id_raises(tmp_path: Path):
     folder.mkdir()
     (folder / "plugin.yaml").write_text("name: 無 id\n", encoding="utf-8")
     with pytest.raises(ScanError, match="缺少 id"):
-        discover_source_modules(folder, PY)
+        discover_source_modules(tmp_path, PY)      # 從模組的上一層掃進去
 
 
 def test_no_plugin_yaml_raises(tmp_path: Path):
@@ -78,7 +95,7 @@ def test_packaging_excludes_pycache_and_compiled(tmp_path: Path):
     (folder / "sub").mkdir()
     (folder / "sub" / "helper.py").write_text("x = 1\n", encoding="utf-8")
 
-    module = discover_source_modules(folder, PY)[0]
+    module = discover_source_modules(folder.parent, PY)[0]
     manifest = package_source_module(module, tmp_path / "out")
 
     pack = tmp_path / "out" / "source-packages" / "module_042"
@@ -92,7 +109,7 @@ def test_packaging_excludes_pycache_and_compiled(tmp_path: Path):
 def test_manifest_signs_each_file_with_sha256(tmp_path: Path):
     folder = _make_module(tmp_path, "module_042", "version: 1.0.0\n")
     (folder / "run.py").write_text("print('signed')\n", encoding="utf-8")
-    module = discover_source_modules(folder, PY)[0]
+    module = discover_source_modules(folder.parent, PY)[0]
     manifest = package_source_module(module, tmp_path / "out")
 
     pack = tmp_path / "out" / "source-packages" / "module_042"
@@ -108,7 +125,7 @@ def test_manifest_signs_each_file_with_sha256(tmp_path: Path):
 def test_repack_replaces_content_atomically(tmp_path: Path):
     folder = _make_module(tmp_path, "module_042", "version: 1.0.0\n")
     (folder / "run.py").write_text("OLD\n", encoding="utf-8")
-    module = discover_source_modules(folder, PY)[0]
+    module = discover_source_modules(folder.parent, PY)[0]
     out = tmp_path / "out"
     package_source_module(module, out)
 
@@ -124,7 +141,7 @@ def test_repack_replaces_content_atomically(tmp_path: Path):
 
 def test_requires_and_defaults_captured(tmp_path: Path):
     folder = _make_module(tmp_path, "module_042", "requires:\n  - cowsay\n  - '  '\nenabled: false\n")
-    module = discover_source_modules(folder, PY)[0]
+    module = discover_source_modules(folder.parent, PY)[0]
     assert module.requires == ("cowsay",)  # 空白項被濾掉
     assert module.enabled is False
     assert module.category == "module"  # 未寫 category 時預設 module

@@ -255,7 +255,10 @@ def test_missing_from_lock_names_the_module_and_where_it_is_imported(tmp_path):
     message = report.failure_message()
     assert "duckdb" in message
     assert "app.py:2" in message                       # WHERE it is imported
-    assert "加進" in message and "requirements" in message      # way out #1
+    # way out #1 — "put it in the dependency declaration". WHICH declaration
+    # depends on the install source: a pinned lock means the extras field is
+    # inert, so the only thing that changes the outcome is a pin in that lock.
+    assert "加進" in message and ("requirements" in message or "lock" in message)
     assert "確認它真的是選用的" in message                        # way out #2
     assert "try/except ImportError" in message          # …and how to say so honestly
     assert "一定跑不起來" not in message                 # not an assertion
@@ -281,7 +284,7 @@ def test_the_failure_message_never_tells_anyone_to_move_an_import_into_a_functio
     assert "移到函式內" not in message
     assert "用到才 import" not in message
     # the two honest ways out, and only those
-    assert "加進" in message and "requirements" in message
+    assert "加進" in message and ("requirements" in message or "lock" in message)
     assert "try/except ImportError" in message
     message.encode("cp950")
 

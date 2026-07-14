@@ -186,7 +186,10 @@ def _module_collection(root: Path, count: int = 3) -> Path:
     for i in range(count):
         module = root / "modules" / f"module_{i:03d}"
         module.mkdir(parents=True)
-        (module / "plugin.yaml").write_text("id: module\n", encoding="utf-8")
+        # Real ids: these fixtures get fed to discover_source_modules, which (rightly)
+        # rejects a folder whose modules all claim the same id.
+        (module / "plugin.yaml").write_text(
+            f"id: module_{i:03d}\nversion: 1.0.0\n", encoding="utf-8")
         (module / f"{i:03d}_input.py").write_text(
             "import streamlit as st\nst.title('module')\n", encoding="utf-8")
     return root
@@ -211,8 +214,183 @@ def test_a_cim_module_collection_on_the_streamlit_tab_is_told_which_tab_to_use(t
     assert not found.found
     assert "plugin.yaml" in found.hint                       # what this folder IS
     assert "CIM 平台模組" in found.hint                       # the tab that wants it
-    assert "平台專案" in found.hint                           # the field on that tab
+    assert discover.MODULE_ROOT_FIELD in found.hint          # the field that ACCEPTS it
     found.hint.encode("cp950")
+
+
+def test_cim_modules_are_never_offered_as_streamlit_entry_point_candidates(tmp_path):
+    """The hint used to open with 「找到多個可能的入口(modules/module_000/000_input.py…),
+    請用「瀏覽…」自行指定」 and only THEN mention the wrong tab. The four "candidates"
+    are CIM modules; picking one is exactly the mistake being rescued from. When the
+    rescue fires it must replace that invitation, not queue up behind it."""
+    _module_collection(tmp_path, count=18)
+
+    hint = discover.find_entrypoint(tmp_path).hint
+
+    assert "瀏覽" not in hint and "自行指定" not in hint     # no invitation to pick one
+    assert "000_input.py" not in hint                        # not even listed as a candidate
+    assert discover.MODULE_ROOT_FIELD in hint                # just the way out
+    hint.encode("cp950")
+
+
+def test_two_plausible_pages_still_get_the_invitation(tmp_path):
+    """…and the rescue must not eat the normal answer: a real Streamlit project with
+    two candidate pages needs 「瀏覽…」, which is the correct advice there."""
+    for name in ("one.py", "two.py"):
+        (tmp_path / name).write_text("import streamlit as st\nst.title('x')\n", encoding="utf-8")
+    hint = discover.find_entrypoint(tmp_path).hint
+    assert "瀏覽" in hint and "one.py" in hint and "two.py" in hint
+
+
+def test_the_rescue_names_a_field_that_actually_accepts_the_folder(tmp_path):
+    """The rescue used to end with 「把「平台專案」指到這裡」. PlatformGateway requires
+    <it>\\sidecar\\python-engine\\engine.py, which a module collection never has — so
+    following our own advice hit a hard error 100% of the time.
+
+    This test refuses to take the hint's word for it: it feeds the folder the hint
+    names into the code behind that field, and the folder the OLD hint named into the
+    code behind THAT field, and checks which one survives."""
+    import sys
+
+    from provision_builder.gateway import GatewayError, PlatformGateway
+    from provision_builder.source_pack import discover_source_modules
+
+    _module_collection(tmp_path, count=3)
+    hint = discover.hint_for_streamlit_tab(tmp_path)
+
+    # The old advice: this folder into 「平台專案」. Still a dead end — so the hint
+    # must not send anyone there, and must say so out loud.
+    with pytest.raises(GatewayError):
+        PlatformGateway(tmp_path)
+    assert f"把「{discover.PLATFORM_FIELD}」指到這裡" not in hint
+    assert discover.PLATFORM_FIELD_IS_THE_PLATFORM in hint
+
+    # The new advice: 「Module 資料夾」 → this exact path. Run it through the code that
+    # field feeds, and it must actually load the modules.
+    collection = discover.find_module_collection(tmp_path)
+    assert collection.module_root == tmp_path / "modules"
+    assert str(collection.module_root) in hint
+    modules = discover_source_modules(collection.module_root, [sys.executable])
+    assert len(modules) == 3
+    hint.encode("cp950")
+
+
+def test_a_plugin_yaml_in_tests_fixtures_does_not_suppress_the_streamlit_rescue(tmp_path):
+    """The GUI kept its own depth-3 plugin.yaml glob with no skip list. One
+    `tests/fixtures/plugin.yaml` — a fixture, not a module — was enough to make the
+    tool declare a Streamlit project a CIM module collection, and the entire Streamlit
+    rescue vanished: the operator was told to point 「Module 資料夾」 at their tests
+    folder. SKIPPED_DIRS is the whole difference."""
+    (tmp_path / "app.py").write_text("import streamlit as st\nst.title('real')\n", encoding="utf-8")
+    fixtures = tmp_path / "tests" / "fixtures"
+    fixtures.mkdir(parents=True)
+    (fixtures / "plugin.yaml").write_text("id: not_a_module\n", encoding="utf-8")
+
+    assert discover.find_plugin_manifests(tmp_path) == []
+    assert not discover.find_module_collection(tmp_path).found
+
+    hint = discover.hint_for_cim_tab(tmp_path)
+    assert discover.STREAMLIT_TAB in hint                    # the rescue fires…
+    assert str(fixtures) not in hint                         # …and never names the fixture folder
+    assert discover.MODULE_ROOT_FIELD not in hint            # this is not a module collection
+    hint.encode("cp950")
+
+
+# ── where the modules live: one implementation, used by both tabs ─────────────
+
+def test_module_root_is_the_layer_that_directly_holds_the_module_folders(tmp_path):
+    _module_collection(tmp_path, count=18)
+    collection = discover.find_module_collection(tmp_path)
+    assert collection.found
+    assert len(collection.manifests) == 18
+    assert collection.module_root == tmp_path / "modules"     # not tmp_path, not a module
+    assert not collection.is_single_module
+
+
+def test_pointing_at_one_module_reports_the_layer_above_it(tmp_path):
+    """source_pack refuses this folder; the answer it needs — the parent — is the
+    same 'where do the modules live' calculation, so it lives in the same place."""
+    module = tmp_path / "modules" / "module_001"
+    module.mkdir(parents=True)
+    (module / "plugin.yaml").write_text("id: m\n", encoding="utf-8")
+
+    collection = discover.find_module_collection(module)
+    assert collection.is_single_module
+    assert collection.module_root == tmp_path / "modules"
+
+
+def test_the_cim_tab_stays_quiet_when_the_folder_is_already_the_module_root(tmp_path):
+    """「請把欄位改成它現在的值」 is what the previous version said. The fault is
+    elsewhere (a broken plugin.yaml, the wrong platform); do not send them chasing it."""
+    for i in range(3):
+        module = tmp_path / f"module_{i:03d}"
+        module.mkdir()
+        (module / "plugin.yaml").write_text("id: m\n", encoding="utf-8")
+
+    collection = discover.find_module_collection(tmp_path)
+    assert collection.already_correct
+    assert discover.hint_for_cim_tab(tmp_path) == ""
+
+
+def test_one_stray_manifest_does_not_drag_the_operator_away_from_the_other_18(tmp_path):
+    """Ties go to the layer holding the MOST modules."""
+    _module_collection(tmp_path, count=18)                     # modules/module_XXX/plugin.yaml
+    stray = tmp_path / "sandbox" / "one_off"
+    stray.mkdir(parents=True)
+    (stray / "plugin.yaml").write_text("id: stray\n", encoding="utf-8")
+
+    assert discover.find_module_collection(tmp_path).module_root == tmp_path / "modules"
+
+
+def test_a_streamlit_project_on_the_cim_tab_is_sent_to_the_streamlit_tab(tmp_path):
+    (tmp_path / "app.py").write_text("import streamlit as st\nst.title('x')\n", encoding="utf-8")
+    hint = discover.hint_for_cim_tab(tmp_path)
+    assert discover.STREAMLIT_TAB in hint
+    assert discover.SD_PROJECT_FIELD in hint
+    assert str(tmp_path) in hint
+    hint.encode("cp950")
+
+
+# ── the folder pick must not freeze the UI ───────────────────────────────────
+
+def test_the_venv_is_never_descended_into(tmp_path, monkeypatch):
+    """`sorted(rglob("*.py"))` listed every .py in the project and filtered afterwards:
+    on the real C:\\code\\claude\\AI4BI that is 9343 files, nearly all inside .venv —
+    2.4–3.2 s (measured) of frozen Tk main thread on every folder pick, for the same
+    103 candidates os.walk finds in 4–6 ms. Filtering after the walk is not the same
+    as not walking — prune `dirnames` in place or os.walk has already gone in."""
+    (tmp_path / "app.py").write_text("import streamlit as st\nst.title('x')\n", encoding="utf-8")
+    deep = tmp_path / ".venv" / "Lib" / "site-packages" / "pandas"
+    deep.mkdir(parents=True)
+    (deep / "core.py").write_text("import streamlit as st\n", encoding="utf-8")
+
+    visited: list[str] = []
+    real_walk = discover.os.walk
+
+    def spy(top, *args, **kwargs):
+        for row in real_walk(top, *args, **kwargs):
+            visited.append(str(row[0]))
+            yield row
+
+    monkeypatch.setattr(discover.os, "walk", spy)
+    files = list(discover._searchable_py(tmp_path))
+
+    assert tmp_path / "app.py" in files
+    assert not any(".venv" in v for v in visited)      # never opened the door
+    assert all(".venv" not in str(f) for f in files)
+
+
+def test_files_deeper_than_max_depth_are_still_ignored(tmp_path):
+    """Pruning must not quietly widen the search: the depth limit is what keeps a
+    40 GB folder picked by mistake from being crawled."""
+    deep = tmp_path / "a" / "b" / "c" / "d"
+    deep.mkdir(parents=True)
+    (deep / "buried.py").write_text("import streamlit as st\nst.title('x')\n", encoding="utf-8")
+    (tmp_path / "a" / "b" / "c" / "reachable.py").write_text("x = 1\n", encoding="utf-8")
+
+    files = list(discover._searchable_py(tmp_path))
+    assert tmp_path / "a" / "b" / "c" / "reachable.py" in files
+    assert deep / "buried.py" not in files
 
 
 def test_a_folder_with_neither_streamlit_nor_an_app_still_names_the_other_tab(tmp_path):

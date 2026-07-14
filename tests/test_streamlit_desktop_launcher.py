@@ -155,6 +155,102 @@ def test_load_manifest_reports_missing_keys(tmp_path: Path):
         launch.load_manifest(tmp_path)
 
 
+# ── this MACHINE is broken vs this VERSION is broken ─────────────────────────
+
+def _store_package(tmp_path: Path) -> Path:
+    """A store-layout version tree: everything load_manifest() insists on exists,
+    and the shell comes from the SHARED store the way bootstrap hands it over."""
+    pkg = tmp_path / "v1.1.0"
+    (pkg / "application").mkdir(parents=True)
+    (pkg / "application" / "app.py").write_text("import streamlit as st\n", encoding="utf-8")
+    (pkg / "launcher").mkdir()
+    (pkg / "launcher" / "engine_shim.py").write_text("", encoding="utf-8")
+    (pkg / "app-package.json").write_text(json.dumps({
+        "app_id": "app-demo", "display_name": "Demo",
+        "entrypoint": "application/app.py",
+        "engine_shim": "launcher/engine_shim.py",
+        # schema 2: the runtime is SHARED, so _python is sys.executable
+        "runtime_fingerprint": "cp311-aaaaaaaaaaaa",
+    }), encoding="utf-8")
+    return pkg
+
+
+def _shared_shell(tmp_path: Path, *, present: bool) -> Path:
+    """deps/shells/<fp>/cim-light.exe — outside every version, used by all of them."""
+    exe = tmp_path / "deps" / "shells" / "sh-abc" / "cim-light.exe"
+    if present:
+        exe.parent.mkdir(parents=True)
+        exe.write_bytes(b"MZ")
+    return exe
+
+
+def test_a_missing_shared_shell_does_not_mark_the_version_failed(tmp_path, monkeypatch,
+                                                                 capsys):
+    """The shell lives in deps/shells/<fp>/ and EVERY version in the store points at
+    the same one. Antivirus eats it, and load_manifest's existence loop raised the same
+    ManifestError it raises for a missing entrypoint — so main() returned 4, bootstrap
+    marked a perfectly good version failed (a sticky verdict: only --clear-failed undoes
+    it), rolled back onto a version missing the identical folder, watched it die the same
+    way, and announced 「已恢復前一版本」 about a recovery that never happened.
+
+    Exit 5 is the code that means 'touch no state, blame no version'."""
+    pkg = _store_package(tmp_path)
+    monkeypatch.setenv("CIM_SHELL_EXE", str(_shared_shell(tmp_path, present=False)))
+    monkeypatch.setenv("CIM_APP_DATA", str(tmp_path / "data"))
+    monkeypatch.setattr(launch, "PKG_ROOT", pkg)
+
+    with pytest.raises(launch.SharedComponentError):
+        launch.load_manifest(pkg)
+
+    assert launch.main([]) == launch.EXIT_MACHINE_BROKEN     # 5 — never 4
+    err = capsys.readouterr().err
+    assert "共用" in err                                     # whose component it is
+    assert "不會退版" in err and "不會把這個版本標記為失敗" in err
+    assert "WebView2" in err and "排除清單" in err            # …and what to DO about it
+    err.encode("cp950")
+
+
+def test_a_missing_entrypoint_is_still_this_versions_fault(tmp_path, monkeypatch, capsys):
+    """The other side of the line, and the reason SharedComponentError has to be caught
+    BEFORE ManifestError rather than instead of it: a file that THIS VERSION declares
+    inside THIS VERSION's own folder is version-specific. It must still be exit 4."""
+    pkg = _store_package(tmp_path)
+    (pkg / "application" / "app.py").unlink()
+    monkeypatch.setenv("CIM_SHELL_EXE", str(_shared_shell(tmp_path, present=True)))
+    monkeypatch.setenv("CIM_APP_DATA", str(tmp_path / "data"))
+    monkeypatch.setattr(launch, "PKG_ROOT", pkg)
+
+    assert launch.main([]) == launch.EXIT_VERSION_BROKEN     # 4: fail it, roll back
+    err = capsys.readouterr().err
+    assert "自動退回上一個可用版本" in err                     # and TELL the user that
+    err.encode("cp950")
+
+
+# ── the red text on the factory floor ────────────────────────────────────────
+
+def test_the_missing_package_message_is_written_for_the_person_who_is_reading_it(tmp_path):
+    """It used to end with 「請回到打包工具,把上面的套件加進 requirements(或 lock 檔)後
+    重新建置這個版本」 — the last word on the screen of a production machine, addressed to
+    an admin who is not in the room, read by a line worker who has never seen the
+    packaging tool and cannot act on a single word of it. They take it to mean the line
+    is down until somebody comes. It is not: the machine rolls itself back within
+    seconds, and that fact was nowhere on the screen."""
+    text = launch.missing_modules_message(["cv2"], tmp_path / "application")
+    lines = text.splitlines()
+
+    def at(needle: str) -> int:
+        return next(i for i, line in enumerate(lines) if needle in line)
+
+    # what the person in the room needs, and needs FIRST
+    assert "自動退回上一個可用版本" in text and "您不需要做任何事" in text
+    assert "交給管理員" in text
+    # the rebuild instruction survives — demoted to one line, under a heading that
+    # says out loud that it is not for the reader.
+    assert at("您不需要做任何事") < at("以下請交給管理員") < at("重新建置這個版本")
+    assert "opencv-python" in text          # the admin still gets everything they need
+    text.encode("cp950")
+
+
 # ── port selection ───────────────────────────────────────────────────────────
 
 def test_pick_port_uses_preferred_when_free():

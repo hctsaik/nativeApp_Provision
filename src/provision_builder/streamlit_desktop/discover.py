@@ -104,21 +104,54 @@ def default_output(repo_root: Path | None = None) -> Path:
 
 def _searchable_py(project: Path, max_depth: int = 3):
     """Project .py files worth considering as an entry point. Skips build junk
-    and the places an entry point never hides (tests, spikes, docs)."""
+    and the places an entry point never hides (tests, spikes, docs).
+
+    Prunes as it walks instead of listing everything and filtering afterwards.
+    `rglob("*.py")` visits every file it is asked to discard: 9343 of AI4BI's .py
+    files live in `.venv`, and the old version spent 2.4–3.2 s (measured, warm cache)
+    listing and sorting them all before throwing away everything but 103 — with the Tk
+    main thread blocked, because this runs the moment the operator picks a folder.
+    Same 103 candidates, in the same order, in 4–6 ms. `dirnames[:] = ...` is the
+    difference between "descend into 20k files" and "never open the door": filtering
+    after the walk is not the same as not walking.
+    """
+    project = Path(project)
     skip = set(SKIPPED_DIRS)
-    for path in sorted(project.rglob("*.py")):
-        rel = path.relative_to(project)
-        if len(rel.parts) > max_depth + 1:
-            continue
-        if any(part in skip or part.startswith(".") for part in rel.parts[:-1]):
-            continue
-        yield path
+    base = len(project.parts)
+    found: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(project):   # os.walk swallows OSError by design
+        here = Path(dirpath)
+        depth = len(here.parts) - base                      # 0 == the project root itself
+        # In-place, or os.walk has already committed to descending.
+        dirnames[:] = [] if depth >= max_depth else [
+            d for d in dirnames if d not in skip and not d.startswith(".")
+        ]
+        found.extend(here / name for name in filenames if name.endswith(".py"))
+    # Callers compare candidates by path; keep the old global ordering so that
+    # "shallowest, then alphabetical" stays deterministic across machines.
+    yield from sorted(found)
 
 
-# The GUI's two tabs, named exactly as the operator reads them. A rescue hint that
-# says "the other tab" and makes them go looking for it is half a rescue.
+# The GUI's two tabs and the three fields a rescue can send someone to, spelled
+# exactly as they appear on screen. A hint that says "the other tab" and makes them
+# go looking for it is half a rescue; a hint that names a field which then REJECTS
+# the value is worse than none — it costs a round trip and the operator's trust.
 CIM_TAB = "CIM 平台模組（需 plugin.yaml）"
 STREAMLIT_TAB = "Streamlit 專案 → 桌面 App"
+MODULE_ROOT_FIELD = "Module 資料夾"      # CIM tab: the layer holding the module folders
+PLATFORM_FIELD = "平台專案"              # CIM tab: the platform itself — see the warning below
+SD_PROJECT_FIELD = "專案資料夾"          # Streamlit tab
+
+# 「平台專案」 is NOT "wherever your code is": PlatformGateway requires
+# <it>\sidecar\python-engine\engine.py and raises GatewayError otherwise. A module
+# collection (ANnoTation) has no engine — telling its owner to put it there, as this
+# module did until now, is advice that fails 100% of the time. The modules go in
+# 「Module 資料夾」; 「平台專案」 keeps pointing at the platform.
+PLATFORM_FIELD_IS_THE_PLATFORM = (
+    f"「{PLATFORM_FIELD}」要留給 CIM 平台本身"
+    "(底下有 sidecar\\python-engine\\engine.py 的那一層,例如 C:\\code\\claude\\nativeApp),"
+    "不是這個資料夾——填錯會直接失敗。"
+)
 
 PLUGIN_MANIFEST = "plugin.yaml"
 # ANnoTation keeps its 18 plugin.yaml files at modules/module_XXX/plugin.yaml, so
@@ -131,7 +164,13 @@ _PLUGIN_GLOBS = (PLUGIN_MANIFEST, f"*/{PLUGIN_MANIFEST}", f"*/*/{PLUGIN_MANIFEST
 def find_plugin_manifests(project: Path, limit: int = 50) -> list[Path]:
     """The plugin.yaml files under `project`: the signature of a CIM module
     collection. Bounded (globs, a few levels, a cap) because this runs on every
-    folder the operator picks, including a 40 GB one they picked by mistake."""
+    folder the operator picks, including a 40 GB one they picked by mistake.
+
+    SKIPPED_DIRS is load-bearing, not hygiene: a Streamlit project with a
+    `tests/fixtures/plugin.yaml` is still a Streamlit project. Counting that file
+    as a module makes the tool declare the whole project a CIM module collection
+    and swallow the Streamlit rescue entirely — the operator is then told to point
+    「Module 資料夾」 at their `tests` folder."""
     project = Path(project)
     if not project.is_dir():
         return []
@@ -150,19 +189,119 @@ def find_plugin_manifests(project: Path, limit: int = 50) -> list[Path]:
     return found
 
 
-def wrong_tab_hint(project: Path) -> str:
-    """"這裡沒有 Streamlit 入口" is true and useless when the operator has pointed
-    a CIM module collection at the Streamlit tab. Say what the folder IS, and name
-    the tab that wants it — the CIM tab has done this for Streamlit projects since
-    day one, and the courtesy was never returned."""
-    hits = find_plugin_manifests(project)
-    if not hits:
+@dataclass(frozen=True)
+class ModuleCollection:
+    """What a folder is, in CIM terms — and where its modules actually live.
+
+    One implementation, because "where do the modules live" was computed in two
+    places (here and the GUI) and the two answers had already drifted apart.
+    """
+
+    folder: Path                       # what the operator pointed at
+    manifests: tuple[Path, ...]        # the plugin.yaml files under it (skip list applied)
+    module_root: Path | None           # the layer that DIRECTLY holds the module folders
+
+    @property
+    def found(self) -> bool:
+        return bool(self.manifests)
+
+    @property
+    def is_single_module(self) -> bool:
+        """They pointed at one module, not at the layer above it. `module_root`
+        is then the parent — the folder that holds this module and its siblings."""
+        return any(m.parent == self.folder for m in self.manifests)
+
+    @property
+    def already_correct(self) -> bool:
+        """The folder IS the module root. Say nothing: the fault is elsewhere, and
+        「請把欄位改成它現在的值」 is the kind of advice that ends support calls badly."""
+        return self.found and self.module_root == self.folder
+
+    def example(self) -> str:
+        if not self.manifests:
+            return ""
+        try:
+            return self.manifests[0].relative_to(self.folder).as_posix()
+        except ValueError:  # pragma: no cover — manifests always sit under folder
+            return self.manifests[0].name
+
+    def count(self) -> str:
+        return f"{len(self.manifests)} 個" if len(self.manifests) < 50 else "很多"
+
+
+def find_module_collection(folder: Path, limit: int = 50) -> ModuleCollection:
+    """The one answer to "is this a CIM module collection, and where do I point
+    「Module 資料夾」?" — call this from the GUI instead of keeping a second copy.
+
+    `module_root` is the layer that directly contains the module folders, which is
+    what 「Module 資料夾」 wants (`source_pack.discover_source_modules` globs
+    `*/plugin.yaml` from it). Ties go to the layer holding the MOST modules, so one
+    stray manifest cannot drag the operator away from the folder holding the other 18.
+    """
+    folder = Path(folder)
+    manifests = tuple(find_plugin_manifests(folder, limit=limit))
+    root: Path | None = None
+    if manifests:
+        counts: dict[Path, int] = {}
+        for hit in manifests:
+            # hit.parent == the module folder → hit.parent.parent == the layer above it.
+            # For a plugin.yaml sitting directly in `folder`, that lands on folder.parent:
+            # correct, and exactly what the "you pointed at a single module" rescue needs.
+            counts[hit.parent.parent] = counts.get(hit.parent.parent, 0) + 1
+        root = sorted(counts, key=lambda p: (-counts[p], len(p.parts), str(p)))[0]
+    return ModuleCollection(folder=folder, manifests=manifests, module_root=root)
+
+
+def hint_for_streamlit_tab(project: Path) -> str:
+    """The operator is on the Streamlit tab with a folder it cannot build.
+
+    "這裡沒有 Streamlit 入口" is true and useless when what they have is a CIM module
+    collection. Name what the folder IS, and name a field that will ACCEPT it — this
+    hint used to say 「平台專案」, which rejects it every single time.
+    """
+    collection = find_module_collection(project)
+    if not collection.found or collection.module_root is None:
         return ""
-    example = hits[0].relative_to(Path(project)).as_posix()
-    count = f"{len(hits)} 個" if len(hits) < 50 else "很多"
-    return (f"\n這個資料夾底下有 {count} plugin.yaml(例:{example}),"
+    return (f"\n這個資料夾底下有 {collection.count()} plugin.yaml(例:{collection.example()}),"
             f"看起來是 CIM 平台模組集合,不是 Streamlit 專案。\n"
-            f"請改用「{CIM_TAB}」分頁,把「平台專案」指到這裡。")
+            f"請改用「{CIM_TAB}」分頁,把「{MODULE_ROOT_FIELD}」指到:{collection.module_root}\n"
+            f"{PLATFORM_FIELD_IS_THE_PLATFORM}")
+
+
+def hint_for_cim_tab(folder: Path) -> str:
+    """The operator is on the CIM tab (the tab the GUI opens on) with a folder that
+    failed to scan. Three different truths, and the wrong one is a dead end:
+
+    * the modules are there, just one layer down  → name the layer;
+    * this is a Streamlit project                 → name the other tab;
+    * they already point at the module root       → say nothing, the fault is elsewhere.
+
+    A single module folder gets nothing here on purpose: `discover_source_modules`
+    raises a better-worded error naming its parent, and printing both would show the
+    operator the same paragraph twice.
+    """
+    folder = Path(folder)
+    try:
+        collection = find_module_collection(folder)
+        if collection.found:
+            if collection.already_correct or collection.is_single_module:
+                return ""
+            return ("\n\n這個資料夾底下其實有 plugin.yaml"
+                    f"(例:{collection.example()}),只是不在掃描的那一層。\n"
+                    f"請把「{MODULE_ROOT_FIELD}」改指到:{collection.module_root}\n"
+                    f"(「{MODULE_ROOT_FIELD}」= 直接裝著各個模組資料夾的那一層。)")
+        if not looks_like_streamlit(folder):
+            return ""
+        entry = find_entrypoint(folder)
+    except OSError:
+        return ""
+
+    which = f"(入口:{entry.value.name})" if entry.found else "(入口有多個候選,屆時可自行指定)"
+    return (f"\n\n這看起來是一個 Streamlit 專案{which},不是 CIM 平台模組"
+            "(本頁需要 plugin.yaml)。\n"
+            f"請改用上方的「{STREAMLIT_TAB}」分頁——"
+            "它會把這個專案打成 User 可直接執行的資料夾。\n"
+            f"(那一頁的「{SD_PROJECT_FIELD}」填:{folder})")
 
 
 def _is_streamlit_app(path: Path) -> bool:
@@ -201,8 +340,8 @@ def find_entrypoint(project: Path) -> Detected:
         if len(rivals) > 1:
             names = "、".join(p.relative_to(project).as_posix() for p in rivals[:4])
             return Detected(None, "有多個候選",
-                            hint=f"找到多個同名入口({names}…),請自行指定。"
-                                 + wrong_tab_hint(project))
+                            hint=_ask_or_rescue(project,
+                                                f"找到多個同名入口({names}…),請自行指定。"))
         return Detected(best, f"自動偵測:{best.relative_to(project).as_posix()}")
 
     apps = [p for p in candidates if _is_streamlit_app(p)]
@@ -217,11 +356,24 @@ def find_entrypoint(project: Path) -> Detected:
         # way out, not just the empty one.
         names = "、".join(p.relative_to(project).as_posix() for p in apps[:4])
         return Detected(None, "有多個候選",
-                        hint=f"找到多個可能的入口({names}…),請用「瀏覽…」自行指定。"
-                             + wrong_tab_hint(project))
+                        hint=_ask_or_rescue(
+                            project, f"找到多個可能的入口({names}…),請用「瀏覽…」自行指定。"))
+    # The empty dead end. Here the diagnosis is not harmful advice, so it stays and the
+    # rescue is appended to it.
     return Detected(None, "找不到",
                     hint="這個資料夾裡沒有 import streamlit 的 .py,請確認選對專案。"
-                         + wrong_tab_hint(project))
+                         + hint_for_streamlit_tab(project))
+
+
+def _ask_or_rescue(project: Path, ask: str) -> str:
+    """「請自行指定」 is the right answer for a Streamlit project with two plausible
+    pages. It is the WRONG answer for a CIM module collection: those "candidates" are
+    18 CIM modules, and inviting the operator to pick one as a Streamlit entry point is
+    the mistake the rescue exists to prevent — offering it and then explaining they are
+    on the wrong tab just leaves both doors open. When the rescue fires, it replaces
+    the invitation instead of trailing after it."""
+    rescue = hint_for_streamlit_tab(project)
+    return rescue.lstrip("\n") if rescue else ask
 
 
 def suggest_name(project: Path) -> str:

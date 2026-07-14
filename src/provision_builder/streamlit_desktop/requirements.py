@@ -123,12 +123,19 @@ def resolve(project_dir: Path, explicit: Path | None = None,
         explicit = Path(explicit)
         if not explicit.is_file():
             raise RequirementsError(f"找不到指定的 requirements 檔:{explicit}")
-        # An explicitly chosen pyproject.toml is still a pyproject: extras apply.
-        is_pyproject = explicit.name == "pyproject.toml"
-        lost = () if is_pyproject else tuple(extras)
+        # An explicitly chosen pyproject.toml is still a pyproject — the old comment
+        # here said exactly that and the code then did the opposite: it handed the
+        # path straight to pip as a requirements file. `pip install -r pyproject.toml`
+        # tries to parse TOML as requirement lines, and it does so AFTER we have
+        # copied a 500 MB runtime. 「檢查專案」 was green the whole way.
+        #
+        # Take the same road the auto-discovered pyproject takes: extract the
+        # dependencies and write a real requirements file.
+        if explicit.name == "pyproject.toml":
+            return _from_pyproject(explicit, extras, staging,
+                                   label=f"指定檔案:{explicit.name}")
         return Requirements(explicit, f"指定檔案:{explicit.name}", generated=False,
-                            ignored_extras=lost,
-                            pyproject=explicit if is_pyproject else None)
+                            ignored_extras=tuple(extras), pyproject=None)
 
     # A lock/requirements file wins — but the project may STILL have a pyproject
     # whose optional groups explain a missing package. Carrying it costs nothing
@@ -144,19 +151,7 @@ def resolve(project_dir: Path, explicit: Path | None = None,
 
     pyproject = project_dir / "pyproject.toml"
     if pyproject.is_file():
-        deps = pyproject_dependencies(pyproject, extras)   # raises if there are none
-        source = "pyproject.toml 的 [project].dependencies"
-        if extras:
-            source += f"(含選用群組:{'、'.join(extras)})"
-        if staging is None:
-            return Requirements(pyproject, source, generated=True, pyproject=pyproject)
-        target = Path(staging) / "requirements.from-pyproject.txt"
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(
-            "# 由 pyproject.toml 的相依宣告產生(建置用,勿手動編輯)\n"
-            + "\n".join(deps) + "\n",
-            encoding="utf-8")
-        return Requirements(target, source, generated=True, pyproject=pyproject)
+        return _from_pyproject(pyproject, extras, staging)
 
     raise RequirementsError(
         f"找不到相依宣告:{project_dir}\n"
@@ -169,6 +164,30 @@ def resolve(project_dir: Path, explicit: Path | None = None,
         "把那一行刪掉即可——專案自己的原始碼會直接打包進交付包,不需要 pip 再裝一次。\n"
         "  2. 已經有現成的 lock 檔(在別的位置也可以):在「進階設定 → 相依 lock 檔」"
         "直接指定它,不必動到專案。")
+
+
+def _from_pyproject(pyproject: Path, extras: tuple[str, ...],
+                    staging: Path | None, label: str = "") -> "Requirements":
+    """A pyproject is never a requirements file — it has to be turned into one.
+
+    ONE implementation, used by both the auto-discovered pyproject and the one an
+    operator points at explicitly. They used to differ: the explicit path handed
+    the .toml straight to pip, which is a failure that only surfaces after the
+    500 MB runtime copy.
+    """
+    deps = pyproject_dependencies(pyproject, extras)       # raises if there are none
+    source = label or "pyproject.toml 的 [project].dependencies"
+    if extras:
+        source += f"(含選用群組:{'、'.join(extras)})"
+    if staging is None:                                    # read-only 「檢查專案」
+        return Requirements(pyproject, source, generated=True, pyproject=pyproject)
+    target = Path(staging) / "requirements.from-pyproject.txt"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        "# 由 pyproject.toml 的相依宣告產生(建置用,勿手動編輯)\n"
+        + "\n".join(deps) + "\n",
+        encoding="utf-8")
+    return Requirements(target, source, generated=True, pyproject=pyproject)
 
 
 def declared_names(found: "Requirements", extras: tuple[str, ...] = ()) -> list[str]:

@@ -70,13 +70,34 @@ EXCLUDED_DIRS_ROOT_ONLY = (
 # else — that is the one that decides what travels.
 EXCLUDED_DIRS = EXCLUDED_DIRS_ANY_DEPTH + EXCLUDED_DIRS_ROOT_ONLY
 
-# Build-time artifacts that a running app never reads. Archives are here for the
-# same reason as the wheelhouse: a 200 MB dataset.zip beside the app is payload
-# nobody asked to ship, and the operator never sees it leave.
-EXCLUDED_FILES = (
-    "*.pyc", "*.pyo", "*.whl", "*.egg-info",
-    "*.tar.gz", "*.zip", "*.7z",
-)
+# Build-time artifacts, split by DEPTH for exactly the same reason the directories
+# above are — and it is the same bug, one class up.
+#
+#   ANY DEPTH — files a running app can never be reading, wherever they sit. `*.pyc`
+#   / `*.pyo` are regenerated from the source we are shipping beside them;
+#   `*.egg-info` (a DIRECTORY, not a file) is install metadata; and a `.whl` is a
+#   package waiting to be installed, never runtime data — nothing in a delivered app
+#   opens a wheel, because its dependencies are already installed into runtime/.
+#   CV_Viewer's root `wheels/` was 124 MB of them, and a nested `vendor/wheels/` is
+#   the same 124 MB at a different address, which is why this one stays at depth.
+#
+#   ROOT ONLY — ARCHIVES. At the project root, `release.zip` / `dist.tar.gz` is
+#   something a build left lying about: junk, and frequently 200 MB of it. NESTED, an
+#   archive is DATA. `assets/data.zip`, `models/weights.tar.gz`,
+#   `tests/fixtures/sample.7z` — the app OPENS THESE AT RUN TIME. Dropping them by
+#   name at any depth is the `dist/` disaster again: the build reports success, the
+#   package even runs on the BUILD machine (where the file is still sitting next to
+#   the source we copied from), and it dies on the factory floor with a
+#   FileNotFoundError naming a path that was there the whole time. A package that is
+#   too big is a complaint; a package that lost its model bundle is a broken delivery.
+#   An operator who really does keep a 200 MB dataset.zip under assets/ can say so:
+#   `assets/*.zip` in .provisionignore. There is no way to say the reverse in time.
+EXCLUDED_FILES_ANY_DEPTH = ("*.pyc", "*.pyo", "*.whl", "*.egg-info")
+EXCLUDED_FILES_ROOT_ONLY = ("*.tar.gz", "*.zip", "*.7z")
+
+# The union, for callers that only need the cheap "is this name ever junk" filter.
+# The DEPTH-aware decision lives in builder.ignore_reason() and nowhere else.
+EXCLUDED_FILES = EXCLUDED_FILES_ANY_DEPTH + EXCLUDED_FILES_ROOT_ONLY
 
 # The project can add its own patterns, gitignore-style, without touching the GUI.
 PROVISIONIGNORE = ".provisionignore"

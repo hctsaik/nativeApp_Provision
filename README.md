@@ -43,6 +43,96 @@ GUI 的第二個分頁做的是另一件事：**把一個 Streamlit 專案變成
 操作上**只需要選一個東西：Streamlit 專案資料夾**。應用名稱與入口檔案會自動帶出，
 Tauri 殼與可攜 Python runtime 會自動偵測（偵測結果會顯示在畫面上；要換來源時打開「進階設定」）。
 
+### 哪些東西不會被交付，以及怎麼把它要回來（`.provisionignore`）
+
+建置會自動排除一批「執行時絕對用不到」的東西。**排除是預設值，不是判決**：
+每一條都能用專案根目錄的 `.provisionignore` 覆寫掉。
+
+**深度會改變一個名字的意思**，所以規則分兩層：
+
+| 規則 | 內容 | 為什麼 |
+|------|------|--------|
+| **任何深度** | `.git/` `.hg/` `.svn/` `.venv/` `__pycache__/` `.pytest_cache/` `.mypy_cache/` `.ruff_cache/` `.streamlit_cache/` `node_modules/` `site-packages/`、`*.pyc` `*.pyo` `*.whl` `*.egg-info` | 這些名字**不可能是你的 App**。`node_modules/` 是前端的建置相依（AI4BI 的巢狀那份有 200 MB），編譯結果早就在 `dist/` 裡；`.whl` 更不可能被執行時打開——相依已經裝進 `runtime/` 了。 |
+| **只在專案根目錄** | `venv/` `env/` `wheels/` `wheelhouse/` `vendor/` `dist/` `build/`、`*.zip` `*.tar.gz` `*.7z` | 這些名字**在根目錄是垃圾，往下一層就是資料**。根目錄的 `dist/` 是你自己的建置產物；但 `ui/components/xxx/frontend/dist/` **就是那個 Streamlit 元件本身**（`declare_component(path=...)` 指的就是它）。同理：根目錄的 `release.zip` 是沒人要的發布產物，`assets/data.zip`、`models/weights.tar.gz` 卻是 App **執行時要讀的檔案**。 |
+
+這兩條規則都是拿真實事故換來的：把 `dist/` 用名字砍到底，會做出一個「建置成功、跑得起來、
+元件位置一片空白」的交付包；把 `*.zip` 用名字砍到底，會做出一個在**建置機上測起來正常**
+（原檔還在專案裡）、到了工廠現場才 `FileNotFoundError` 的交付包。而工廠現場沒有網路、
+沒有原始專案，也沒有人能把那個檔案放回去。
+
+#### `.provisionignore` 語法
+
+放在**專案根目錄**，一行一條，UTF-8。語法是 gitignore 的常用子集：
+
+```gitignore
+# 註解
+*.mp4                  # 名字樣式：任何深度都比對
+recordings/            # 目錄（結尾的 / 表示只比對目錄）
+data/*                 # 路徑樣式：含 / 就比對「相對專案根目錄的路徑」，整棵子樹都排除
+docs\draft\*           # 反斜線也可以：這是 Windows 產品，你螢幕上就長這樣
+!assets/data.zip       # ! = 再包含。可以救回「被內建規則排掉」的東西
+```
+
+規則有三條：
+
+1. **含 `/` 或 `\` 的樣式比對「相對路徑」**，不含的比對「檔名」（任何深度）。
+2. **最後一條符合的規則說了算**（gitignore 語意）。`*.zip` 後面再寫 `!assets/data.zip`，
+   那個檔案就留下來；順序反過來就不會。
+3. **`!` 的對手包含內建規則**。內建排除只是「起始立場」，不是最終答案。
+
+GUI「額外排除」欄位輸入的樣式與 `.provisionignore` 走完全同一套規則，
+Fat 模式與 Store 模式也走同一套（它們一度不同，於是同一個專案在 Fat 模式排掉了
+85 MB 錄影、在 Store 模式每次更新都把它送出去一次）。
+
+#### 例：模型權重被自動排除了，我要把它帶進去
+
+你的專案是這樣：
+
+```text
+my-app/
+├─ app.py
+├─ release.zip              <- 上次發布的產物，不要
+└─ assets/
+   └─ model.zip             <- App 啟動時 zipfile.ZipFile() 打開它，一定要
+```
+
+`assets/model.zip` 在**巢狀位置**，所以它**本來就會被帶進去**（見上表：`*.zip` 只在根目錄才排除），
+根目錄的 `release.zip` 則會被排掉——不必寫任何東西。
+
+真正需要 `!` 的是另一種情況：**檔案就放在根目錄**，或者**被你自己的樣式掃到了**：
+
+```gitignore
+# my-app/.provisionignore
+data.zip                   # (不寫也一樣：根目錄的 *.zip 內建就會排掉)
+!model.zip                 # 但根目錄這個 model.zip 是 App 要讀的，救回來
+*.pth                      # 排掉所有權重檔...
+!models/dinov2.pth         # ...除了這一個
+```
+
+建置前按「檢查專案」，被排除的東西會列在畫面上（含大小），後面就跟著這句話：
+
+```text
+已自動排除：wheels/ 124 MB、*.pyc 18 MB（共 142 MB，不會進交付包）。
+要保留其中某個檔案，在專案根目錄的 .provisionignore 裡寫 `!路徑`
+（例：`!assets/data.zip`）；最後一條符合的規則說了算。
+```
+
+#### Store 模式：大檔會在「每一版」被完整複製一次
+
+Store 佈局版本之間共用的是 **runtime**（同一份 requirements 的新版本零複製），
+**不是你的專案**：`application\` 沒有硬連結、沒有檔案級去重，每個版本目錄都拿到完整一份。
+所以一個 84 MB 的模型權重檔，發五版就是 420 MB，「一次改版只搬十幾 MB」對這種專案不成立。
+
+檢查專案時會直接把數字算給你看：
+
+```text
+Store 佈局：每發一個新版本，application\ 都會被「完整複製一份」（86 MB），
+其中「models/dinov2.pth」就佔 84 MB。版本之間共用的是 runtime，不是你的專案檔案
+（沒有硬連結、沒有去重），所以發 5 版就是 430 MB，「一次改版只搬十幾 MB」對這個專案不成立。
+若「models/dinov2.pth」不隨版本改變：把它移出專案（改由外部資料夾或共用磁碟提供），
+或在 .provisionignore 排除它，增量更新才會回來。
+```
+
 第一次使用若還沒有可攜 Python runtime，GUI 會出現「下載可攜 Python」按鈕（需連網，只需做一次）。
 也可以自己先跑：
 

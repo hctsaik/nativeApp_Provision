@@ -172,7 +172,19 @@ def _stage_version(paths: paths_mod.AppPaths, provider: UpdateProvider,
     try:
         with held(store_gc_lock(paths.deps_dir), timeout=_STAGE_LOCK_TIMEOUT):
             log.info("下載版本 %s …", release.version)
-            provider.download_app(release, staging)
+            # link_from: hardlink whatever an EXISTING version slot on this machine
+            # already holds byte for byte, instead of copying it out of the payload
+            # again. CV_Viewer's 84 MB weight file has not changed in a year, and
+            # without this the target machine re-copies it off the USB stick on every
+            # single release — while an identical copy sits in the slot next door.
+            #
+            # Safe because nothing here trusts the link: the staging dir is a sibling
+            # of versions\ (same volume, so os.link can work at all), and verify_tree()
+            # below hashes the STAGED tree — reading through the link, at the bytes it
+            # actually points at — before anything is renamed into place. A wrong link
+            # fails verification and the staging dir is destroyed; it cannot be
+            # promoted. That is checked by test_a_wrong_hardlink_can_never_be_promoted.
+            provider.download_app(release, staging, link_from=paths.versions_dir)
             manifest = paths_mod.load_manifest(staging)
             for key, expected in (("app_id", release.app_id), ("version", release.version),
                                   ("runtime_fingerprint", release.runtime_fingerprint)):

@@ -118,12 +118,13 @@ import hashlib
 import logging
 import os
 import re
+import stat
 import subprocess
 import threading
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 if __package__:
@@ -531,8 +532,8 @@ def run_version(paths: paths_mod.AppPaths, store: state_mod.StateStore,
             pass
 
 
-def resolve_rollback_target(paths: paths_mod.AppPaths, state: state_mod.AppState,
-                            *, force: bool = False) -> str | None:
+def resolve_rollback_target(paths: paths_mod.AppPaths,
+                            state: state_mod.AppState) -> str | None:
     """The best version we can actually fall back to, checked against the disk.
 
     state.rollback_target() only knows last_known_good and previous, and both can
@@ -543,11 +544,21 @@ def resolve_rollback_target(paths: paths_mod.AppPaths, state: state_mod.AppState
 
     Returns None when there is genuinely nothing left; callers must then fail
     loudly rather than pretend a rollback happened.
+
+    THERE IS NO `force` HERE, and there must not be. This function answers "where
+    would the machine take itself?", and the answer may never be a version in
+    failed_versions — least of all now that fail_candidate() records the build we
+    just fled in `previous`, which is the second slot this scan reads. A `force`
+    flag that skipped is_failed() (which is what the dead one used to do, and no
+    caller ever passed) would march the machine straight back onto the version that
+    stopped the line ten seconds ago. An operator who genuinely wants a failed build
+    already has the explicit route — `--rollback-to <版本> --force`, where they name
+    it themselves — and that path does its own is_failed check, on purpose.
     """
     def usable(version: str | None) -> bool:
         if not version or version == state.current:
             return False
-        if not force and state.is_failed(version):
+        if state.is_failed(version):
             return False
         return not paths_mod.verify_version(paths, version, deep=False)
 
@@ -871,13 +882,80 @@ def _version_revision(paths: paths_mod.AppPaths, version: str) -> str:
     return hashlib.sha256(files_json).hexdigest()[:12]
 
 
+# What each last_operation kind DID, in the words of the person reading it. The kinds
+# are state.py's (plus store_builder's "deliver", which is written on the build machine
+# and travels to the device inside state.json).
+_OPERATION_LABELS = {
+    "initialize": "初次安裝",
+    "deliver": "出廠交付",
+    "set_pending": "設定待套用版本",
+    "promote": "套用更新",
+    "commit_candidate": "確認版本可用",
+    "clear_bad_pending": "取消不合格的更新",
+    "rollback": "自動退版",
+    "manual_rollback": "手動退版",
+}
+
+
+def _local_time(stamp: str | None) -> str | None:
+    """state.json's UTC stamp, as the clock on the WALL of the room the machine is in.
+
+    The question this screen answers is 「這台機器昨晚發生了什麼事?」, and the person
+    asking it compares what we print against the shift log next to them. A Z-suffixed
+    UTC string is not an answer to that; 2026-07-14 06:12 is.
+    """
+    if not stamp:
+        return None
+    try:
+        moment = datetime.strptime(str(stamp), "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return str(stamp)          # some other format: raw beats nothing
+    return (moment.replace(tzinfo=timezone.utc).astimezone()
+            .strftime("%Y-%m-%d %H:%M"))
+
+
+def describe_operation(op: dict) -> str | None:
+    """「自動退版(v1.1.0 → v1.0.0),2026-07-14 06:12」
+
+    THE single most useful line for 「這台機器昨晚發生了什麼事?」, and --status never
+    printed it. state.json has recorded last_operation since the first commit — kind,
+    status, timestamp, and (now) the versions it moved between — and the status screen
+    read every other field and skipped this one, so the only way to answer the question
+    was to open state.json on the machine and read raw JSON down the phone.
+
+    Degrades instead of failing: an operation written by an older build has no
+    from/to, and an unknown kind prints as itself rather than vanishing.
+    """
+    if not op:
+        return None
+    label = _OPERATION_LABELS.get(op.get("kind")) or op.get("kind")
+    if not label:
+        return None
+    moved_from, moved_to = op.get("from_version"), op.get("to_version")
+    if moved_from and moved_to:
+        label = f"{label}({moved_from} → {moved_to})"
+    elif op.get("version"):
+        label = f"{label}({op['version']})"
+    when = _local_time(op.get("timestamp_utc"))
+    return f"{label},{when}" if when else label
+
+
 def print_status(paths: paths_mod.AppPaths) -> int:
     """One screen an operator can read down the phone."""
     state = state_mod.StateStore(paths.state_dir).load()
     print(f"\n應用      : {paths.app_id}")
     print(f"目前版本  : {state.current}" + ("  ← 尚未通過首次啟動驗證"
                                             if state.candidate == state.current else ""))
-    print(f"上一版    : {state.previous or '(無)'}")
+    # NEVER the same version in two fields. fail_candidate() now moves `previous`, so
+    # a rollback leaves the two describing two different things — but a machine that
+    # rolled back under an OLDER build still has previous == current sitting in its
+    # state.json, and 「目前版本 v1.0.0 / 上一版 v1.0.0」 read down a phone is precisely
+    # the confusion this screen exists to prevent. In that state there is no known
+    # older version, so say that instead of saying it twice.
+    previous = state.previous if state.previous != state.current else None
+    note = ("  ← 啟動失敗過,已退回目前版本"
+            if previous and state.is_failed(previous) else "")
+    print(f"上一版    : {previous or '(無)'}{note}")
     print(f"最後可用  : {state.last_known_good or '(尚未有)'}")
     print(f"待套用    : {state.pending or '(無)'}")
     source = paths.config().get("update_source")
@@ -886,8 +964,17 @@ def print_status(paths: paths_mod.AppPaths) -> int:
         print("啟動失敗過:")
         for entry in state.failed_versions:
             print(f"  · {entry.get('version')}  (revision {entry.get('revision') or '未知'})")
+    last = describe_operation(state.last_operation)
+    if last:
+        print(f"最後動作  : {last}")
     target = resolve_rollback_target(paths, state)
-    print(f"\n可退回到  : {target or '(沒有可退回的版本)'}")
+    if target:
+        print(f"\n可退回到  : {target}")
+    elif _already_on_last_known_good(state):
+        # Not a dead end — the opposite. See rollback_now().
+        print(f"\n可退回到  : (不需要:{state.current} 就是最後確認可用的版本)")
+    else:
+        print("\n可退回到  : (沒有可退回的版本)")
     print(f"記錄位置  : {paths.data_dir / 'logs'}\n")
     return 0
 
@@ -923,28 +1010,77 @@ def _apply_rollback(paths: paths_mod.AppPaths, store: state_mod.StateStore,
     return 0
 
 
+def _already_on_last_known_good(state: state_mod.AppState) -> bool:
+    """We are standing ON the last version that is known to have worked.
+
+    This is NOT a dead end, and telling the operator it is one is the harmful part:
+    it is what an EARLIER rollback was supposed to achieve. The automatic path lands
+    here every time it does its job — v1.1.0 dies, we fall back to v1.0.0, and
+    last_known_good has said v1.0.0 all along.
+    """
+    return bool(state.last_known_good) and state.last_known_good == state.current
+
+
+def _report_already_on_last_known_good(state: state_mod.AppState) -> int:
+    """「你已經在最好的版本上了」 — and that is a 0, not an ERROR.
+
+    What this used to print instead: [ERROR], three guessed reasons (「都不存在、不完整,
+    或本身就在失敗清單裡」 — one of which is true and we know which), and, worst of all,
+    「--rollback-to <版本> --force」 pointed at the list of "other" versions on the disk,
+    which after an automatic rollback consists of exactly the version that just failed.
+    Forcing the machine back onto that build is the one action guaranteed to break the
+    line again, and we were recommending it, in red, with an exit code that told any
+    script calling us that the rollback had failed.
+    """
+    failed = [e.get("version") for e in state.failed_versions
+              if e.get("version") and e.get("version") != state.current]
+    fled = failed[-1] if failed else None
+    happened = describe_operation(state.last_operation)
+    print(f"[bootstrap] 目前的 {state.current} 就是最後一個確認可用的版本,"
+          f"不需要、也不能再退。\n"
+          + (f"  ({fled} 啟動失敗,系統已經自動退回 {state.current} 了。)\n" if fled else "")
+          + (f"  最後一次動作:{happened}\n" if happened else "")
+          + f"  這台機器上沒有更舊、而且確認可用的版本可以退。\n"
+          f"  如果 {state.current} 現在也有問題,請用 tools\\admin.bat → [3] "
+          f"裝一個新的版本上來(命令列:--install <更新資料夾>)。",
+          flush=True)
+    return 0
+
+
 def rollback_now(paths: paths_mod.AppPaths) -> int:
     """Operator-initiated rollback (the automatic one only fires on a failed
     first start; a version that starts but behaves wrongly needs this)."""
     store = state_mod.StateStore(paths.state_dir)
     state = store.load()
     target = resolve_rollback_target(paths, state)
-    if not target:
-        # Do NOT return 0 here. "Nothing to roll back to" used to be reported as
-        # a success by the automatic path, so an operator whose only good version
-        # had been GC'd was told the rollback worked and then hit the same crash.
-        installed = _installed_versions(paths)
-        others = [v for v in installed if v != state.current]
-        print(f"[bootstrap][ERROR] 沒有任何「曾經成功啟動過、而且比現在舊」的版本可以退回"
-              f"(目前 {state.current})。\n"
-              f"  last-known-good / 上一版 都不存在、不完整,或本身就在失敗清單裡。\n"
-              f"  這台機器上已安裝:{'、'.join(installed) or '(無)'}\n"
-              + (f"  只剩比較新、而且從沒成功啟動過的版本({'、'.join(others)}),\n"
-                 f"  退到那裡不叫退回——所以不會自動這樣做。\n" if others else "")
-              + f"  你可以:--rollback-to <版本> --force 明確指定,或用 --install 重新安裝一版。",
-              file=sys.stderr, flush=True)
-        return 1
-    return _apply_rollback(paths, store, state, target)
+    if target:
+        return _apply_rollback(paths, store, state, target)
+    if _already_on_last_known_good(state):
+        # 「無路可退」 and 「你已經在最好的版本上了」 are not the same machine, and they
+        # were being printed the same way. This one is working as designed.
+        return _report_already_on_last_known_good(state)
+
+    # A real dead end: nothing here has ever been proven, and there is nothing older
+    # to fall back to. Do NOT return 0 — "nothing to roll back to" used to be reported
+    # as a success by the automatic path, so an operator whose only good version had
+    # been GC'd was told the rollback worked and then hit the same crash.
+    installed = _installed_versions(paths)
+    # NEVER offer --force at a version we have already watched fail: that is the one
+    # move that reliably re-breaks the machine. Failed builds are listed, separately,
+    # as what they are.
+    failed = [v for v in installed if state.is_failed(v)]
+    others = [v for v in installed if v != state.current and v not in failed]
+    print(f"[bootstrap][ERROR] 沒有任何「曾經成功啟動過、而且比現在舊」的版本可以退回"
+          f"(目前 {state.current})。\n"
+          f"  last-known-good / 上一版 都不存在、不完整,或本身就在失敗清單裡。\n"
+          f"  這台機器上已安裝:{'、'.join(installed) or '(無)'}\n"
+          + (f"  啟動失敗過(不可以退回去):{'、'.join(failed)}\n" if failed else "")
+          + (f"  只剩比較新、而且從沒成功啟動過的版本({'、'.join(others)}),\n"
+             f"  退到那裡不叫退回——所以不會自動這樣做。\n"
+             f"  真的要用它:--rollback-to <版本>。\n" if others else "")
+          + f"  建議用 --install 裝一個確定可用的版本上來。",
+          file=sys.stderr, flush=True)
+    return 1
 
 
 def _installed_versions(paths: paths_mod.AppPaths) -> list[str]:
@@ -978,6 +1114,29 @@ def rollback_to_version(paths: paths_mod.AppPaths, version: str, *,
 
 # ── --install: the offline delivery path ─────────────────────────────────────
 
+def _payload_candidates(folder: Path) -> dict:
+    """{app_id: the child folder that holds ITS release.json}.
+
+    Keyed by what each release.json SAYS, never by what its folder is called: the
+    exporter writes <out>/<app_id>/, but the operator copies it to a stick and
+    renames it 「v1.1.0更新包」, and after that the folder name is decoration. A
+    directory nobody can read, or one with no release.json in it, is simply not a
+    candidate — a USB stick has junk on it, and junk is not an error.
+    """
+    found: dict = {}
+    try:
+        children = sorted(Path(folder).iterdir())
+    except OSError:
+        return found
+    for child in children:
+        if not child.is_dir() or not (child / "release.json").is_file():
+            continue
+        app_id = FolderUpdateProvider.from_payload_dir(child).payload_app_id()
+        if app_id and app_id not in found:
+            found[app_id] = child
+    return found
+
+
 def _payload_root(payload_dir: Path, app_id: str) -> Path:
     """The folder that actually holds release.json — the payload dir itself, or
     the folder it sits in.
@@ -1001,10 +1160,112 @@ def _payload_root(payload_dir: Path, app_id: str) -> Path:
     nested = payload_dir / app_id
     if (nested / "release.json").is_file():
         return nested
+    # …and the same folder AFTER somebody renamed it. The name is decoration; the
+    # app_id inside release.json is the fact. Without this, pointing --install at
+    # the stick's ROOT worked only while the payload folder still had its original
+    # name.
+    renamed = _payload_candidates(payload_dir).get(app_id)
+    if renamed is not None:
+        return renamed
     raise BootstrapError(
         f"{payload_dir} 不是更新資料夾:裡面沒有 release.json。\n"
         f"  正確的更新資料夾長這樣:<資料夾>\\release.json + versions\\ + runtimes\\\n"
         f"  (資料夾叫什麼名字都可以,重點是 release.json 要在裡面。)")
+
+
+# ── which app is an --install FOR? ───────────────────────────────────────────
+#
+# THE PAYLOAD SAYS, AND ONLY THE PAYLOAD SAYS. main() used to answer this with
+# _resolve_app(root, args.app) — i.e. out of apps\, the list of apps ALREADY on the
+# machine — before it had even looked at what it was being asked to install. On a
+# machine running App A that made the second app impossible to deliver by update:
+#
+#   --app app-b --install <B's payload>   ->  「找不到 app 'app-b'」  (exit 2)
+#         …which is a lie about the payload: B is not in apps\ BECAUSE we have not
+#         installed it yet, which is the entire point of the command being run.
+#   --install <B's payload>               ->  resolved to A, handed B's payload to
+#         provider.get_latest_release("app-a"), and was refused as 「別的 app 的」
+#         with advice to re-run with `--app app-b` — the command on the line above,
+#         which cannot work. The two halves of the product sent the operator in a
+#         circle.
+#   --install <A's payload> on a 2-app store -> 「apps\ 下有 2 個 app,請用 --app
+#         指定」, over a payload that names its app in the first line of its
+#         release.json. We refused to read the answer we were standing on.
+#
+# So --install resolves the app from the payload. apps\ is then consulted for ONE
+# question only, and it is a different question: is this app already installed?
+
+def _resolve_install_app(payload_dir: Path, requested: str | None) -> tuple[str, Path]:
+    """(app_id, the folder holding its release.json) — read out of the payload."""
+    payload_dir = Path(payload_dir)
+    if not payload_dir.is_dir():
+        raise BootstrapError(f"找不到更新資料夾:{payload_dir}")
+
+    if (payload_dir / "release.json").is_file():
+        found = FolderUpdateProvider.from_payload_dir(payload_dir).payload_app_id()
+        if not found:
+            raise BootstrapError(
+                f"{payload_dir / 'release.json'} 讀不到、或裡面沒有合法的 app_id。\n"
+                f"  請重新從建置機匯出一份更新包。")
+        if requested and requested != found:
+            raise BootstrapError(
+                f"這個資料夾是 {found!r} 的更新包,不是 {requested!r} 的。\n"
+                f"  更新包:{payload_dir}\n"
+                f"  要裝它:--app {found} --install <這個資料夾>(或直接不要加 --app)。")
+        return found, payload_dir
+
+    # A folder that CONTAINS payloads: the exporter's <out>\, or a USB stick's root.
+    offered = _payload_candidates(payload_dir)
+    if not offered:
+        raise BootstrapError(
+            f"{payload_dir} 不是更新資料夾:裡面沒有 release.json。\n"
+            f"  正確的更新資料夾長這樣:<資料夾>\\release.json + versions\\ + runtimes\\\n"
+            f"  (資料夾叫什麼名字都可以,重點是 release.json 要在裡面。)")
+    if requested:
+        if requested not in offered:
+            raise BootstrapError(
+                f"這個資料夾裡沒有 {requested!r} 的更新包。\n"
+                f"  {payload_dir}\n"
+                f"  裡面有的是:{'、'.join(sorted(offered)) or '(沒有任何更新包)'}")
+        return requested, offered[requested]
+    if len(offered) == 1:
+        return next(iter(offered.items()))
+    raise BootstrapError(
+        f"這個資料夾裡有 {len(offered)} 個 app 的更新包,請用 --app 指定要裝哪一個:\n"
+        f"  {payload_dir}\n"
+        + "\n".join(f"  · --app {app_id} --install \"{payload_dir}\""
+                    for app_id in sorted(offered)))
+
+
+# A payload is an UPDATE, not a delivery. It carries versions\ (+ runtimes\ and
+# shells\ when they changed) and nothing else — no start-<app>.bat, no
+# messages\*.txt for that bat to `type`, no tools\admin-<app>.bat. Those are
+# per-app, they are generated on the BUILD machine by store_builder, and no amount
+# of payload will conjure them here.
+#
+# So installing a brand-new app from a payload could only ever produce a version
+# tree on disk that the operator has no way to start: the app would be "installed"
+# and invisible. Worse, store_builder's own rule for a second app is that the
+# generic start.bat is REMOVED in favour of start-<app>.bat — a device-side
+# --install that started renaming App A's launcher out from under the line's
+# desktop shortcut is not a thing this command may do.
+#
+# The build machine's 「匯出完整交付」 already delivers an app INTO an existing
+# store (it writes the per-app bats, rewrites the admin console's chooser, and
+# leaves the apps already there alone). That is the fix, so that is what we name.
+# What we may NOT do is pretend, or half-do it.
+def _refuse_new_app(app_id: str, payload_root: Path, installed: list) -> str:
+    return (
+        f"這是「更新包」,不是「完整交付」,而 {app_id!r} 還沒有安裝在這台機器上。\n"
+        f"  更新包:{payload_root}\n"
+        f"  這台機器目前有的 app:{'、'.join(installed) or '(一個也沒有)'}\n"
+        f"  更新包裡只有版本內容,沒有這個 App 的啟動檔(start-{app_id}.bat)、"
+        f"訊息檔與管理主控台;\n"
+        f"  就算把版本裝進去,也沒有任何辦法啟動它。\n"
+        f"  第一次安裝這個 App,請用建置機匯出的「完整交付」資料夾"
+        f"(在打包工具裡選「匯出完整交付」)。\n"
+        f"  它會補上啟動檔,並且不會動到這台機器上已經有的 app。\n"
+        f"  裝好一次之後,以後的改版就可以用 --install 這個更新包了。")
 
 
 def install_payload(paths: paths_mod.AppPaths, payload_dir: Path, *,
@@ -1096,7 +1357,19 @@ def set_update_source(paths: paths_mod.AppPaths, source: str) -> int:
         raise BootstrapError("更新來源不可以是空的")
     path = Path(text)
     is_unc = text.startswith("\\\\") or text.startswith("//")
-    if path.exists() and not path.is_dir():
+    # A disconnected UNC root does not consistently behave like a missing local
+    # path on Windows.  Depending on the redirector/cache state, stat() can raise
+    # WinError 53/64/67 instead of returning ENOENT.  An offline update share is a
+    # valid configuration (VPN down, factory file server unavailable); only a path
+    # we positively reached and proved to be a regular/non-directory file is an
+    # input error.  Probe once so the warning branch cannot trigger a second stat
+    # with a different result.
+    try:
+        source_stat = path.stat()
+    except OSError:
+        source_stat = None
+    source_is_dir = bool(source_stat and stat.S_ISDIR(source_stat.st_mode))
+    if source_stat is not None and not source_is_dir:
         raise BootstrapError(f"更新來源必須是資料夾,但這是檔案:{path}")
 
     config_path = paths.app_dir / "config.json"
@@ -1112,7 +1385,7 @@ def set_update_source(paths: paths_mod.AppPaths, source: str) -> int:
     os.replace(tmp, config_path)     # atomic: never a half-written config
 
     print(f"\n[bootstrap] 更新來源已設定:{path}", flush=True)
-    if not path.is_dir():
+    if not source_is_dir:
         # A share that is not mounted right now is normal (VPN down, stick out),
         # so this is a warning, not a failure — but say it, or the operator will
         # wait a week for an update that was never going to arrive.
@@ -1206,7 +1479,19 @@ def main(argv: list[str] | None = None) -> int:
     try:
         # AppPaths validates the app id, so a hand-renamed apps\<dir> ("我的 App")
         # raises here rather than as a raw IdentifierError traceback.
-        app_id = _resolve_app(root, args.app)
+        payload_root = None
+        if args.install:
+            # --install asks the PAYLOAD which app this is. Resolving it out of
+            # apps\ first is what made the second app undeliverable: see
+            # _resolve_install_app. This runs BEFORE _setup_logging() on purpose —
+            # that calls ensure_data_dirs(), and an app we are about to refuse must
+            # not leave an apps\<id>\data\ skeleton behind as a souvenir.
+            app_id, payload_root = _resolve_install_app(Path(args.install), args.app)
+            installed = paths_mod.list_app_ids(root)
+            if app_id not in installed:
+                raise BootstrapError(_refuse_new_app(app_id, payload_root, installed))
+        else:
+            app_id = _resolve_app(root, args.app)
         paths = paths_mod.AppPaths(root, app_id)
     except (BootstrapError, IdentifierError) as exc:
         print(f"[bootstrap][ERROR] {exc}", file=sys.stderr, flush=True)
@@ -1229,7 +1514,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.status:
             return print_status(paths)
         if args.install:
-            return install_payload(paths, Path(args.install), force=args.force)
+            # payload_root is the folder we PROVED holds this app's release.json,
+            # so install_payload never has to re-derive it from a folder name.
+            return install_payload(paths, payload_root or Path(args.install),
+                                   force=args.force)
         if args.set_update_source:
             return set_update_source(paths, args.set_update_source)
         if args.rollback_to:

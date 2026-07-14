@@ -23,11 +23,14 @@ that fails identically.
   3  the app itself is broken (missing module, syntax error, script raised
      before it ever rendered)
      -> this VERSION is bad: mark failed, roll back
-  4  the version tree is broken (bad/missing manifest, path escapes package)
+  4  the version tree is broken (bad/missing manifest, path escapes package, a file
+     THIS VERSION declares is not in THIS VERSION's folder)
      -> this VERSION is bad: mark failed, roll back
-  5  the machine is broken (no WebView2, antivirus ate the shell, no window)
-     -> the shell is SHARED; every version fails the same way. Touch no state,
-        claim no rollback, tell the operator what to install.
+  5  the machine is broken (no WebView2, antivirus ate the shell, no window, or a
+     SHARED component is gone: deps/shells/<fp>/, deps/runtimes/<fp>/ — see
+     SharedComponentError)
+     -> the shell and the runtime are SHARED; every version fails the same way. Touch
+        no state, claim no rollback, tell the operator what to install.
 
 THE HEALTHY MARKER (CIM_HEALTHY_MARKER), and what bootstrap may conclude
 =======================================================================
@@ -107,6 +110,34 @@ EXIT_MACHINE_BROKEN = 5
 # device/bootstrap.py, which is the other half of the contract.
 MARKER_NO_SESSION = "no-session"
 
+
+# ── WHO IS READING THIS ──────────────────────────────────────────────────────
+#
+# Every string this file prints in red goes to a LINE WORKER standing in front of a
+# machine on a factory floor. They have never opened the packaging tool, they cannot
+# add a package to a requirements file, and they cannot rebuild a version. There are
+# exactly two things they need from us:
+#
+#     1. is the line going to run again?          -> yes, the machine fixes itself
+#     2. who do I give this to?                   -> the admin
+#
+# Everything else on the screen is written for the admin, who is NOT in the room, and
+# is therefore written to be FORWARDED — read down a phone, photographed, pasted into
+# a ticket — not acted on by the reader.
+#
+# We were getting this exactly backwards. missing_modules_message() ended with
+# 「請回到打包工具,把上面的套件加進 requirements(或 lock 檔)後重新建置這個版本」 —
+# an instruction, as the last word on the screen, addressed to somebody who is not
+# there, given to somebody who cannot follow it and is now certain the line is down
+# until they can. _ARRIVAL_FAILURE_HINT was the only message in the file that led with
+# what the reader actually needs; now they all do, from this one constant.
+_USER_ROLLBACK_LEAD = (
+    "  系統會自動退回上一個可用版本,您不需要做任何事。\n"
+    "  請把這段訊息交給管理員。"
+)
+# Below this line we stop talking to the person in the room.
+_ADMIN_SECTION = "  ── 以下請交給管理員 ──"
+
 PKG_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_NAME = "app-package.json"
 
@@ -122,7 +153,44 @@ log = logging.getLogger("launcher")
 # ── manifest ─────────────────────────────────────────────────────────────────
 
 class ManifestError(Exception):
-    pass
+    """THIS VERSION's tree or manifest is wrong -> exit 4: fail it, roll back."""
+
+
+class SharedComponentError(ManifestError):
+    """A SHARED component is missing: deps/shells/<fp>/ or deps/runtimes/<fp>/.
+
+    THE MACHINE is broken, not this version -> exit 5: touch no state, blame nobody.
+
+    Every version in the store points at the SAME shell and the SAME runtime, so the
+    version that happened to trip over a missing one is not the suspect. Reporting it
+    as a broken version tree (which is what a plain ManifestError does — exit 4) makes
+    bootstrap mark a perfectly good release failed, roll back onto a version that is
+    missing the very same shared folder and fails identically, and then announce
+    「已恢復前一版本」 about a recovery that never happened. And failed_versions is
+    STICKY: the updater will not re-stage a version that is in it, so the operator has
+    lost that release until somebody runs --clear-failed.
+
+    A SUBCLASS of ManifestError, so every existing `except ManifestError` still catches
+    it — but any handler that must tell the two apart MUST test for this one FIRST, or
+    the base class swallows it and we are back to exit 4. (main() does; that ordering
+    is the whole point of the class.) The same idea, and the same name, as
+    device/runtime_store.py's SharedComponentError, which is bootstrap's half of this
+    contract — we cannot import it: launch.py ships INSIDE a version package and runs
+    stdlib-only under whatever runtime the manifest names.
+    """
+
+    def __init__(self, what: str, path):
+        super().__init__(f"{what}不在:{path}")
+        self.what = what
+        self.path = path
+
+
+# _shell / _python can each come from EITHER the version (a fat schema-1 package, where
+# they are this version's own files) or the store's shared deps/ (schema 2, where they
+# belong to the machine). Same manifest key, opposite verdicts — so load_manifest tracks
+# which source each one actually came from rather than guessing later.
+_SHARED_NAMES = {"_shell": "共用的應用程式外殼(Tauri 視窗程式)",
+                 "_python": "共用的 Python runtime"}
 
 
 def resolve_inside(root: Path, relative: str, *, what: str) -> Path:
@@ -152,13 +220,24 @@ def load_manifest(pkg_root: Path) -> dict:
     data["_entrypoint"] = resolve_inside(pkg_root, data["entrypoint"], what="entrypoint")
     data["_shim"] = resolve_inside(pkg_root, data["engine_shim"], what="engine_shim")
 
+    # WHOSE FILE IS IT? Every path below is checked for existence in the same loop at
+    # the end, and until now they all raised the same ManifestError — so a shell that
+    # antivirus ate out of the SHARED deps/shells/<fp>/ (this MACHINE is broken; exit
+    # 5; touch no state) was reported exactly like a missing entrypoint (this VERSION
+    # is broken; exit 4; mark it failed and roll back onto a version that is missing
+    # the identical shared folder). `shared` is what keeps them apart.
+    shared: set[str] = set()
+
     # Store layout: the shell is SHARED (deps/shells/<fp>/), so it necessarily
     # lives outside this version directory. bootstrap resolves and integrity-checks
     # it, then hands us the path — we still refuse to run if it is not there.
     shared_shell = os.environ.get("CIM_SHELL_EXE")
     if shared_shell:
         data["_shell"] = Path(shared_shell)
+        shared.add("_shell")
     elif data.get("shell_executable"):
+        # A fat package carries its own shell INSIDE the version tree, so a missing
+        # one really is this version's tree being wrong. Same key, different owner.
         data["_shell"] = resolve_inside(pkg_root, data["shell_executable"],
                                         what="shell_executable")
     else:
@@ -176,13 +255,18 @@ def load_manifest(pkg_root: Path) -> dict:
     # shared runtime, so the interpreter is simply sys.executable.
     if data.get("runtime_fingerprint"):
         data["_python"] = Path(sys.executable)
+        shared.add("_python")        # deps/runtimes/<fp>/ — the machine's, not ours
     elif data.get("python"):
         data["_python"] = resolve_inside(pkg_root, data["python"], what="python")
     else:
         raise ManifestError(f"{MANIFEST_NAME} needs either python or runtime_fingerprint")
     for key in ("_entrypoint", "_python", "_shell", "_shim"):
-        if not data[key].is_file():
-            raise ManifestError(f"file declared in {MANIFEST_NAME} does not exist: {data[key]}")
+        if data[key].is_file():
+            continue
+        if key in shared:
+            # NOT this version's fault. See SharedComponentError: exit 5, no rollback.
+            raise SharedComponentError(_SHARED_NAMES[key], data[key])
+        raise ManifestError(f"file declared in {MANIFEST_NAME} does not exist: {data[key]}")
     return data
 
 
@@ -568,14 +652,31 @@ def preflight(entrypoint: Path, app_root: Path) -> tuple[list[str], str | None]:
 
 
 def missing_modules_message(missing: list[str], app_root: Path) -> str:
-    lines = ["這個版本的 App 需要的套件,這台機器的 runtime 裡沒有:"]
+    """The version is missing a package it needs — said to the person in the room first.
+
+    This message used to close with 「請回到打包工具...重新建置這個版本」: the last word
+    on a factory machine's screen, addressed to somebody who is not standing there,
+    telling the person who IS to do something they have no tool for and no authority to
+    do. They read it as "the line is down until the admin comes". It never was — the
+    machine rolls itself back to the last working version within seconds. That is the
+    first thing they must be told, and it was not on the screen at all.
+
+    The rebuild instruction is still here. It is now ONE line, under a heading that
+    says who it is for. See _USER_ROLLBACK_LEAD.
+    """
+    lines = [
+        "這個版本的 App 少了它需要的套件,所以沒辦法啟動。",
+        _USER_ROLLBACK_LEAD,
+        "",
+        _ADMIN_SECTION,
+        "  這台機器的 runtime 裡找不到這些套件:",
+    ]
     for name in missing:
         hint = _DIST_HINT.get(name)
-        lines.append(f"  - {name}" + (f"(要裝的套件叫 {hint})" if hint else ""))
+        lines.append(f"    - {name}" + (f"(要裝的套件叫 {hint})" if hint else ""))
     lines += [
-        "",
-        "這不是這台電腦的問題,是這個版本打包時漏掉了相依套件。",
-        "請回到打包工具,把上面的套件加進 requirements(或 lock 檔)後重新建置這個版本。",
+        "  這不是這台電腦的問題,是這個版本打包時漏掉了相依套件。",
+        "  修法:回到打包工具,把上面的套件加進 requirements(或 lock 檔),重新建置這個版本。",
         f"  App 目錄:{app_root}",
     ]
     return "\n".join(lines)
@@ -1181,8 +1282,10 @@ def _terminate_shell(proc) -> None:
 # vanish; not saying why is how a self-healing rollback looks like a crash.
 _ARRIVAL_FAILURE_HINT = (
     "\n[start][ERROR] App 一啟動就出錯,畫面上只會是一個紅色錯誤方塊,所以視窗已經關閉。\n"
-    "  這個版本會被標記為失敗並自動退回上一個可用版本,不需要您做任何事。\n"
-    "  (若這是您剛更新的版本,請把下面的錯誤訊息交給開發者。)"
+    + _USER_ROLLBACK_LEAD + "\n\n"
+    + _ADMIN_SECTION + "\n"
+    "  這個版本會被標記為失敗,自動更新不會再把它裝回來。\n"
+    "  請把下面的錯誤訊息交給開發者。"
 )
 
 
@@ -1338,8 +1441,11 @@ def finish_session(supervisor: StreamlitSupervisor, shell_code: int) -> int:
     if fatal:
         _revoke_marker()
         log.error("the app failed on arrival: %s", fatal)
-        print("\n[start][ERROR] 這個版本的 App 一啟動就出錯,使用者根本看不到畫面:\n"
-              f"{fatal}\n  完整記錄:{supervisor.log_path}", file=sys.stderr, flush=True)
+        print("\n[start][ERROR] 這個版本的 App 一啟動就出錯,使用者根本看不到畫面。\n"
+              + _USER_ROLLBACK_LEAD + "\n"
+              + _ADMIN_SECTION + "\n"
+              f"{fatal}\n"
+              f"  完整記錄:{supervisor.log_path}", file=sys.stderr, flush=True)
         return EXIT_APP_BROKEN
 
     late = supervisor.late_app_error_in_log()
@@ -1401,9 +1507,28 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         manifest = load_manifest(PKG_ROOT)
+    except SharedComponentError as exc:
+        # MUST come BEFORE ManifestError — it is a SUBCLASS of it, and the base clause
+        # below returns exit 4, which is bootstrap's cue to mark this version failed and
+        # roll back. There is nothing to roll back TO: deps/shells/<fp>/ and
+        # deps/runtimes/<fp>/ are shared by every version in the store, so the version
+        # we roll onto is missing exactly the same folder and dies exactly the same way,
+        # and we have thrown away a good release to get there. This is the machine.
+        log.error("shared component missing (the machine, not this version): %s", exc)
+        print(f"\n[start][ERROR] 這台電腦少了「所有版本共用」的元件,App 開不起來:\n"
+              f"  {exc}\n"
+              f"  這不是版本的問題:系統不會退版,也不會把這個版本標記為失敗。\n"
+              f"  這台電腦要先修好,請把這段訊息交給管理員或 IT。\n\n"
+              + _ADMIN_SECTION + "\n" + _MACHINE_HINT +
+              f"\n  log: {log_path}", file=sys.stderr, flush=True)
+        return EXIT_MACHINE_BROKEN
     except ManifestError as exc:
         log.error("bad package: %s", exc)
-        print(f"\n[start][ERROR] 這個版本的套件描述檔壞了:{exc}\n  log: {log_path}",
+        print(f"\n[start][ERROR] 這個版本的套件描述檔壞了,App 開不起來。\n"
+              + _USER_ROLLBACK_LEAD + "\n"
+              + _ADMIN_SECTION + "\n"
+              f"  {exc}\n"
+              f"  這個版本要重新建置。\n  log: {log_path}",
               file=sys.stderr, flush=True)
         return EXIT_VERSION_BROKEN
 
@@ -1423,14 +1548,21 @@ def main(argv: list[str] | None = None) -> int:
         # every pages/*.py, which is precisely the failure this module was fixed
         # for. An incomplete version tree is a broken version (exit 4).
         log.error("incomplete launcher: %s", exc)
-        print(f"\n[start][ERROR] {exc}\n  log: {log_path}", file=sys.stderr, flush=True)
+        print(f"\n[start][ERROR] 這個版本的檔案不完整,App 開不起來。\n"
+              + _USER_ROLLBACK_LEAD + "\n"
+              + _ADMIN_SECTION + "\n"
+              f"  {exc}\n  log: {log_path}", file=sys.stderr, flush=True)
         return EXIT_VERSION_BROKEN
     finally:
         sys.path[:] = saved_path
     if syntax_error:
         log.error("preflight: %s", syntax_error)
-        print(f"\n[start][ERROR] 這個版本的 App 有語法錯誤,無法執行:\n  {syntax_error}\n"
-              f"  請重新建置這個版本。\n  log: {log_path}", file=sys.stderr, flush=True)
+        print(f"\n[start][ERROR] 這個版本的 App 有語法錯誤,無法執行。\n"
+              + _USER_ROLLBACK_LEAD + "\n"
+              + _ADMIN_SECTION + "\n"
+              f"  {syntax_error}\n"
+              f"  修好程式後重新建置這個版本。\n  log: {log_path}",
+              file=sys.stderr, flush=True)
         return EXIT_APP_BROKEN
     if missing:
         log.error("preflight: missing modules %s", missing)
@@ -1448,7 +1580,10 @@ def main(argv: list[str] | None = None) -> int:
         except StreamlitExited as exc:
             # Fail loudly instead of opening a shell onto nothing.
             log.error("Streamlit failed to start: %s", exc)
-            print(f"\n[start][ERROR] {exc}\n  log: {log_path}", file=sys.stderr, flush=True)
+            print(f"\n[start][ERROR] 這個版本的 App 起不來(Streamlit 沒有正常啟動)。\n"
+                  + _USER_ROLLBACK_LEAD + "\n"
+                  + _ADMIN_SECTION + "\n"
+                  f"  {exc}\n  log: {log_path}", file=sys.stderr, flush=True)
             return EXIT_APP_BROKEN
 
         # flush: stdout is block-buffered once it is piped to a file or a parent

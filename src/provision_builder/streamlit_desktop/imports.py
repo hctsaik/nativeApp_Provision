@@ -302,6 +302,23 @@ class MissingReport:
         """The ONE sentence that tells this operator, with this project, what to add
         and where. Not a menu of everything a Python project could theoretically do."""
         group = self.group_for(name)
+
+        # THE INSTALL SOURCE DECIDES. A fully-pinned lock IS the source: pip is run
+        # against it and nothing else, so the 「選用相依群組」 field has no effect at
+        # all — validate already warns 「你勾的選用群組這次不會生效」.
+        #
+        # Recommending that field anyway produced a tool that contradicts itself
+        # inside a single check: 「請去勾 llm」 next to 「你勾的 llm 不會生效」. The
+        # operator does what we asked, nothing happens, and we told them so in the
+        # same breath. Whatever the package is declared in, when a lock is the
+        # source the only thing that changes the outcome is a pin in that lock.
+        if self.complete:
+            where = self.source_label or "lock 檔"
+            hint = f"(它在 pyproject.toml 的「{group}」群組裡)" if group else ""
+            return (f"相依來源是{where},pip 只會照它安裝——"
+                    f"「選用相依群組」欄位在這個模式下不會生效。{hint}\n"
+                    f"    請把 {name} 釘死的版本加進那個 lock 檔(例:{name}==1.2.3),再重新建置。")
+
         if group:
             return (f"這個套件已經宣告在 pyproject.toml 的 "
                     f"[project.optional-dependencies] 的「{group}」群組裡,"

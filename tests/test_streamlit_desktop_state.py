@@ -12,6 +12,8 @@ import errno
 import io
 import json
 import os
+import re
+import shutil
 import threading
 from pathlib import Path
 
@@ -530,6 +532,27 @@ def test_set_update_source_warns_but_accepts_an_offline_share(tree, capsys):
     assert paths_of(tree).config()["update_source"] == r"\\fileserver\updates"
 
 
+def test_set_update_source_accepts_a_unc_share_when_windows_stat_raises(
+        tree, capsys, monkeypatch):
+    """Disconnected UNC roots may raise WinError 53/64/67 instead of returning False.
+
+    The share is still a useful update source: the VPN/server can come back later.
+    Persist it and warn; never turn a routine network outage into a traceback.
+    """
+    original_stat = Path.stat
+
+    def offline_unc(path, *args, **kwargs):
+        if str(path).startswith(r"\\server\share"):
+            raise OSError(64, "The specified network name is no longer available")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", offline_unc)
+    assert bootstrap.set_update_source(paths_of(tree), r"\\server\share") == 0
+    out = capsys.readouterr().out
+    assert "[注意]" in out and "連不上" in out
+    assert paths_of(tree).config()["update_source"] == r"\\server\share"
+
+
 def test_set_update_source_rejects_a_file(tree, tmp_path):
     target = tmp_path / "notadir.txt"
     target.write_text("x", encoding="utf-8")
@@ -649,6 +672,128 @@ def test_rollback_to_a_missing_or_incomplete_version_is_refused(tree, capsys):
 
 def test_rollback_to_current_is_a_no_op(tree):
     assert bootstrap.rollback_to_version(paths_of(tree), "v1") == 1
+
+
+# ── what the machine SAYS about a rollback it already did ────────────────────
+#
+# Everything below is read down a phone by somebody trying to work out what happened
+# to a machine overnight. The mechanism was right and the story was not.
+
+def test_fail_candidate_moves_previous_to_the_version_it_rolled_away_from():
+    """`previous` is 'the version we were running before this one'. fail_candidate()
+    was the only transition that changed `current` without moving it, so after an
+    automatic rollback current and previous were THE SAME VERSION."""
+    s = state.fail_candidate(
+        make_state(current="v2", candidate="v2", previous="v1", last_known_good="v1"),
+        revision="r1")
+
+    assert s.current == "v1"
+    assert s.previous == "v2"          # the failed candidate: where we came FROM
+    assert s.previous != s.current     # …and never the version we are standing on
+
+
+def auto_rollback(tree, monkeypatch):
+    """The factory-floor event: v1 is proven, v2 is promoted, v2 dies on its first
+    start, the machine rolls itself back to v1 without anyone touching it."""
+    arm_candidate(tree)                                  # v1 = LKG, v2 staged
+    monkeypatch.setattr(bootstrap.time, "sleep", lambda _s: None)
+    popen = popen_factory([dict(healthy=False, exit_code=bootstrap.EXIT_APP_FAILURE),
+                           dict(healthy=True)])
+    assert bootstrap.start_app(paths_of(tree), [], notify=lambda *a: None,
+                               popen=popen) == 0
+    final = store_of(tree).load()
+    assert final.current == "v1" and final.is_failed("v2")     # the rollback happened
+    return final
+
+
+def test_status_never_prints_the_same_version_as_both_current_and_previous(
+        tree, monkeypatch, capsys):
+    """「目前版本 v1.0.0 / 上一版 v1.0.0」 — the same version in two fields, read down a
+    phone to an admin trying to understand what the machine did last night. The two
+    fields have to describe two different things or neither of them means anything."""
+    auto_rollback(tree, monkeypatch)
+    capsys.readouterr()                                  # drop the launch chatter
+
+    assert bootstrap.print_status(paths_of(tree)) == 0
+    out = capsys.readouterr().out
+    lines = {line.split(":", 1)[0].strip(): line.split(":", 1)[1].strip()
+             for line in out.splitlines() if ":" in line}
+
+    assert lines["目前版本"].startswith("v1")
+    assert lines["上一版"].startswith("v2")              # where we came FROM
+    assert lines["目前版本"].split()[0] != lines["上一版"].split()[0]
+    out.encode("cp950")
+
+
+def test_status_says_what_happened_to_this_machine_last_night(tree, monkeypatch, capsys):
+    """state.json has recorded last_operation since the first commit — and --status
+    read every other field and skipped the only one that answers the question the
+    operator is actually phoning about."""
+    auto_rollback(tree, monkeypatch)
+    capsys.readouterr()
+
+    bootstrap.print_status(paths_of(tree))
+    out = capsys.readouterr().out
+
+    assert "最後動作" in out
+    assert "自動退版" in out                              # not 「rollback」, and not silence
+    assert "v2 → v1" in out                              # WHICH versions, in which direction
+    # …and when, on the wall clock of the room the machine is in.
+    assert re.search(r"自動退版\(v2 → v1\),\d{4}-\d{2}-\d{2} \d{2}:\d{2}", out), out
+    out.encode("cp950")
+
+
+def test_a_second_rollback_never_lands_on_the_version_that_just_failed(
+        tree, monkeypatch, capsys):
+    """`previous` now points AT the failed candidate, so both rollback resolvers are
+    one is_failed() check away from marching the machine straight back onto the build
+    it just fled. They must not."""
+    auto_rollback(tree, monkeypatch)                     # current=v1, previous=v2(failed)
+    capsys.readouterr()
+    after = store_of(tree).load()
+    assert after.previous == "v2" and after.is_failed("v2")
+
+    # Neither resolver may offer it — state-only or checked against the disk.
+    assert after.rollback_target() is None
+    assert bootstrap.resolve_rollback_target(paths_of(tree), after) is None
+
+    assert bootstrap.rollback_now(paths_of(tree)) == 0   # nothing to do, and that is fine
+    final = store_of(tree).load()
+    assert final.current == "v1"                         # NOT back onto the broken v2
+    assert final.generation == after.generation          # and nothing was written at all
+
+
+def test_being_on_the_last_known_good_is_not_an_error_and_never_recommends_the_failed_build(
+        tree, monkeypatch, capsys):
+    """--rollback after an automatic rollback. The machine is not broken — it is on the
+    last version that worked, which is what the earlier rollback was FOR. It used to
+    print [ERROR], three guessed reasons, and 「--rollback-to <版本> --force」 aimed at
+    the list of other versions on the disk, which consists of exactly the build that
+    just failed. Forcing the machine back onto that is the one action guaranteed to
+    stop the line again."""
+    auto_rollback(tree, monkeypatch)
+    capsys.readouterr()
+
+    code = bootstrap.rollback_now(paths_of(tree))
+    captured = capsys.readouterr()
+
+    assert code == 0                                     # not a failure: it worked
+    assert "[ERROR]" not in captured.out + captured.err
+    assert "不需要、也不能再退" in captured.out
+    assert "v1 就是最後一個確認可用的版本" in captured.out
+    assert "v2 啟動失敗" in captured.out                  # and WHY we are here
+    assert "--force" not in captured.out + captured.err   # never aim it at a failed build
+    (captured.out + captured.err).encode("cp950")
+
+
+def test_a_genuine_dead_end_is_still_an_error(tree, capsys):
+    """The trap in the fix above: 「你已經在最好的版本上了」 must not swallow 「無路可退」.
+    A machine whose current version has never once started successfully has no LKG, and
+    that is a real failure with a real next step."""
+    code = bootstrap.rollback_now(paths_of(tree))        # v1 is current, LKG is None
+    err = capsys.readouterr().err
+    assert code != 0
+    assert "沒有任何" in err and "--install" in err
 
 
 # ── launcher exit-code contract ──────────────────────────────────────────────
@@ -2323,3 +2468,338 @@ def test_a_missing_state_file_says_which_one_and_what_it_means(store):
     message = str(caught.value)
     assert str(store.path) in message and "找不到" in message
     message.encode("cp950")
+
+
+# ── hardlink dedup between version slots ─────────────────────────────────────
+#
+# store_builder now os.link()s byte-identical files between version slots instead of
+# re-copying them (CV_Viewer: versions\ 168 MB -> 84 MB; a second version costs 0 MB).
+# Three things downstream had to learn about it, and each of these tests is named for
+# the failure it prevents.
+
+BIG = b"W" * (4 * 1024 * 1024)          # a stand-in for the 84 MB DINOv2 weight file
+WEIGHT = "application/weights.bin"
+
+
+def add_file(vdir: Path, relpath: str, blob: bytes) -> Path:
+    """Put a file into a COMPLETE version slot and re-earn its files.json/.complete."""
+    path = Path(vdir) / relpath
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(blob)
+    reseal(vdir)
+    return path
+
+
+def reseal(vdir: Path) -> None:
+    integrity.remove_complete(vdir)
+    integrity.write_files_json(vdir, integrity.build_files_json(vdir))
+    integrity.write_complete(vdir)
+
+
+def link_into(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    os.link(src, dst)
+
+
+def run_argv(tree, monkeypatch, argv):
+    """bootstrap.main() with the RAW argv — including the case of no --app at all,
+    which is the one that matters here."""
+    monkeypatch.setattr(bootstrap, "_store_root", lambda: Path(tree))
+    monkeypatch.setattr(bootstrap.subprocess, "Popen",
+                        lambda *a, **k: pytest.fail("launcher must not be started"))
+    return bootstrap.main(argv)
+
+
+def make_payload_for(tmp_path: Path, app_id: str, version: str, *,
+                     folder: str | None = None, revision: str = "r1",
+                     fingerprint: str = FP1, body: str = "two") -> Path:
+    """export_update()'s output for ANY app — including one this machine has never
+    heard of, which is the entire point of the --install tests below."""
+    payload = tmp_path / "usb" / (folder or app_id)
+    payload.mkdir(parents=True, exist_ok=True)
+    build_version(payload / "versions" / version, version, fingerprint,
+                  app=app_id, complete=False, body=body)
+    (payload / "release.json").write_text(json.dumps({
+        "schema": 1, "app_id": app_id, "version": version, "revision": revision,
+        "runtime_fingerprint": fingerprint,
+    }), encoding="utf-8")
+    return payload
+
+
+# ── (1) a second app can never arrive by the update path ─────────────────────
+
+def test_installing_a_new_app_onto_an_existing_store_refuses_with_the_honest_reason(
+        tree, tmp_path, monkeypatch, capsys):
+    """THE BLOCKER. main() resolved the app from apps\\ BEFORE dispatching --install,
+    so on a machine already running app A:
+
+        --app app-b --install <B's payload>   ->  「找不到 app 'app-b'」
+
+    which is a lie about the payload: B is not in apps\\ BECAUSE it has not been
+    installed yet, which is the whole reason the command was run. And the advice the
+    provider gives for the no---app case is 「請指定它:--app app-b」 — i.e. the command
+    on the line above, which could not work. The two halves sent the operator in a
+    circle.
+
+    A payload genuinely CANNOT be a first install (no start-<app>.bat, no messages\\
+    for it to print, no admin console), so the answer is a refusal — but it must be
+    the TRUE refusal, naming the app, naming what is missing and naming the fix."""
+    payload = make_payload_for(tmp_path, "app-b", "v9")
+
+    code = run_argv(tree, monkeypatch, ["--app", "app-b", "--install", str(payload)])
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "找不到 app" not in err                  # the old lie
+    assert "更新包" in err and "完整交付" in err     # this is an update, not a delivery
+    assert "app-b" in err                           # …for THIS app
+    assert "start-app-b.bat" in err                 # …and this is what it cannot bring
+    assert "第一次安裝這個 App" in err               # …and this is the way in
+    err.encode("cp950")                             # …on a zh-TW console
+
+    # AND IT LEFT NOTHING BEHIND. A refused install that has already created
+    # apps\app-b\data\ is a half-app, and the next --status would find it.
+    assert not (tree / "apps" / "app-b").exists()
+    assert paths_mod.list_app_ids(tree) == [APP]
+
+
+def test_a_new_apps_payload_is_never_silently_handed_to_the_app_that_is_installed(
+        tree, tmp_path, monkeypatch, capsys):
+    """Bare --install on a machine running app A used to resolve to A (the only app in
+    apps\\) and hand it B's payload. provider's app_id check refused it — so nothing
+    was ever mis-installed — but the message blamed the payload for being 「別的 app
+    的」 and sent the operator to a command that cannot work. The app comes from the
+    PAYLOAD now, so the answer is about the real situation."""
+    payload = make_payload_for(tmp_path, "app-b", "v9")
+
+    code = run_argv(tree, monkeypatch, ["--install", str(payload)])
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "完整交付" in err and "app-b" in err
+    assert "不是 'demo' 的" not in err       # not the old 「你拿錯更新包了」 accusation
+    assert store_of(tree).load().current == "v1"        # …and A is untouched
+    assert store_of(tree).load().pending is None
+    err.encode("cp950")
+
+
+def test_install_reads_the_app_from_the_payload_so_a_two_app_store_needs_no_app_flag(
+        tree, tmp_path, monkeypatch, capsys):
+    """The other half of the same bug. With two apps installed, bare --install died
+    with 「apps\\ 下有 2 個 app,請用 --app 指定」 — over a payload whose release.json
+    names its app in the first line. We refused to read the answer we were standing on.
+    """
+    make_app(tree, "app-b", {"v1": FP1}, current="v1")      # a second app, installed
+    assert len(paths_mod.list_app_ids(tree)) == 2
+    payload = make_payload_for(tmp_path, "app-b", "v2")
+
+    code = run_argv(tree, monkeypatch, ["--install", str(payload)])       # no --app
+
+    assert code == 0, capsys.readouterr().err
+    assert state.StateStore(tree / "apps" / "app-b" / "state").load().pending == "v2"
+    assert store_of(tree).load().pending is None            # …and app A was not touched
+
+
+def test_install_of_a_payload_for_another_app_than_the_one_named_says_which(
+        tree, tmp_path, monkeypatch, capsys):
+    """--app demo --install <B's payload>: the operator grabbed the wrong folder. Name
+    the app the folder is actually FOR, not just the mismatch."""
+    payload = make_payload_for(tmp_path, "app-b", "v9")
+
+    code = run_argv(tree, monkeypatch, ["--app", APP, "--install", str(payload)])
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "app-b" in err and "demo" in err
+    err.encode("cp950")
+
+
+def test_install_finds_the_payload_in_a_folder_the_operator_renamed(
+        tree, tmp_path, monkeypatch):
+    """The operator copies the export onto a stick and renames it 「v2更新包」, then
+    points --install at the stick's ROOT. The folder name is decoration; the app_id in
+    release.json is the fact."""
+    make_payload_for(tmp_path, APP, "v2", folder="v2更新包")
+
+    code = run_argv(tree, monkeypatch, ["--install", str(tmp_path / "usb")])
+
+    assert code == 0
+    assert store_of(tree).load().pending == "v2"
+
+
+# ── (2) the target machine must not re-copy what it already has ──────────────
+
+def test_an_update_hardlinks_the_unchanged_weight_file_instead_of_copying_it(
+        tree, tmp_path, monkeypatch, capsys):
+    """updater.py:175 passed no link_from, so download_app fell back to a plain copy:
+    the factory PC copied CV_Viewer's 84 MB weight file out of the USB stick on EVERY
+    release, while a byte-identical copy sat in the version slot next door. The store
+    layout is sold on 「一次改版只搬十幾 MB」 and on the one machine that matters it
+    was not true."""
+    installed = tree / "apps" / APP / "versions" / "v1"
+    add_file(installed, WEIGHT, BIG)                    # v1 holds the big file
+    payload = make_payload_for(tmp_path, APP, "v2")
+    (payload / "versions" / "v2" / WEIGHT).parent.mkdir(parents=True, exist_ok=True)
+    (payload / "versions" / "v2" / WEIGHT).write_bytes(BIG)   # …and so does v2, identically
+    integrity.write_files_json(payload / "versions" / "v2")
+
+    assert run_argv(tree, monkeypatch, ["--install", str(payload)]) == 0
+
+    staged = tree / "apps" / APP / "versions" / "v2" / WEIGHT
+    old = installed / WEIGHT
+    assert staged.is_file() and staged.read_bytes() == BIG      # …and it is CORRECT
+    # ONE set of bytes, two names: the update cost a directory entry, not 4 MB.
+    assert os.stat(staged).st_ino == os.stat(old).st_ino
+    assert os.stat(staged).st_nlink == 2
+    # …and the version still verifies, which is what the sentinel is earned on.
+    assert integrity.verify_tree(tree / "apps" / APP / "versions" / "v2") == []
+
+
+def test_a_wrong_hardlink_can_never_be_promoted(tree, tmp_path, monkeypatch, capsys):
+    """The safety claim link_from rests on, tested rather than trusted: stage_release
+    runs verify_tree() over the STAGED tree — hashing whatever the link points AT —
+    before anything is renamed into place.
+
+    The scenario that would poison an install: the prior slot's files.json is honest,
+    but its FILE has silently rotted (bit rot, antivirus 'repair'). The linker trusts
+    that files.json (by design: it never re-hashes a completed slot), so it links the
+    ROTTEN bytes into the new version. verify_tree must catch it, because the new
+    version's OWN files.json disagrees."""
+    installed = tree / "apps" / APP / "versions" / "v1"
+    add_file(installed, WEIGHT, BIG)                   # files.json now declares sha(BIG)
+    rotted = BIG[:-1] + b"X"                           # same size, different bytes
+    (installed / WEIGHT).write_bytes(rotted)           # …and nobody updated files.json
+
+    payload = make_payload_for(tmp_path, APP, "v2")
+    (payload / "versions" / "v2" / WEIGHT).parent.mkdir(parents=True, exist_ok=True)
+    (payload / "versions" / "v2" / WEIGHT).write_bytes(BIG)
+    integrity.write_files_json(payload / "versions" / "v2")
+
+    code = run_argv(tree, monkeypatch, ["--install", str(payload)])
+
+    assert code == 2                                   # refused…
+    out = capsys.readouterr()
+    assert "驗證失敗" in (out.out + out.err)
+    # …and NOTHING was promoted: no v2, no pending, no sentinel, no staging left over.
+    assert not (tree / "apps" / APP / "versions" / "v2").exists()
+    assert store_of(tree).load().pending is None
+    assert store_of(tree).load().current == "v1"
+    assert not list((tree / "apps" / APP / "staging").glob("*"))
+
+
+# ── (3) GC must not claim bytes another slot still holds ─────────────────────
+
+def test_gc_never_claims_to_free_bytes_that_another_slot_still_holds(tree):
+    """THE LIE. GC summed st_size, so deleting a version whose 84 MB weight file is
+    hardlinked from the version next door freed roughly NOTHING while GC announced
+    「回收完成…實際回收 84 MB」. The data is safe — the OS keeps the bytes until the
+    last name goes — but 「回收完成」 over a run that freed nothing is exactly the bug
+    class this file has been fixed for twice already."""
+    current = tree / "apps" / APP / "versions" / "v1"
+    orphan = make_version(tree, "v0")                  # older, unreferenced: GC will take it
+    add_file(current, WEIGHT, BIG)
+    link_into(current / WEIGHT, orphan / WEIGHT)       # what store_builder now does
+    reseal(orphan)
+    assert os.stat(orphan / WEIGHT).st_nlink == 2
+
+    free_before = shutil.disk_usage(tree).free
+    plan = gc_mod.run_gc(tree, apply=True, log=lambda *_a: None)
+    freed_on_disk = (shutil.disk_usage(tree).free - free_before) / 1024 ** 2
+
+    assert not orphan.exists()                         # the slot went…
+    assert plan.reclaimed_mb() < 1                     # …and it gave back nothing
+    assert freed_on_disk < 1                           # …which is what the disk says
+    assert plan.reclaimed_mb() <= freed_on_disk + 1    # never claim more than the disk
+    # …and the 4 MB is REPORTED, not silently dropped.
+    assert plan.shared_skipped_mb() >= 3
+    report = plan.report()
+    assert "其他版本共用" in report and "沒有釋放" in report
+    assert "回收完成:刪掉 1 項,實際回收 4 MB" not in plan.headline()   # the old lie
+    report.encode("cp950")
+    plan.headline().encode("cp950")
+
+    # AND THE DATA IS SAFE: the surviving version still has every byte.
+    assert (current / WEIGHT).read_bytes() == BIG
+    assert integrity.verify_tree(current) == []
+
+
+def test_the_gc_forecast_does_not_promise_space_that_cannot_arrive(tree):
+    """Same lie, one step earlier. 「試算:可回收 4 MB」 is a promise, and the operator
+    who reads it clears their afternoon for a disk that will not move."""
+    current = tree / "apps" / APP / "versions" / "v1"
+    orphan = make_version(tree, "v0")
+    add_file(current, WEIGHT, BIG)
+    link_into(current / WEIGHT, orphan / WEIGHT)
+    reseal(orphan)
+
+    plan = gc_mod.collect_plan(tree)
+
+    assert (APP, "v0") in {(a, v) for a, v, _p in plan.delete_versions}
+    assert plan.reclaimable_mb() < 1                   # the honest forecast
+    assert plan.shared_mb() >= 3                       # …and where the 4 MB went
+    summary = plan.summary()
+    assert "其他版本共用" in summary and "不會釋放" in summary
+    summary.encode("cp950")
+    assert "其他版本共用" in plan.headline()
+    plan.headline().encode("cp950")
+    # the version consumer must not promise it either
+    [versions] = [c for c in plan.consumers if c.kind == "versions"]
+    assert versions.reclaimable_mb < 1 and versions.shared_mb >= 3
+    versions.line().encode("cp950")
+
+
+def test_gc_credits_the_shared_bytes_to_the_last_slot_that_holds_them(tree):
+    """The other half of honesty: when EVERY name is going, the bytes really do come
+    back, and GC must not under-report that either. Counting 「nlink == 1 at the moment
+    of deletion」 gets this right by construction — the first slot sees 2 names and
+    reports 0, the second sees 1 and reports the lot."""
+    make_version(tree, "v0")
+    orphan_a = tree / "apps" / APP / "versions" / "v0"
+    orphan_b = make_version(tree, "v0-b")
+    add_file(orphan_a, WEIGHT, BIG)
+    link_into(orphan_a / WEIGHT, orphan_b / WEIGHT)
+    reseal(orphan_b)
+    assert store_of(tree).load().current == "v1"        # neither orphan is referenced
+
+    free_before = shutil.disk_usage(tree).free
+    plan = gc_mod.run_gc(tree, apply=True, log=lambda *_a: None)
+    freed_on_disk = (shutil.disk_usage(tree).free - free_before) / 1024 ** 2
+
+    assert not orphan_a.exists() and not orphan_b.exists()
+    assert plan.reclaimed_mb() >= 3                     # the bytes DID come back…
+    assert freed_on_disk >= 3                           # …and the disk agrees
+    assert plan.shared_skipped_mb() < 1                 # nothing was left behind
+
+
+def test_gc_does_not_credit_bytes_a_slot_that_refused_to_delete_still_holds(
+        tree, monkeypatch):
+    """The case a precomputed forecast can never get right, and the reason the apply
+    path measures at the moment of deletion: two doomed slots share the file, the first
+    REFUSES to delete (the App has it open), so the bytes never come back — and the
+    second slot must not be credited with the 4 MB the forecast promised."""
+    orphan_a = make_version(tree, "v0")
+    orphan_b = make_version(tree, "v0-b")
+    add_file(orphan_a, WEIGHT, BIG)
+    link_into(orphan_a / WEIGHT, orphan_b / WEIGHT)
+    reseal(orphan_b)
+
+    plan_before = gc_mod.collect_plan(tree)
+    assert plan_before.reclaimable_mb() >= 3           # the forecast: both are going
+
+    real_rmtree = gc_mod.shutil.rmtree
+
+    def refuse_the_first(path, *args, **kwargs):
+        if Path(path).name == "v0":                    # the App still has it open
+            raise PermissionError(32, "the file is in use by another process")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(gc_mod.shutil, "rmtree", refuse_the_first)
+    plan = gc_mod.run_gc(tree, apply=True, log=lambda *_a: None)
+
+    assert orphan_a.is_dir() and not orphan_b.exists()      # one stayed, one went
+    assert plan.survivors                                   # …and it is reported
+    assert plan.reclaimed_mb() < 1                          # the 4 MB did NOT come back
+    assert plan.shared_skipped_mb() >= 3                    # …and GC says why
+    text = plan.report()
+    assert "其他版本共用" in text
+    text.encode("cp950")

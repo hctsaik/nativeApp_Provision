@@ -136,6 +136,37 @@ def test_fingerprint_depends_on_pins_and_python():
     assert fp.startswith("cp311-")
 
 
+def test_runtime_publish_falls_back_to_verified_copy_when_defender_blocks_rename(
+        tmp_path, monkeypatch):
+    """A real CV Viewer build remained pinned beyond the 76-second rename window.
+
+    The fallback may expose a directory name, but never a usable runtime: `.complete`
+    is written only after the copied tree passes its own files.json verification.
+    """
+    staging = tmp_path / ".staging-runtime"
+    target = tmp_path / "cp311-runtime"
+    (staging / "Lib").mkdir(parents=True)
+    (staging / "python.exe").write_bytes(b"python")
+    (staging / "Lib" / "os.py").write_text("# stdlib", encoding="utf-8")
+    (staging / runtime_store.RUNTIME_META).write_text(
+        json.dumps({"fingerprint": target.name}), encoding="utf-8")
+    integrity.write_files_json(
+        staging, integrity.build_files_json(
+            staging, extra_excluded={runtime_store.RUNTIME_META}))
+
+    def defender_never_releases(*_args, **_kwargs):
+        raise runtime_mod.RuntimeError_("WinError 5 after retries")
+
+    monkeypatch.setattr(store_builder, "_rename_with_retry", defender_never_releases)
+    store_builder._publish_completed_tree(
+        staging, target, extra_excluded={runtime_store.RUNTIME_META})
+
+    assert integrity.is_complete(target)
+    assert integrity.verify_tree(
+        target, extra_excluded={runtime_store.RUNTIME_META}) == []
+    assert not staging.exists()
+
+
 def test_first_use_verifies_deeply_then_writes_sentinel(tree):
     rdir = make_runtime(tree, FP2, complete=False)
     rstore = rstore_of(tree)
@@ -251,13 +282,162 @@ def test_failed_version_is_not_restaged_until_revision_changes(tree, tmp_path):
 
 
 def test_release_for_another_app_is_rejected(tmp_path):
+    """A provider that hands back another app's release is how App B's bytes get
+    installed into App A's version slot. The check stays — but it is no longer a dead
+    end: it names the app the payload IS for, and the way in."""
     source = tmp_path / "usb"
     (source / "other").mkdir(parents=True)
     (source / "other" / "release.json").write_text(json.dumps({
         "app_id": APP, "version": "v9", "revision": "r",
         "runtime_fingerprint": FP1}), encoding="utf-8")
-    with pytest.raises(ProviderError, match="別的 app"):
+    with pytest.raises(ProviderError) as caught:
         FolderUpdateProvider(source).get_latest_release("other", "v1")
+    message = str(caught.value)
+    assert APP in message and "other" in message      # both sides of the mismatch
+    assert f"--app {APP}" in message                  # ...and what to type instead
+    message.encode("cp950")
+
+
+def test_a_payload_can_say_which_app_it_is_for_without_being_told_first(tmp_path):
+    """S8, THE SECOND APP CAN NEVER ARRIVE. Every entry point into this provider starts
+    from an app_id the CALLER already has — and bootstrap gets that id from the apps
+    already installed in apps\\. So `--install <App B's payload>` on a machine that runs
+    App A resolved to App A, asked for App A's release, got App B's release.json, and
+    refused it. The machine, the operator and the payload were all correct.
+
+    A payload knows perfectly well which app it is for. Asking it must not require
+    knowing the answer in advance — that is the loop this closes.
+    """
+    payload = tmp_path / "v1.1.0更新包"          # the operator renamed it. They do.
+    payload.mkdir()
+    (payload / "release.json").write_text(json.dumps({
+        "schema": 1, "app_id": "line-b-report", "version": "v2.0.0",
+        "revision": "r7", "runtime_fingerprint": FP1}), encoding="utf-8")
+
+    provider = FolderUpdateProvider.from_payload_dir(payload)
+    assert provider.payload_app_id() == "line-b-report"
+    assert provider.app_ids() == ["line-b-report"]
+    # and knowing the id, the release itself reads back — for an app this machine has
+    # never seen, which is the entire point
+    release = provider.get_latest_release("line-b-report", "")
+    assert release is not None and release.version == "v2.0.0"
+
+
+def test_an_update_source_lists_every_app_it_offers_not_just_the_ones_we_have(tmp_path):
+    """The same question asked of a SHARE rather than a folder: a machine polling
+    \\\\server\\updates has to be able to see an app it does not have yet."""
+    source = tmp_path / "share"
+    for app_id, version in (("line-a-viewer", "v1"), ("line-b-report", "v2")):
+        (source / app_id).mkdir(parents=True)
+        (source / app_id / "release.json").write_text(json.dumps({
+            "schema": 1, "app_id": app_id, "version": version, "revision": "r",
+            "runtime_fingerprint": FP1}), encoding="utf-8")
+    (source / "not-a-payload").mkdir()               # junk on a USB stick: skipped
+    (source / "readme.txt").write_text("hi", encoding="utf-8")
+
+    assert FolderUpdateProvider(source).app_ids() == ["line-a-viewer", "line-b-report"]
+    assert FolderUpdateProvider(tmp_path / "nothing").app_ids() == []
+
+
+def test_a_payload_whose_app_id_is_junk_is_not_a_payload(tmp_path):
+    """An app_id off a USB stick is untrusted input, and it is about to become a path."""
+    payload = tmp_path / "payload"
+    payload.mkdir()
+    (payload / "release.json").write_text(json.dumps({
+        "app_id": "../../windows/system32", "version": "v1",
+        "runtime_fingerprint": FP1}), encoding="utf-8")
+    assert FolderUpdateProvider.from_payload_dir(payload).payload_app_id() is None
+
+    (payload / "release.json").write_text("{ not json", encoding="utf-8")
+    assert FolderUpdateProvider.from_payload_dir(payload).payload_app_id() is None
+
+
+def test_staging_an_update_reuses_the_big_file_this_machine_already_has(tree, tmp_path):
+    """S8/S5, THE FACTORY PC'S HALF. Deduplicating version slots on the BUILD machine
+    saves a disk nobody is short of. The machine that actually matters is the factory PC,
+    and it gets its versions from a payload: updater.stage_release() copies the whole
+    version out of the USB stick — including the 84 MB model file sitting, byte for byte,
+    in the version slot it is running RIGHT NOW, one directory over.
+
+    `download_app(..., link_from=paths.versions_dir)` makes that file cost a directory
+    entry instead of 84 MB, on every release, forever.
+
+    It is safe precisely BECAUSE of where it sits: the staging dir is a sibling of the
+    version slots (same volume), and stage_release() runs verify_tree() over the staged
+    tree — hashing whatever the link actually points at — before it renames anything into
+    place. A wrong link is a verification failure, not a promoted version.
+    """
+    weight = b"MODEL" * 20000                       # the file that never changes
+    (tree / "apps" / APP / "versions" / "v1" / "application" / "model.bin").write_bytes(weight)
+    integrity.write_files_json(tree / "apps" / APP / "versions" / "v1")
+    integrity.write_complete(tree / "apps" / APP / "versions" / "v1")
+
+    source = make_update_source(tmp_path, "v2", FP1, with_runtime=False)
+    payload_v2 = source / APP / "versions" / "v2"
+    (payload_v2 / "application" / "model.bin").write_bytes(weight)   # identical
+    (payload_v2 / "application" / "app.py").write_text(              # this really changed
+        "# v2: the new inference panel", encoding="utf-8")
+    integrity.write_files_json(payload_v2)
+
+    paths = app_paths(tree)
+    provider = FolderUpdateProvider(source)
+    staging = tree / "apps" / APP / "staging" / "probe"
+    provider.download_app(
+        ReleaseMetadata(app_id=APP, version="v2", revision="r1", runtime_fingerprint=FP1),
+        staging, link_from=paths.versions_dir)
+
+    staged = staging / "application" / "model.bin"
+    live = tree / "apps" / APP / "versions" / "v1" / "application" / "model.bin"
+    assert staged.stat().st_ino == live.stat().st_ino, "又從 USB 複製了一份一模一樣的大檔"
+    assert staged.read_bytes() == weight
+    # the file that really CHANGED is a real copy, carrying the payload's bytes — the
+    # dedup keys on content, so it can never serve the old version's code as the new one
+    app_py = staging / "application" / "app.py"
+    assert app_py.stat().st_ino != (
+        tree / "apps" / APP / "versions" / "v1" / "application" / "app.py").stat().st_ino
+    assert app_py.read_text("utf-8") == "# v2: the new inference panel"
+    # ...and the staged tree still verifies against its own files.json, which is what
+    # stage_release() checks before it promotes anything
+    assert integrity.verify_tree(staging) == []
+
+
+def test_staging_without_link_from_behaves_exactly_as_before(tree, tmp_path):
+    """The dedup is opt-in: a caller that does not ask for it gets today's behaviour,
+    byte for byte. updater.py has to pass `link_from` before the factory PC benefits."""
+    source = make_update_source(tmp_path, "v2", FP1, with_runtime=False)
+    staging = tree / "apps" / APP / "staging" / "probe"
+    FolderUpdateProvider(source).download_app(
+        ReleaseMetadata(app_id=APP, version="v2", revision="r1", runtime_fingerprint=FP1),
+        staging)
+    assert (staging / "application" / "app.py").stat().st_nlink == 1
+    assert integrity.verify_tree(staging) == []
+
+
+def test_a_payload_file_that_only_LOOKS_like_the_one_we_have_is_never_linked(tree, tmp_path):
+    """Same path, same size, different bytes — a retrained model. Linking on the path
+    would install the OLD model under the NEW version's number, and every hash in
+    files.json would agree with itself all the way to the factory floor."""
+    old = b"A" * 4096
+    new = b"B" * 4096                               # same size, different content
+    (tree / "apps" / APP / "versions" / "v1" / "application" / "model.bin").write_bytes(old)
+    integrity.write_files_json(tree / "apps" / APP / "versions" / "v1")
+    integrity.write_complete(tree / "apps" / APP / "versions" / "v1")
+
+    source = make_update_source(tmp_path, "v2", FP1, with_runtime=False)
+    payload_v2 = source / APP / "versions" / "v2"
+    (payload_v2 / "application" / "model.bin").write_bytes(new)
+    integrity.write_files_json(payload_v2)
+
+    staging = tree / "apps" / APP / "staging" / "probe"
+    FolderUpdateProvider(source).download_app(
+        ReleaseMetadata(app_id=APP, version="v2", revision="r1", runtime_fingerprint=FP1),
+        staging, link_from=app_paths(tree).versions_dir)
+
+    assert (staging / "application" / "model.bin").read_bytes() == new
+    assert integrity.verify_tree(staging) == []
+    # the version this machine is running still has ITS bytes
+    assert (tree / "apps" / APP / "versions" / "v1" / "application"
+            / "model.bin").read_bytes() == old
 
 
 def test_notification_happens_only_after_pending_is_written(tree, tmp_path):
@@ -833,7 +1013,11 @@ def test_reused_runtime_still_gets_the_missing_import_gate(build_request, stub_t
     assert not second.ok
     assert any("duckdb" in e for e in second.errors), second.errors
     assert any("app.py:1" in e for e in second.errors), second.errors      # where
-    assert any("requirements" in e for e in second.errors), second.errors  # way out 1
+    # way out #1 — "add it to the dependency declaration". In store mode the
+    # source is a pinned lock, so the honest instruction is the lock file, not
+    # "requirements": the 選用相依群組 field is inert when a lock is the source,
+    # and recommending it produced a tool that contradicted itself in one breath.
+    assert any("lock" in e or "requirements" in e for e in second.errors), second.errors
     assert any("try/except ImportError" in e for e in second.errors), second.errors  # way 2
 
     # asked the runtime that will really run the app — the shared, reused one

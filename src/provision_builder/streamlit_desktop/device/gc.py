@@ -105,11 +105,42 @@ operator concluded there was nothing to gain. Measurement now walks per entry,
 counts what it could not read (Measured.unreadable), and says 「至少 N MB」 instead
 of pretending a runtime is empty.
 
+AND: A DELETED VERSION DOES NOT MEAN RECLAIMED BYTES (hardlink dedup)
+=====================================================================
+store_builder now hardlinks byte-identical files between version slots, so CV_Viewer's
+versions dir went 168 MB -> 84 MB and a second version costs 0 MB. A hardlink is two
+NAMES for one set of bytes: the bytes go only when the LAST name goes. GC summed
+st_size, so
+deleting a slot whose 84 MB weight file is still linked from the slot next door freed
+roughly NOTHING while GC announced 「實際回收 84 MB」. The data was never at risk (the
+OS keeps the bytes while any name remains — v1.1.0 still verifies after v1.0.0 is
+collected); the REPORT was false, and 「回收完成」 over a run that freed nothing is the
+same bug this file has already been fixed for twice.
+
+    RECLAIMED means: this deletion removed the file's LAST name (st_nlink == 1 at the
+    moment of deletion). Nothing else may be counted, forecast or reported.
+    SHARED means: another version slot still holds a name. Those bytes are reported by
+    name and by size, and are NEVER netted into a reclaim figure.
+
+The apply path measures each tree AT THE MOMENT it deletes it, not from the forecast.
+That is what makes it self-correcting: two doomed slots sharing an inode credit the
+bytes to whichever goes last (total = the truth), and a slot that REFUSES to delete
+keeps its name — so its sibling honestly reports 0 MB freed instead of the 84 MB the
+forecast promised. See _reclaim_of().
+
 WHAT A GUI SHOULD READ (never re-derive any of this from the plan's forecast):
     plan.applied            did --apply actually run?
-    plan.deleted            [(label, mb)] — what ACTUALLY went away
+    plan.deleted            [(label, mb)] — what ACTUALLY went away, and `mb` is what
+                            it RELEASED (not the size of the tree: see above)
     plan.reclaimed_mb()     MEASURED total. reclaimable_mb() is a FORECAST: it is
                             only ever valid before --apply.
+    plan.shared_skipped     [(label, mb)] MEASURED bytes that did NOT come back
+                            because another slot still holds them
+    plan.shared_skipped_mb() / plan.shared_mb()   the same, totalled (measured /
+                            forecast). NEVER subtract these from anything: they are
+                            already excluded from the reclaim figures.
+    plan.shared_note()      the one honest cp950-safe sentence about shared bytes ("")
+                            when there are none
     plan.survivors          [GcSurvivor] — what stayed, .reason why, .in_use
                             (→ .hint(): 關掉 App 再跑一次), .label, .path
     plan.failures           the same survivors, pre-rendered as console lines
@@ -144,6 +175,7 @@ sys.dont_write_bytecode = True  # we run under the shared runtime; never mutate 
 
 import os
 import shutil
+import stat
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -315,8 +347,160 @@ def _entry_size(entry) -> int:
 
     A single function so that "a file a running App has open" is a thing that can
     be tested, instead of a thing we hope we handled.
+
+    This is a SIZE, and it stays a size: it answers 「這棵樹有多大」. It does NOT
+    answer 「刪掉它會空出多少」 — since version slots dedup by hardlink, those are
+    two different numbers and conflating them is what _reclaim_of() exists to end.
     """
     return entry.stat(follow_symlinks=False).st_size
+
+
+# ── what a deletion ACTUALLY gives back ──────────────────────────────────────
+#
+# store_builder now hardlinks byte-identical files between version slots (CV_Viewer:
+# versions\ went 168 MB -> 84 MB, and a second version costs 0 MB). A hardlink is two
+# NAMES for one set of bytes, and the bytes go only when the LAST name goes. So
+# deleting a version slot whose 84 MB weight file is still linked from the slot next
+# door frees ROUGHLY NOTHING — while GC, which summed st_size, announced 「實際回收
+# 84 MB」 over a disk that had not moved a byte. The data was never at risk (the OS
+# keeps the bytes while any name remains, and v1.1.0 still verifies after v1.0.0 is
+# collected); it was the REPORT that lied, and 「回收完成」 over a run that freed
+# nothing is the exact bug class this file has already been fixed for twice.
+#
+# THE RULE: a file's bytes count as reclaimed only when THIS deletion released them,
+# i.e. when the last link goes. Everything else is reported, separately and by name,
+# as space that another version is holding and that deleting this one cannot give back.
+#
+# WINDOWS TRAP, PAID FOR ONCE: os.scandir()'s DirEntry.stat() returns st_nlink == 0
+# and st_ino == 0 on Windows (documented; only os.stat() fills them in). A naive
+# `entry.stat().st_nlink == 1` therefore matches NOTHING on the one platform this
+# product ships to: GC would have reported 0 MB reclaimed for every run, forever,
+# while passing on Linux CI. Every link fact below comes from os.stat(), never from
+# the scandir entry.
+
+@dataclass
+class _Names:
+    """One inode, and how many of its names we found inside the delete set."""
+    size: int
+    nlink: int                 # names this file has IN TOTAL (os.stat)
+    here: int = 0              # …of which this many are inside the set
+    holders: set = field(default_factory=set)   # indices of the trees holding them
+    last: int = 0              # the tree whose deletion removes the last one
+
+
+@dataclass
+class Reclaim:
+    """The bytes a deletion gives back, and the bytes it cannot."""
+    mb: float = 0.0            # released: this deletion removed the file's LAST name
+    shared_mb: float = 0.0     # another name still holds these bytes afterwards
+    unreadable: int = 0        # files we could not stat: never counted as either
+
+    @property
+    def partial(self) -> bool:
+        return self.unreadable > 0
+
+    def text(self) -> str:
+        body = f"{'至少 ' if self.partial else ''}{self.mb:,.0f} MB"
+        return f"{body}{self.shared_note()}"
+
+    def shared_note(self) -> str:
+        """Said out loud, every time, or the operator is promised space that cannot
+        arrive. This is the whole point of the class."""
+        if self.shared_mb < 1:
+            return ""
+        return (f"(其中 {self.shared_mb:,.0f} MB 由其他版本共用,"
+                f"刪掉這個版本不會釋放它)")
+
+
+def _reclaim_of(roots) -> tuple:
+    """(total, per_root, detail) — what deleting exactly these trees, RIGHT NOW, frees.
+
+    `detail` is {inode key: (released, mb)}, and it is what lets the apply loop tell the
+    truth about a RUN rather than about a moment. Deleting two slots that share an inode
+    honestly reports 「0 MB freed, 4 MB shared」 for the first and 「4 MB freed」 for the
+    second — but the run as a whole freed 4 MB and left nothing behind, and an operator
+    told BOTH numbers about the same 4 MB has been lied to twice. run_gc() therefore
+    keeps the keys and, at the end, drops from 「shared」 every inode a later deletion
+    turned out to release.
+
+    A file's bytes are RELEASED iff every name it has is inside this set of trees.
+    We know how many names it has (os.stat().st_nlink) and how many of them we found
+    in here, so the answer is exact — no guessing, no assuming a link is ours.
+
+    Called with ALL doomed trees at once it is the dry run's forecast. Called with ONE
+    tree, immediately before deleting it, it is the truth about that deletion — and it
+    is self-correcting in a way a precomputed plan can never be:
+
+      * Two doomed slots share an 84 MB inode. The first deletion sees st_nlink == 2
+        and honestly reports 0 MB released + 84 MB shared; the second then sees
+        st_nlink == 1 and reports the 84 MB. The run's total is 84 MB: exactly what
+        the disk gave back.
+      * The first slot REFUSES to delete (the App is open). The second slot still sees
+        st_nlink == 2 and still reports 0 MB — because the survivor is still holding
+        those bytes, and they did not come back. A forecast would have promised 84 MB
+        here. That is the survivor lie this module exists to not tell.
+
+    per_root attributes released bytes to the tree whose deletion drops the last name,
+    and shared bytes to EVERY tree holding one (so each slot can say honestly how much
+    of itself is shared). per_root's shared totals may therefore overlap; the total's
+    do not, because it counts each inode once.
+    """
+    roots = [Path(r) for r in roots]
+    links: dict = {}                   # (dev, ino) -> _Names
+    unreadable = [0] * len(roots)
+
+    for index, root in enumerate(roots):
+        stack = [root]
+        while stack:
+            current = stack.pop()
+            try:
+                # os.stat, NOT the scandir entry: see the Windows trap above.
+                st = os.stat(current, follow_symlinks=False)
+            except FileNotFoundError:
+                continue               # not there = genuinely nothing, not unknown
+            except OSError:
+                unreadable[index] += 1
+                continue
+            if stat.S_ISDIR(st.st_mode):
+                try:
+                    stack.extend(Path(e.path) for e in os.scandir(current))
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    unreadable[index] += 1
+                continue
+            # A filesystem that does not report inodes (FAT/exFAT, some network
+            # shares) hands back st_ino == 0 for everything. Grouping those by inode
+            # would fuse every file on the volume into one; give each its own key.
+            # Such a volume cannot hold a hardlink anyway, so st_nlink is 1 and every
+            # file is simply released.
+            key = ((st.st_dev, st.st_ino) if st.st_ino else ("path", str(current)))
+            names = links.get(key)
+            if names is None:
+                names = links[key] = _Names(size=st.st_size, nlink=max(1, st.st_nlink))
+            names.here += 1            # one more of this file's names is in the set
+            names.holders.add(index)
+            names.last = index
+
+    total = Reclaim()
+    per_root = {str(root): Reclaim() for root in roots}
+    detail: dict = {}
+    for key, names in links.items():
+        mb = names.size / 1024 ** 2
+        released = names.here >= names.nlink   # every name this file has is in the set
+        detail[key] = (released, mb)
+        if released:
+            total.mb += mb
+            per_root[str(roots[names.last])].mb += mb
+        else:                          # a name outside the set keeps the bytes alive
+            total.shared_mb += mb
+            for index in names.holders:
+                per_root[str(roots[index])].shared_mb += mb
+    for index, count in enumerate(unreadable):
+        if count:
+            total.unreadable += count
+            per_root[str(roots[index])].unreadable += count
+    return total, per_root, detail
 
 
 @dataclass
@@ -390,15 +574,26 @@ class Consumer:
     label: str
     kind: str                    # versions|logs|cache|data|staging|runtime|shell|other
     mb: float = 0.0
-    reclaimable_mb: float = 0.0  # how much of it THIS run could take back
+    reclaimable_mb: float = 0.0  # how much of it THIS run could take back — RELEASED
+    # …and how much of it is bytes a SURVIVING version slot also holds (hardlink dedup).
+    # It is part of `mb` (the slot really is that big) and it is NOT part of
+    # reclaimable_mb (deleting the slot will not give it back). Both facts are true and
+    # the operator needs both, so both are said.
+    shared_mb: float = 0.0
     partial: bool = False        # some of it could not be measured
     path: str | None = None
 
     def line(self) -> str:
         size = f"至少 {self.mb:,.0f} MB" if self.partial else f"{self.mb:,.0f} MB"
+        text = f"{self.label}:{size}"
         if self.reclaimable_mb >= 1:
-            return f"{self.label}:{size}(其中 {self.reclaimable_mb:,.0f} MB 這次可以回收)"
-        return f"{self.label}:{size}"
+            text += f"(其中 {self.reclaimable_mb:,.0f} MB 這次可以回收"
+            if self.shared_mb >= 1:
+                text += f";另有 {self.shared_mb:,.0f} MB 與其他版本共用,刪了也不會釋放"
+            text += ")"
+        elif self.shared_mb >= 1:
+            text += f"(其中 {self.shared_mb:,.0f} MB 與其他版本共用,刪了也不會釋放)"
+        return text
 
 
 @dataclass
@@ -545,8 +740,16 @@ class GcPlan:
     # never from the plan — a plan is a promise, and the operator is owed the
     # outcome.
     applied: bool = False
-    deleted: list = field(default_factory=list)          # (label, mb) — MEASURED
+    deleted: list = field(default_factory=list)          # (label, mb) — MEASURED, and
+    # `mb` is the space this deletion RELEASED, not the size of the tree that went:
+    # with hardlink dedup between version slots those are different numbers, and the
+    # one the operator is owed is the first (see _reclaim_of).
     survivors: list = field(default_factory=list)        # GcSurvivor
+    # Bytes that did NOT come back because another version slot still holds a name for
+    # them. MEASURED at deletion time. Reported separately and never netted against
+    # `deleted`: 「刪掉了,但沒有空出來」 is the honest sentence, and it is a sentence
+    # the operator has to hear or they will keep waiting for space that cannot arrive.
+    shared_skipped: list = field(default_factory=list)   # (label, mb)
     # WHERE THE SPACE WENT — filled in by collect_plan() on EVERY run, valid even
     # when there is nothing to reclaim. An operator with a full C: drive is owed an
     # answer, and 「沒有可回收的項目」 is not one.
@@ -559,6 +762,11 @@ class GcPlan:
     unmeasured: list = field(default_factory=list)       # sample of (path, why)
     unmeasured_count: int = 0                            # …the exact count
     _sizes: dict = field(default_factory=dict, repr=False)   # path -> Measured
+    # THE FORECAST, computed once by collect_plan() over every doomed tree AT ONCE —
+    # which is the only way to get it right: whether deleting v1.0.0 frees its 84 MB
+    # weight file depends on whether v1.1.0 (which shares the inode) is also going.
+    _forecast: Reclaim = field(default_factory=Reclaim, repr=False)
+    _forecast_by_path: dict = field(default_factory=dict, repr=False)  # path -> Reclaim
 
     @property
     def failures(self) -> list:
@@ -648,6 +856,22 @@ class GcPlan:
     def _mb(self, path: Path) -> float:
         return self.measure(path).mb
 
+    def forecast_for(self, path: Path) -> Reclaim:
+        """What the plan expects deleting THIS tree to release. Empty for a tree that
+        is not in the plan."""
+        return self._forecast_by_path.get(str(path)) or Reclaim()
+
+    def item_text(self, path: Path) -> str:
+        """One doomed tree, as the operator should see it: how big it is, and how much
+        of that is bytes another version also holds and that deleting this one will
+        therefore NOT give back. 「可刪版本 v1.0.0(84 MB)」 was true about the size and
+        a lie about the space."""
+        size = self.measure(path).text()
+        shared = self.forecast_for(path).shared_mb
+        if shared < 1:
+            return size
+        return f"{size};其中 {shared:,.0f} MB 由其他版本共用,刪掉不會釋放"
+
     # ── the plan ─────────────────────────────────────────────────────────────
 
     def groups(self) -> list:
@@ -668,15 +892,49 @@ class GcPlan:
     def cache_mb(self) -> float:
         return sum(group.mb for group in self.delete_caches)
 
+    def doomed_paths(self) -> list:
+        """Every path this plan would delete, IN DELETION ORDER.
+
+        The order matters to the forecast: when two doomed slots share an inode, the
+        bytes are released by whichever is deleted LAST, and _reclaim_of attributes
+        them there so the forecast and the eventual report tell the same story.
+        """
+        paths = [path for _label, path in self.items()]
+        for group in self.groups():
+            paths.extend(group.paths)
+        return paths
+
     def reclaimable_mb(self) -> float:
-        return sum(self._mb(p) for _fp, p in self.delete_runtimes) \
-            + sum(self._mb(p) for _fp, p in self.delete_shells) \
-            + sum(self._mb(p) for _a, _v, p in self.delete_versions) \
-            + sum(self._mb(p) for _w, p in self.delete_staging) \
-            + self.logs_mb() + self.cache_mb()
+        """FORECAST: the bytes that would ACTUALLY come back. Never the sum of the
+        trees' sizes — a slot whose 84 MB weight file is hardlinked from the slot next
+        door is 84 MB big and frees nothing, and summing st_size promised the operator
+        space that could not arrive."""
+        return self._forecast.mb
+
+    def shared_mb(self) -> float:
+        """FORECAST: bytes inside the doomed trees that a SURVIVING slot also holds.
+        Deleting the plan will not release them. Reported, never netted away."""
+        return self._forecast.shared_mb
 
     def reclaimed_mb(self) -> float:
+        """MEASURED: bytes whose last name this run actually removed."""
         return sum(mb for _label, mb in self.deleted)
+
+    def shared_skipped_mb(self) -> float:
+        """MEASURED: bytes that stayed on the disk because another slot still holds
+        them (or because the slot that held the other name refused to delete)."""
+        return sum(mb for _label, mb in self.shared_skipped)
+
+    def shared_note(self) -> str:
+        """The one sentence that keeps 「回收完成」 honest, past tense or future."""
+        shared = self.shared_skipped_mb() if self.applied else self.shared_mb()
+        if shared < 1:
+            return ""
+        if self.applied:
+            return (f"另有 {shared:,.0f} MB 沒有釋放:那些檔案被其他版本共用"
+                    f"(硬連結),只要還有版本用到它們,刪掉這些版本也不會空出空間。")
+        return (f"另有 {shared:,.0f} MB 不會釋放:那些檔案被其他版本共用(硬連結),"
+                f"刪掉這些版本也不會空出這些空間。")
 
     def items(self) -> list:
         """Every TREE to delete, as (label, path), in deletion order. The bulk file
@@ -812,7 +1070,8 @@ class GcPlan:
         if not self.applied:                                   # a plan, not an outcome
             if not self.is_empty():
                 return (f"試算:可回收 {self.item_count()} 項、"
-                        f"約 {self.reclaimable_mb():.0f} MB(還沒有刪除任何東西)。")
+                        f"約 {self.reclaimable_mb():.0f} MB(還沒有刪除任何東西)。"
+                        + self.shared_note())
             if self.self_hosted:
                 return (f"沒有其他可回收的項目;還有一份沒人在用的 runtime "
                         f"{self.self_hosted},但 GC 正在用它執行,這次回收不掉。")
@@ -822,10 +1081,15 @@ class GcPlan:
         if self.deleted and self.survivors:
             return (f"部分回收:刪掉 {len(self.deleted)} 項,"
                     f"實際回收 {self.reclaimed_mb():.0f} MB;"
-                    f"還有 {len(self.survivors)} 項刪不掉,那些空間沒有回收。")
+                    f"還有 {len(self.survivors)} 項刪不掉,那些空間沒有回收。"
+                    + self.shared_note())
         if self.deleted:
+            # 「回收完成」 over a run that freed nothing is exactly the sentence this
+            # module keeps having to un-print. reclaimed_mb() is now the bytes that
+            # actually went, and if the rest is being held by another slot, the
+            # headline says so in the same breath.
             return (f"回收完成:刪掉 {len(self.deleted)} 項,"
-                    f"實際回收 {self.reclaimed_mb():.0f} MB。")
+                    f"實際回收 {self.reclaimed_mb():.0f} MB。" + self.shared_note())
         if self.survivors:
             return (f"一項都沒有刪掉:{len(self.survivors)} 項全部刪不掉,"
                     "磁碟空間完全沒有回收。")
@@ -914,10 +1178,10 @@ class GcPlan:
         lines = self.scope_lines() + self.keep_lines()
         lines += [f"保留 runtime:{sorted(self.keep_fingerprints)}",
                   f"保留 shell:{sorted(self.keep_shells)}"]
-        lines += [f"可刪版本:{a}/{v}({self.measure(p).text()})" for a, v, p in self.delete_versions]
-        lines += [f"可刪 runtime:{fp}({self.measure(p).text()})" for fp, p in self.delete_runtimes]
-        lines += [f"可刪 shell:{fp}({self.measure(p).text()})" for fp, p in self.delete_shells]
-        lines += [f"可刪建置殘留:{w}({self.measure(p).text()})" for w, p in self.delete_staging]
+        lines += [f"可刪版本:{a}/{v}({self.item_text(p)})" for a, v, p in self.delete_versions]
+        lines += [f"可刪 runtime:{fp}({self.item_text(p)})" for fp, p in self.delete_runtimes]
+        lines += [f"可刪 shell:{fp}({self.item_text(p)})" for fp, p in self.delete_shells]
+        lines += [f"可刪建置殘留:{w}({self.item_text(p)})" for w, p in self.delete_staging]
         # Reported SEPARATELY from versions/runtimes, because they are a different
         # answer to a different question: this is the space a machine loses simply
         # by being used, and nobody was ever shown it.
@@ -926,6 +1190,12 @@ class GcPlan:
                   for group in self.delete_caches]
         if not self.is_empty():
             lines.append(f"可回收合計:{self.reclaimable_mb():.0f} MB")
+            # …and, immediately under it, the space that is NOT coming back. An
+            # operator who reads 「可回收合計 0 MB」 under 「可刪版本 v1.0.0(84 MB)」
+            # would otherwise conclude GC is broken; the truth is that v1.1.0 is
+            # holding those bytes, and it is one line to say so.
+            if self.shared_note():
+                lines.append(self.shared_note())
         elif not self.self_hosted:
             # ONLY here is "nothing to reclaim" true. With self_hosted set, the
             # empty delete lists are not the absence of an orphan — they are the
@@ -947,13 +1217,24 @@ class GcPlan:
         operator as 「沒有刪掉任何東西」.
         """
         lines = self.scope_lines() + self.keep_lines()
-        lines += [f"已刪除 {label}({mb:.0f} MB)" for label, mb in self.deleted]
+        # 「已刪除 版本 v1.0.0(84 MB)」 over a disk that did not move is the lie this
+        # is here to stop. The tree DID go; the bytes did not, because the slot next
+        # door still holds a name for them. Both halves, on the same line.
+        shared_by_label = dict(self.shared_skipped)
+        for label, mb in self.deleted:
+            line = f"已刪除 {label}({mb:.0f} MB)"
+            shared = shared_by_label.get(label, 0.0)
+            if shared >= 1:
+                line += f",其中 {shared:,.0f} MB 由其他版本共用,沒有釋放"
+            lines.append(line)
         if self.deleted and not self.survivors:
             lines.append(f"實際回收合計:{self.reclaimed_mb():.0f} MB(計畫中的項目全部刪除完成)")
         elif self.deleted:
             lines.append(f"實際回收合計:{self.reclaimed_mb():.0f} MB")
             lines.append(f"部分回收:成功刪除 {len(self.deleted)} 項,"
                          f"還有 {len(self.survivors)} 項刪不掉(見下)。")
+        if self.deleted and self.shared_note():
+            lines.append(self.shared_note())
         elif not self.survivors and not self.self_hosted:
             # The empty plan, applied. There is no 「實際回收合計」 line here and
             # there must never be one: 0 MB came back. gc.bat used to be handed
@@ -1075,33 +1356,40 @@ def _measure_store(plan: GcPlan, root: Path, *, forecast: bool = True) -> None:
     cache_by_app = {group.app_id: group for group in plan.delete_caches}
 
     def add(label: str, kind: str, measured: Measured, *, reclaimable: float = 0.0,
-            path: Path | None = None) -> None:
+            shared: float = 0.0, path: Path | None = None) -> None:
         if measured.mb <= 0 and not measured.partial:
             return
         plan.consumers.append(Consumer(label=label, kind=kind, mb=measured.mb,
                                        reclaimable_mb=reclaimable if forecast else 0.0,
+                                       shared_mb=shared if forecast else 0.0,
                                        partial=measured.partial,
                                        path=str(path) if path else None))
 
+    # 「其中 N MB 這次可以回收」 is a PROMISE OF SPACE, so it may only ever count bytes
+    # whose last name this run removes. Summing the doomed slots' sizes here is the
+    # same lie as summing them anywhere else: with hardlink dedup a 84 MB slot can be
+    # worth nothing at all.
     for app_id in plan.apps_all:
         paths = paths_mod.AppPaths(root, app_id)
-        versions, reclaim = Measured(), 0.0
+        versions, reclaim, shared = Measured(), 0.0, 0.0
         for child in _children(paths.versions_dir):
             measured = plan.measure(child)
             versions.add(measured)
             if (app_id, child.name) in doomed_versions or str(child) in doomed_staging:
-                reclaim += measured.mb
+                reclaim += plan.forecast_for(child).mb
+                shared += plan.forecast_for(child).shared_mb
         add(f"{app_id}:版本檔案", "versions", versions, reclaimable=reclaim,
-            path=paths.versions_dir)
+            shared=shared, path=paths.versions_dir)
 
-        staging, reclaim = Measured(), 0.0
+        staging, reclaim, shared = Measured(), 0.0, 0.0
         for child in _children(paths.staging_dir):
             measured = plan.measure(child)
             staging.add(measured)
             if str(child) in doomed_staging:
-                reclaim += measured.mb
+                reclaim += plan.forecast_for(child).mb
+                shared += plan.forecast_for(child).shared_mb
         add(f"{app_id}:建置/下載殘留", "staging", staging, reclaimable=reclaim,
-            path=paths.staging_dir)
+            shared=shared, path=paths.staging_dir)
 
         logs = plan.measure(paths.data_dir / "logs")
         group = logs_by_app.get(app_id)
@@ -1128,17 +1416,18 @@ def _measure_store(plan: GcPlan, root: Path, *, forecast: bool = True) -> None:
     runtimes = RuntimeStore(root / "deps").runtimes
     for child in _children(runtimes):
         measured = plan.measure(child)
-        reclaim = measured.mb if (child.name in doomed_runtimes
-                                  or str(child) in doomed_staging) else 0.0
-        add(f"runtime {child.name}", "runtime", measured, reclaimable=reclaim,
-            path=child)
+        doomed = child.name in doomed_runtimes or str(child) in doomed_staging
+        got = plan.forecast_for(child) if doomed else Reclaim()
+        add(f"runtime {child.name}", "runtime", measured, reclaimable=got.mb,
+            shared=got.shared_mb, path=child)
 
     shells = ShellStore(root / "deps").shells
     for child in _children(shells):
         measured = plan.measure(child)
-        reclaim = measured.mb if (child.name in doomed_shells
-                                  or str(child) in doomed_staging) else 0.0
-        add(f"shell {child.name}", "shell", measured, reclaimable=reclaim, path=child)
+        doomed = child.name in doomed_shells or str(child) in doomed_staging
+        got = plan.forecast_for(child) if doomed else Reclaim()
+        add(f"shell {child.name}", "shell", measured, reclaimable=got.mb,
+            shared=got.shared_mb, path=child)
 
     for child in _children(root / "deps"):
         if child.name in ("runtimes", "shells"):
@@ -1308,6 +1597,11 @@ def collect_plan(root: Path, *, apps: list | None = None) -> GcPlan:
     # much of it this run could actually take back — and reported even when the
     # answer is 「none of it」, because that is still the answer to their question.
     plan.disk = disk_space(root)
+    # THE FORECAST, over every doomed tree AT ONCE. It has to be all of them together:
+    # whether deleting v1.0.0 releases its 84 MB weight file depends on whether the
+    # slot that shares the inode is going too. Computed before _measure_store() because
+    # that is what tells each consumer line how much of it can honestly come back.
+    plan._forecast, plan._forecast_by_path, _detail = _reclaim_of(plan.doomed_paths())
     _measure_store(plan, root)
     return plan
 
@@ -1364,17 +1658,44 @@ def run_gc(root: Path, *, apps: list | None = None, apply: bool = False,
         # summary must not be able to cost the operator the disk space they came
         # for — that is precisely what happened when the summary was printed here.
         plan.applied = True
+        # Inodes this run RELEASED, and inodes it found shared. Kept across the whole
+        # loop because 「shared」 is a fact about the RUN: when two doomed slots hold the
+        # same file, the first deletion truthfully sees a second name and the last one
+        # truthfully takes the bytes, and only at the end is it known which happened.
+        released_keys: set = set()
+        shared_seen: dict = {}                  # inode key -> (mb, the tree that saw it)
         for label, path in plan.items():
-            size = plan._mb(path)        # measure it while it still exists
+            # MEASURED AT THE MOMENT OF DELETION, and deliberately not taken from the
+            # plan's forecast. Only the bytes whose LAST name this rmtree removes were
+            # released by it (st_nlink == 1 right now); bytes another slot still holds
+            # are reported as shared and never counted as reclaimed. Doing it here,
+            # per item, is also what makes it correct when a slot REFUSES to delete:
+            # the survivor keeps its name, so the sibling honestly reports 0 MB freed
+            # instead of the 84 MB the forecast promised.
+            got, _by_path, detail = _reclaim_of([path])
             _emit(log, f"刪除 {label} …")
             survivors = _delete_tree(label, path)
             if survivors:
                 plan.survivors.extend(survivors)
-            else:
-                # Only a tree that actually went away counts towards reclaimed_mb().
-                plan.deleted.append((label, size))
+                continue
+            # Only a tree that actually went away counts towards reclaimed_mb() — and
+            # only the bytes of it that actually went with it.
+            plan.deleted.append((label, got.mb))
+            for key, (released, mb) in detail.items():
+                if released:
+                    released_keys.add(key)
+                else:
+                    shared_seen.setdefault(key, (mb, label))
         for group in plan.groups():
-            _delete_group(plan, group, log)
+            _delete_group(plan, group, released_keys, shared_seen, log)
+        # What is STILL shared now that every deletion has run: an inode a later tree
+        # released did come back, and must not also be reported as 「沒有釋放」 — the
+        # operator would be told about the same 4 MB twice, in opposite directions.
+        by_label: dict = {}
+        for key, (mb, label) in shared_seen.items():
+            if key not in released_keys:
+                by_label[label] = by_label.get(label, 0.0) + mb
+        plan.shared_skipped = [(label, mb) for label, mb in by_label.items() if mb >= 1]
         # The disk, re-measured: this is the one number the operator came for, and
         # it is the only one that cannot be argued with. The TREE is re-measured
         # too — the breakdown we scanned describes a tree that no longer exists.
@@ -1386,7 +1707,8 @@ def run_gc(root: Path, *, apps: list | None = None, apply: bool = False,
     return plan
 
 
-def _delete_group(plan: GcPlan, group: GcGroup, log) -> None:
+def _delete_group(plan: GcPlan, group: GcGroup, released_keys: set,
+                  shared_seen: dict, log) -> None:
     """Delete a bulk group (old logs, cache) file by file, report it as one thing.
 
     Per-FILE deletion so a single locked log costs us that log and not the other
@@ -1396,12 +1718,20 @@ def _delete_group(plan: GcPlan, group: GcGroup, log) -> None:
     _emit(log, f"刪除 {group.label}({group.count} 個,{group.mb:,.0f} MB)…")
     freed, failures = 0.0, []
     for path in group.paths:
-        size = plan._mb(path)            # from the collect-time walk: it existed then
+        # Same rule as the trees: what this deletion RELEASES, measured now. A rotated
+        # log has one name and is simply freed; the rule costs nothing here and means
+        # there is exactly one definition of 「回收」 in this file.
+        got, _by_path, detail = _reclaim_of([path])
         survivors = _delete_tree(group.label, path)
         if survivors:
             failures.extend(survivors)
-        else:
-            freed += size
+            continue
+        freed += got.mb
+        for key, (released, mb) in detail.items():
+            if released:
+                released_keys.add(key)
+            else:
+                shared_seen.setdefault(key, (mb, group.label))
     gone = group.count - len(failures)
     if gone:
         plan.deleted.append((f"{group.label}(刪掉 {gone} 個)", freed))

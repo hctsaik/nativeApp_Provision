@@ -337,7 +337,10 @@ def app_lock(state_dir: Path) -> FileLock:
 
 
 def runtime_lock(runtimes_dir: Path, fingerprint: str) -> FileLock:
-    locks = Path(runtimes_dir) / ".locks"
+    # Locks are store metadata, not runtimes.  Keeping `.locks` inside the
+    # runtime directory makes ordinary directory enumeration (and older GC or
+    # packaging code) mistake it for an additional runtime.
+    locks = Path(runtimes_dir).parent / ".locks" / "runtimes"
     return FileLock(locks / f"{fingerprint}.lock", what=f"runtime {fingerprint} lock")
 
 

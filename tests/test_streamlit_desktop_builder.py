@@ -391,7 +391,105 @@ def test_junk_that_can_never_be_the_app_is_dropped_at_any_depth(request_, stub_p
     assert (out / "dist" / "index.html").is_file()     # ...and the payload still does
 
 
+def test_a_nested_archive_is_data_the_app_reads_and_must_travel(request_, stub_pip):
+    """S7. `*.zip` was matched by BARE NAME at any depth — exactly the mistake `dist`
+    made, one class up. So `assets/data.zip`, `models/weights.tar.gz`,
+    `tests/fixtures/sample.7z` — payloads the app OPENS AT RUN TIME — were deleted on
+    the way into the package. The build reported success. It even ran on the BUILD
+    machine, where the file was still sitting next to the source we had copied from.
+    It died on the factory floor, with a FileNotFoundError naming a path that had been
+    there all along, on a machine with no way to put the file back.
+
+    Nested, an archive is DATA. Keep it.
+    """
+    (request_.project_dir / "assets").mkdir()
+    (request_.project_dir / "assets" / "data.zip").write_bytes(b"PK payload")
+    (request_.project_dir / "models").mkdir()
+    (request_.project_dir / "models" / "weights.tar.gz").write_bytes(b"\x1f\x8b payload")
+    (request_.project_dir / "tests" / "fixtures").mkdir(parents=True)
+    (request_.project_dir / "tests" / "fixtures" / "sample.7z").write_bytes(b"7z payload")
+
+    assert not builder_mod.should_ignore("data.zip", False, rel="assets/data.zip")
+    assert not builder_mod.should_ignore("weights.tar.gz", False, rel="models/weights.tar.gz")
+    assert not builder_mod.should_ignore("sample.7z", False, rel="tests/fixtures/sample.7z")
+
+    scan = builder_mod.scan_project(request_)          # the estimate counts them...
+    assert "*.zip" not in scan.excluded and "*.tar.gz" not in scan.excluded
+
+    app = build(request_).package_dir / "application"  # ...and the copy delivers them
+    assert (app / "assets" / "data.zip").read_bytes() == b"PK payload"
+    assert (app / "models" / "weights.tar.gz").is_file()
+    assert (app / "tests" / "fixtures" / "sample.7z").is_file()
+
+
+def test_a_root_level_archive_is_still_a_release_artefact_and_is_dropped(request_, stub_pip):
+    """The other half of the same rule, and the reason the rule exists at all: at the
+    PROJECT ROOT an archive is something a build left lying about — often 200 MB of
+    it. Rescuing assets/data.zip must not start shipping release.zip."""
+    (request_.project_dir / "release.zip").write_bytes(b"PK" * 10)
+    (request_.project_dir / "backup.tar.gz").write_bytes(b"\x1f\x8b" * 10)
+    (request_.project_dir / "old.7z").write_bytes(b"7z" * 10)
+
+    assert builder_mod.should_ignore("release.zip", False, rel="release.zip")
+    assert builder_mod.should_ignore("backup.tar.gz", False, rel="backup.tar.gz")
+    assert builder_mod.should_ignore("old.7z", False, rel="old.7z")
+
+    app = build(request_).package_dir / "application"
+    assert not (app / "release.zip").exists()
+    assert not (app / "backup.tar.gz").exists()
+    assert not (app / "old.7z").exists()
+
+
+def test_a_wheel_is_never_runtime_data_so_it_goes_at_any_depth(request_, stub_pip):
+    """`*.whl` deliberately did NOT move to root-only with the archives. A packaged app
+    never opens a wheel — its dependencies are already installed into runtime/ — so a
+    nested `vendor/wheels/` is CV_Viewer's 124 MB wheelhouse at a different address,
+    not data. The depth split is a judgement about each pattern, not a blanket rule."""
+    nested = request_.project_dir / "vendor" / "wheels"      # `vendor` is root-only too
+    nested.mkdir(parents=True)
+    (nested / "numpy-2.0-cp311-win_amd64.whl").write_bytes(b"PK" * (1024))
+
+    assert builder_mod.should_ignore("numpy-2.0-cp311-win_amd64.whl", False,
+                                     rel="vendor/wheels/numpy-2.0-cp311-win_amd64.whl")
+    app = build(request_).package_dir / "application"
+    assert not (app / "vendor" / "wheels" / "numpy-2.0-cp311-win_amd64.whl").exists()
+
+
 # ── the escape hatch actually opens ──────────────────────────────────────────
+
+def test_the_operator_is_told_the_escape_hatch_exists(request_, stub_pip):
+    """S7. `!pattern` worked, was tested, and was documented NOWHERE: `grep -rn
+    provisionignore README.md docs/` returned nothing, and the GUI never said the word.
+    An escape hatch nobody can find is not an escape hatch — the only inference left to
+    the operator is that this tool deletes things and cannot be argued with.
+
+    So every sentence that says 「我幫你排掉了 X」 now also says how to get X back."""
+    (request_.project_dir / "junk.pyc").write_bytes(b"x" * (2 * 1024 ** 2))
+
+    scan = builder_mod.scan_project(request_)
+    note = scan.excluded_summary
+    assert "已自動排除" in note
+    assert ".provisionignore" in note and "!" in note, note
+    assert any(".provisionignore" in n for n in scan.notes)
+    # ...and it is a NOTE, not a warning: knowing how to undo an exclusion is
+    # information, not a decision the GUI should block the build for.
+    assert not any(".provisionignore" in w for w in scan.warnings)
+
+
+def test_a_root_archive_the_app_really_does_read_can_be_rescued_by_bang(request_, stub_pip):
+    """The root-only archive rule is a DEFAULT, not a verdict. A project that really
+    does keep its payload at the root gets it back with one line — and that line is the
+    one the exclusion note now prints."""
+    (request_.project_dir / "data.zip").write_bytes(b"PK payload")
+    (request_.project_dir / "release.zip").write_bytes(b"PK junk")
+    (request_.project_dir / ".provisionignore").write_text("!data.zip\n", encoding="utf-8")
+
+    assert not builder_mod.should_ignore("data.zip", False, ("!data.zip",), "data.zip")
+
+    app = build(request_).package_dir / "application"
+    assert (app / "data.zip").read_bytes() == b"PK payload"      # rescued
+    assert not (app / "release.zip").exists()                    # and only that one
+
 
 def test_a_user_pattern_can_re_include_what_a_builtin_rule_dropped(request_, stub_pip):
     """S7. The built-ins were checked FIRST and returned immediately, so nothing the
@@ -482,6 +580,73 @@ def test_the_scan_says_what_it_threw_away_and_how_big_it_was(request_, stub_pip)
     # 而「我已經幫你排掉 124MB 的 wheels」不需要任何人做決定。
     assert any("已自動排除" in n for n in scan.notes)
     assert not any("已自動排除" in w for w in scan.warnings)
+
+
+def test_a_file_that_dominates_the_version_slot_is_named_at_check_time(request_, stub_pip):
+    """S7. A store shares the RUNTIME between versions (same requirements -> zero copy),
+    never the application: store_builder has no hardlink and no dedup, so every version
+    directory used to get its own full copy of application\\, so CV_Viewer's 84 MB
+    DINOv2 weight was re-copied on EVERY release.
+
+    Hardlink dedup fixed the DISK half of that (versions/ went 168 MB → 84 MB, and a
+    second version now costs 0 MB). The TRANSFER half is still real and must still be
+    said: the update PACKAGE has to carry the 84 MB, because the target machine does
+    not have those bytes and a USB stick is FAT/exFAT, where hardlinks do not exist.
+
+    So the warning must now say BOTH — and it must not repeat the old claim 「沒有
+    硬連結、沒有去重」, which our own change made false. Shipping a warning we know
+    to be false is the exact disease this whole file keeps curing."""
+    (request_.project_dir / "models").mkdir()
+    (request_.project_dir / "models" / "dinov2.pth").write_bytes(b"\0" * (84 * 1024 * 1024))
+
+    scan = builder_mod.scan_project(request_, versioned=True)
+    warning = scan.version_slot_warning
+    assert warning, scan.warnings
+    assert "models/dinov2.pth" in warning
+    assert "84 MB" in warning                      # the number, not a shrug
+    assert "硬連結共用" in warning                  # the disk half IS solved — say so
+    # …and never re-assert the claim our own change made false. (The sentence about
+    # a USB stick having no hardlinks is TRUE — FAT/exFAT really doesn't — so match
+    # the old lie exactly, not any string containing 「沒有硬連結」.)
+    assert "沒有硬連結、沒有去重" not in warning
+    assert "更新包" in warning                      # the transfer half is NOT — say that too
+    assert ".provisionignore" in warning           # ...and the way out
+    assert warning in scan.warnings                # store mode: the operator is stopped
+
+    # Fat mode has ONE folder and a rebuild replaces it, so the same project must NOT
+    # get a warning about a cost it does not pay. A warning nobody needs to act on is
+    # how the real ones stop being read (see the 「已自動排除」 false alarm).
+    fat = builder_mod.scan_project(request_)
+    assert fat.version_slot_warning == warning     # still computed, for whoever asks...
+    assert warning not in fat.warnings             # ...but it does not block a fat build
+    assert any("dinov2.pth" in w for w in fat.warnings)      # the big-file warning stands
+
+
+def test_a_big_project_with_no_dominating_file_is_not_nagged_about_version_slots(
+        request_, stub_pip):
+    """The advice is 「把那個檔案搬出去」. A 60 MB project made of a thousand 100 KB
+    source files has no such file, so there is nothing to act on and we say nothing."""
+    src = request_.project_dir / "src"
+    src.mkdir()
+    for i in range(30):
+        (src / f"mod{i}.py").write_bytes(b"#" * (1024 * 1024))     # 30 x 1 MB: no big file
+
+    scan = builder_mod.scan_project(request_, versioned=True)
+    assert scan.version_slot_warning == ""
+    assert not any("Store 佈局" in w for w in scan.warnings)
+
+
+def test_every_operator_facing_string_survives_a_cp950_console(request_, stub_pip):
+    """The GUI log and the console are cp950 on a zh-TW box: one un-encodable character
+    takes the whole message down with it, at the moment it is needed most."""
+    (request_.project_dir / "models").mkdir()
+    (request_.project_dir / "models" / "dinov2.pth").write_bytes(b"\0" * (84 * 1024 * 1024))
+    (request_.project_dir / "junk.pyc").write_bytes(b"x" * (2 * 1024 ** 2))
+
+    scan = builder_mod.scan_project(request_, versioned=True)
+    for text in [*scan.warnings, *scan.notes, scan.excluded_summary,
+                 scan.version_slot_warning, builder_mod.ESCAPE_HATCH_HINT]:
+        text.encode("cp950")
 
 
 def test_provisionignore_and_extra_excludes_are_honoured(request_, stub_pip):

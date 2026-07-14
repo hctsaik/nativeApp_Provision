@@ -33,12 +33,25 @@ class SourceModule:
 
 
 def discover_source_modules(module_root: Path, python_cmd: list[str]) -> list[SourceModule]:
-    """接受單一 Module 目錄，或包含多個 Module 子目錄的根。"""
+    """「Module 資料夾」＝**裝著各個模組資料夾的那一層**（底下是 <id>/plugin.yaml）。
+
+    以前這裡也收「單一模組目錄」（root/plugin.yaml）。檔案選擇器是從 modules\\ 裡面打開的，
+    往下多點一層是最常見的手誤——收下它，就會安靜地只打包 18 個模組裡的 1 個，而且整條流程
+    全綠。這種「成功了但只出貨一個工具」的包，要到工廠現場才會被發現。
+    寧可在這裡擋下來，並直接把該指的那一層寫給他看。
+    """
     root = Path(module_root).resolve()
     if not root.is_dir():
         raise ScanError(f"Module 資料夾不存在：{root}")
-    direct = root / "plugin.yaml"
-    paths = [direct] if direct.is_file() else sorted(root.glob("*/plugin.yaml"))
+    if (root / "plugin.yaml").is_file():
+        raise ScanError(
+            f"你指到的是一個模組（plugin.yaml 就在 {root.name} 裡面），"
+            f"不是裝著各個模組的那一層。\n"
+            f"請把「Module 資料夾」改指到：{root.parent}\n"
+            f"（那一層底下才看得到 {root.name} 和其他要一起打包的模組；"
+            f"照現在這樣指，最多只會打包到 {root.name} 這一個。）"
+        )
+    paths = sorted(root.glob("*/plugin.yaml"))
     if not paths:
         raise ScanError(f"{root} 內找不到 plugin.yaml 或 */plugin.yaml")
     loaded = make_subprocess_loader(python_cmd)(paths)

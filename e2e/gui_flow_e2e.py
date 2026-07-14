@@ -52,7 +52,10 @@ def find_module_folder(project: Path, tool_id: str) -> Path:
 def build_source_and_deps(project: Path, dest: Path, tool_id: str) -> None:
     """走 BuildProcess.run(GUI「開始打包」按鈕背後的後端)。"""
     folder = find_module_folder(project, tool_id)
-    modules = discover_source_modules(folder, [sys.executable])
+    # 掃「裝著各個模組的那一層」(= GUI 的「Module 資料夾」),再挑出要的那一個。
+    # 以前這裡直接把單一模組目錄餵進去;source_pack 現在會擋——擋的正是操作員在檔案
+    # 選擇器裡往下多點一層、結果安靜地只打包到 1 個模組的那個手誤。
+    modules = discover_source_modules(folder.parent, [sys.executable])
     picked = [m for m in modules if m.tool_id == tool_id] or modules
     options = BuildOptions(
         project_root=project, dest=dest, tool_ids=(),

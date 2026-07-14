@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -45,7 +46,10 @@ from provision_builder.streamlit_desktop import (  # noqa: E402
     find_shell,
     suggest_name,
 )
-from provision_builder.streamlit_desktop.discover import looks_like_streamlit  # noqa: E402
+from provision_builder.streamlit_desktop.discover import (  # noqa: E402
+    hint_for_cim_tab,
+    looks_like_streamlit,
+)
 from provision_builder.streamlit_desktop import validate_request as validate_streamlit_request  # noqa: E402
 from provision_builder.streamlit_desktop.builder import (  # noqa: E402
     runtime_would_be_reused,
@@ -110,6 +114,7 @@ class ProvisionApp(tk.Tk):
 
         # Streamlit 桌面資料夾（第二頁）——殼／runtime／輸出都自動偵測，見 _detect_environment()
         self.sd_project_var = tk.StringVar()
+        self._sd_typing_job = None                   # 打字 debounce
         self.sd_entry_var = tk.StringVar()
         self.sd_name_var = tk.StringVar()
         self.sd_output_var = tk.StringVar(value=str(default_output()))
@@ -133,6 +138,8 @@ class ProvisionApp(tk.Tk):
         self._sd_last_version: str | None = None
         self._sd_last_package: Path | None = None    # fat 模式：剛做好的那個包
         self._sd_cancel = threading.Event()          # 取消旗標：builder 每個階段邊界都會讀
+        self._sd_fetching = False                    # 正在下載可攜 Python(取消的意思不一樣)
+        self._sd_fetch_proc: subprocess.Popen | None = None
         self._tool_vars: dict[str, tk.BooleanVar] = {}
         self._tool_requires: dict[str, list[str]] = {}
         self._source_modules = {}
@@ -143,6 +150,7 @@ class ProvisionApp(tk.Tk):
         self._active_process = self._build
 
         self._make_ui()
+        self.sd_project_var.trace_add("write", self._on_project_typed)
         self._detect_environment()
         self.after(100, self._drain_events)
 
@@ -448,55 +456,6 @@ class ProvisionApp(tk.Tk):
         self.sd_log = tk.Text(run, height=12, wrap="word", state="disabled", font=("Consolas", 9))
         self.sd_log.pack(fill="both", expand=True)
 
-    def _find_plugin_yamls(self, folder: Path, *, limit: int = 5) -> list[Path]:
-        """plugin.yaml 不一定放在第一層。上一版只看深度 0/1，於是 ANnoTation
-        （18 個 plugin.yaml，全在更深的地方）被判定成「不是 CIM 模組」——
-        對一個站在正確分頁上的人講的,而且他要的東西就在那裡。"""
-        found: list[Path] = []
-        for depth, pattern in enumerate(("plugin.yaml", "*/plugin.yaml",
-                                         "*/*/plugin.yaml", "*/*/*/plugin.yaml")):
-            try:
-                for hit in folder.glob(pattern):
-                    found.append(hit)
-                    if len(found) >= limit:
-                        return found
-            except OSError:
-                break
-        return found
-
-    def _wrong_tab_hint(self, folder: Path) -> str:
-        """「找不到 plugin.yaml」對著一個 Streamlit 專案講是沒有意義的。
-
-        判斷用的是「聞起來像不像 Streamlit 專案」，不是「能不能唯一決定入口檔」——
-        後者會讓 ANnoTation 這種多候選的專案完全拿不到提示。反過來，若資料夾裡
-        其實有 plugin.yaml（只是藏得比較深，或內容壞了），就不要把站對頁的人趕去別頁。"""
-        try:
-            folder = Path(folder)
-            hits = self._find_plugin_yamls(folder)
-            if hits:
-                # 這個資料夾底下真的有模組。要嘛是「模組根目錄」指高了一層（那就告訴他
-                # 該指哪裡），要嘛他已經指對了、錯的是別的東西（那就閉嘴，不要生一句
-                # 「請把欄位改成它現在的值」——那是上一版真的會講出來的話）。
-                roots = sorted({h.parent.parent for h in hits if h.parent.parent != folder})
-                if not roots:
-                    return ""              # 已經指在對的那一層；問題不在這裡
-                return ("\n\n這個資料夾底下其實有 plugin.yaml"
-                        f"（例：{hits[0].relative_to(folder)}），只是不在掃描的那一層。\n"
-                        f"請把「模組根目錄」改指到：{roots[0]}\n"
-                        "（模組根目錄 = 直接裝著各個模組資料夾的那一層。）")
-            if not looks_like_streamlit(folder):
-                return ""
-            entry = find_entrypoint(folder)
-        except OSError:
-            return ""
-
-        which = f"（入口：{entry.value.name}）" if entry.found else "（入口有多個候選，屆時可自行指定）"
-        return (f"\n\n這看起來是一個 Streamlit 專案{which}，不是 CIM 平台模組"
-                "（本頁需要 plugin.yaml）。\n"
-                "請改用上方的「Streamlit 專案 → 桌面 App」分頁——"
-                "它會把這個專案打成 User 可直接執行的資料夾。\n"
-                f"（那一頁的「專案資料夾」填：{folder}）")
-
     def _detect_environment(self) -> None:
         """殼與 runtime 每次建置都一樣，是我們找得到的東西——別叫人來輸入。
         但偵測結果一定要顯示出來：靜靜地用一個猜到的路徑，比問還糟。"""
@@ -565,25 +524,46 @@ class ProvisionApp(tk.Tk):
             messagebox.showerror("找不到腳本", f"找不到:\n{script}\n\n請改用「進階設定」手動指定 runtime。")
             return
         dest = ROOT / ".runtime-cache" / "python311"
+        self._sd_cancel.clear()
+        self._sd_fetching = True
         self._set_desktop_busy(True)
-        self.sd_status_var.set("下載可攜 Python…（需連網，只需做一次）")
+        self.sd_status_var.set("下載可攜 Python…（需連網，只需做一次；可按「取消」中止）")
         self._clear_desktop_log()
 
         def work() -> None:
+            # 這一步是「第一次用」的管理員必經的第一步,而它以前是整個 GUI 裡唯一
+            # 沒有輸出、而且取消鈕是假的那一段:capture_output 會把 powershell 的
+            # 進度整包吞掉,直到跑完才一次倒出來(一個下載了幾分鐘、螢幕上什麼都
+            # 沒有的 GUI,跟當掉沒有兩樣),而「取消」只會跳一個講 pip 和 .staging-*
+            # 的對話框,然後什麼都不做,最後照樣彈「下載完成」。
+            proc = None
             try:
-                proc = subprocess.run(
+                proc = subprocess.Popen(
                     ["powershell", "-ExecutionPolicy", "Bypass", "-File", str(script),
                      "-DestRoot", str(dest), "-Flatten"],
-                    capture_output=True, text=True, encoding="utf-8", errors="replace",
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, encoding="utf-8", errors="replace", bufsize=1,
                 )
-                for line in (proc.stdout or "").splitlines():
-                    self._events.put(("desktop_line", line))
-                if proc.returncode != 0:
-                    self._events.put(("desktop_error", f"下載失敗（exit {proc.returncode}）：{proc.stderr.strip()[:400]}"))
+                self._sd_fetch_proc = proc
+                for line in proc.stdout:                     # 逐行,不要等它跑完
+                    if line.strip():
+                        self._events.put(("desktop_line", line.rstrip()))
+                code = proc.wait()
+
+                if self._sd_cancel.is_set():
+                    shutil.rmtree(dest, ignore_errors=True)  # 半份 runtime 沒有用處
+                    self._events.put(("desktop_fetch_cancelled", dest))
+                    return
+                if code != 0:
+                    self._events.put(("desktop_error", f"下載可攜 Python 失敗（exit {code}）。"
+                                                       "詳見上方紀錄。"))
                     return
                 self._events.put(("desktop_runtime_ready", dest))
             except OSError as exc:
                 self._events.put(("desktop_error", f"下載失敗：{exc}"))
+            finally:
+                self._sd_fetch_proc = None
+                self._sd_fetching = False
 
         self._worker = threading.Thread(target=work, daemon=True)
         self._worker.start()
@@ -593,6 +573,28 @@ class ProvisionApp(tk.Tk):
         if not value:
             return
         self._apply_project(Path(value))
+
+    def _on_project_typed(self, *_args) -> None:
+        """打字或貼上路徑,也要自動帶出入口與名稱。
+
+        以前只有「瀏覽…」按鈕會觸發偵測 —— 一個把路徑貼進去的人,會看著三個空白
+        欄位,以為工具壞了。偵測本身現在只要 5 毫秒(以前 3 秒,因為它走完了整個
+        .venv),所以每次按鍵後短暫 debounce 一下就夠了。"""
+        if getattr(self, "_sd_typing_job", None):
+            self.after_cancel(self._sd_typing_job)
+        self._sd_typing_job = self.after(400, self._apply_typed_project)
+
+    def _apply_typed_project(self) -> None:
+        self._sd_typing_job = None
+        raw = self.sd_project_var.get().strip().strip('"')
+        if not raw:
+            return
+        project = Path(raw)
+        if not project.is_dir():
+            return                                   # 還在打字,不要嘮叨
+        if self.sd_entry_var.get().strip() and self.sd_name_var.get().strip():
+            return                                   # 使用者已經填過了,不要覆蓋他
+        self._apply_project(project)
 
     def _apply_project(self, project: Path) -> None:
         self.sd_project_var.set(str(project))
@@ -740,6 +742,24 @@ class ProvisionApp(tk.Tk):
         一個宣稱會停、實際不會停、還回報你它停了的按鈕，比沒有按鈕更糟。）"""
         if not (self._worker and self._worker.is_alive()):
             return
+
+        # 取消鈕在「下載可攜 Python」時也是亮的,但那條路跟 pip / .staging-* 完全無關。
+        # 對著一個正在下載 Python 的人說「pip 會被中止、.staging-* 會清乾淨」,
+        # 是在描述另一件事——而且那句話以前還是假的。
+        if self._sd_fetching:
+            if not messagebox.askyesno(
+                    "取消下載",
+                    "要中止「下載可攜 Python」嗎？\n\n"
+                    "已經下載的半份 runtime 會被刪掉（半份沒有用處），\n"
+                    "下次可以重新下載。"):
+                return
+            self._sd_cancel.set()
+            self._kill_fetch()
+            self._append_desktop_log("已要求取消下載…")
+            self.sd_status_var.set("正在取消下載…")
+            self.sd_cancel_button.configure(state="disabled")
+            return
+
         if not messagebox.askyesno(
                 "取消建置",
                 "要中止目前的建置嗎？\n\n"
@@ -750,6 +770,21 @@ class ProvisionApp(tk.Tk):
         self._append_desktop_log("已要求取消；正在中止 pip 並清理暫存…")
         self.sd_status_var.set("正在取消…")
         self.sd_cancel_button.configure(state="disabled")
+
+    def _kill_fetch(self) -> None:
+        """powershell 會生出自己的子程序(curl / expand)。terminate() 只殺得到殼,
+        整棵樹要用 taskkill /T —— 這正是 builder 對 pip 做的事。"""
+        proc = self._sd_fetch_proc
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                               capture_output=True, check=False)
+            else:                                   # pragma: no cover
+                proc.kill()
+        except OSError:
+            pass
 
     # ── 交付與維護 ────────────────────────────────────────────────────────────
 
@@ -1079,7 +1114,7 @@ class ProvisionApp(tk.Tk):
             self._append_desktop_log("⚠ " + warning)
 
         # 真實預估，不是寫死的「450–550 MB」：實際掃專案 + 判斷 runtime 會不會重用。
-        preview = scan_streamlit_project(request)
+        preview = scan_streamlit_project(request, versioned=store_mode)
         if store_mode:
             root = Path(self.sd_output_var.get().strip())
             version = self.sd_version_var.get().strip()
@@ -1099,6 +1134,12 @@ class ProvisionApp(tk.Tk):
             self._append_desktop_log("· " + note)
         for warning in preview.warnings:
             self._append_desktop_log("⚠ " + warning)
+        # 「一次改版只搬十幾 MB」對某些專案根本不成立:版本之間共用的是 runtime,
+        # 不是你的專案檔案。CV_Viewer 那個 84MB 的權重檔,每發一版就再複製一份。
+        # 這件事要在他決定用 Store 佈局的時候講,不是等他發到第五版才發現。
+        slot = getattr(preview, "version_slot_warning", "")
+        if slot and store_mode:
+            self._append_desktop_log("⚠ " + slot)
 
     def _start_desktop_build(self) -> None:
         if self._worker and self._worker.is_alive():
@@ -1113,7 +1154,7 @@ class ProvisionApp(tk.Tk):
         # 大檔警告要在「開工前」問，不是在六分鐘之後才在紀錄區飄過去——那時候
         # 東西已經複製完了，問了也無從回答。
         try:
-            preview = scan_streamlit_project(request)
+            preview = scan_streamlit_project(request, versioned=self.sd_store_var.get())
         except Exception:                      # 掃描失敗不該擋住建置
             preview = None
         # 只有「需要你決定」的事才擋人。已經自動排除掉的東西(wheels/、.git/)是
@@ -1234,7 +1275,10 @@ class ProvisionApp(tk.Tk):
                 # 救援要看「兩個欄位」。上一版只看 module_root：一個把 Streamlit 專案
                 # 填進「平台專案」、module_root 還留著預設值的人，會撞到一個關於
                 # nativeApp 的錯誤，而畫面上沒有任何一個字提到他的專案。
-                hint = self._wrong_tab_hint(module_root) or self._wrong_tab_hint(project)
+                # 兩個欄位都問。救援的實作在 discover.py —— GUI 曾經自己抄了一份,
+                # 而那一份沒有 SKIPPED_DIRS(一個 tests/fixtures/plugin.yaml 就能吞掉
+                # 整個 Streamlit 救援),而且叫使用者去填一個畫面上不存在的欄位。
+                hint = hint_for_cim_tab(module_root) or hint_for_cim_tab(project)
                 self._events.put(("error", f"掃描失敗：{exc}{hint}"))
 
         self._worker = threading.Thread(target=work, daemon=True)
@@ -1353,6 +1397,15 @@ class ProvisionApp(tk.Tk):
                         messagebox.showerror("打包失敗", "部分或全部工具打包失敗，請查看建置紀錄。")
                 elif kind == "desktop_line":
                     self._append_desktop_log(str(payload))
+                elif kind == "desktop_fetch_cancelled":
+                    self._set_desktop_busy(False)
+                    self.sd_status_var.set("已取消下載。可再按一次「下載可攜 Python…」重來。")
+                    self._append_desktop_log("已取消下載；半份 runtime 已刪除。")
+                    messagebox.showinfo(
+                        "已取消下載",
+                        "已中止「下載可攜 Python」。\n\n"
+                        "半份的 runtime 已經刪掉（它沒有用處），\n"
+                        "隨時可以再按一次「下載可攜 Python…」重新下載。")
                 elif kind == "desktop_runtime_ready":
                     self._set_desktop_busy(False)
                     self._detect_environment()          # 重新偵測，按鈕自己消失
@@ -1458,12 +1511,19 @@ class ProvisionApp(tk.Tk):
                         lines += ["",
                                   f"User 端入口：{'、'.join(result.entry_bats) or '(無)'}",
                                   "（雙擊後視窗出現，還要在「工作流程」下拉按一次「Start」才會看到 App。）"]
+                        # Store 是「唯一會自動推上產線」的那條路,而它的警告以前只被
+                        # 塞進紀錄區、然後無條件跳「建立完成」——450MB 的 runtime 分岔、
+                        # 沒附 WebView2、專案裡的大檔,全部被降級成一行捲走的 log。
+                        # fat 模式早就會用 showwarning 攔一次;store 反而不會。
+                        notes = list(result.warnings or [])
                         if result.removed_start_bat:
+                            notes.append(
+                                "這棵樹現在有多個 App，通用的 start.bat 已被移除。"
+                                "已經教會 User「雙擊 start.bat」的機器要改用上面列出的檔案。")
+                        if notes:
                             messagebox.showwarning(
-                                "建立完成（入口檔改變了）",
-                                "\n".join(lines) + "\n\n"
-                                "⚠ 這棵樹現在有多個 App，通用的 start.bat 已被移除。\n"
-                                "　 已經教會 User「雙擊 start.bat」的機器要改用上面列出的檔案。")
+                                "建立完成（有需要注意的事）",
+                                "\n".join(lines) + "\n\n⚠ " + "\n\n⚠ ".join(notes))
                         else:
                             messagebox.showinfo("建立完成", "\n".join(lines))
                     else:

@@ -145,6 +145,13 @@ def test_full_export_is_runnable_on_a_bare_machine(build_request, stub_toolchain
 
 
 def test_full_export_of_one_app_leaves_the_other_behind(stub_toolchain, tmp_path):
+    """The entry bat's NAME is decided by the folder that receives it, not by how many
+    apps the build store happened to hold. This folder gets ONE app, so it gets
+    start.bat — the same file the 讀我 in it tells the operator to double-click, and
+    the same file every other one-app delivery has. It used to inherit the source's
+    start-<app>.bat purely because the source store had a second, unrelated app in it:
+    two machines running only App A ended up with differently-named entry points, and
+    support had to ask which build machine had cut the folder."""
     root = tmp_path / "ROOT"
     first = make_project(tmp_path, "Alpha Viewer")
     second = make_project(tmp_path, "Beta Viewer")
@@ -156,8 +163,12 @@ def test_full_export_of_one_app_leaves_the_other_behind(stub_toolchain, tmp_path
     assert export.apps == [first.app_id]
     assert (out / "apps" / first.app_id).is_dir()
     assert not (out / "apps" / second.app_id).exists()
-    assert (out / f"start-{first.app_id}.bat").is_file()
-    assert not (out / f"start-{second.app_id}.bat").exists()
+    assert export.entry_bats == ["start.bat"]
+    assert (out / "start.bat").is_file()
+    assert f"--app {first.app_id}" in (out / "start.bat").read_text("utf-8")
+    # nothing in this folder starts an app this folder does not have
+    assert sorted(p.name for p in out.glob("start*.bat")) == ["start.bat"]
+    assert store_builder.README_NAME and "start.bat" in export.entry_hint()
     # the console of an app that is not in this delivery must not be offered
     assert (out / "tools" / f"admin-{first.app_id}.bat").is_file()
     assert not (out / "tools" / f"admin-{second.app_id}.bat").exists()
@@ -526,7 +537,7 @@ def test_exporting_one_app_does_not_delete_the_other_apps_only_entry_point(stub_
 
     usb = tmp_path / "usb"
     store_builder.export_full_tree(root, usb, app_id=alpha.app_id)
-    assert (usb / f"start-{alpha.app_id}.bat").is_file()
+    assert (usb / "start.bat").is_file()          # one app in the folder: one entry
 
     second = store_builder.export_full_tree(root, usb, app_id=beta.app_id)
 
@@ -686,6 +697,304 @@ def test_a_start_bat_of_an_app_that_is_not_in_the_folder_is_removed(build_reques
     assert sorted(p.name for p in out.glob("start*.bat")) == ["start.bat"]
 
 
+def test_a_second_delivery_never_writes_over_another_installed_apps_entry_bat(
+        stub_toolchain, tmp_path):
+    """S8, THE DESTRUCTIVE STEP. App A was delivered from a one-app store, so its entry
+    is `start.bat`. App B is delivered from ANOTHER one-app store, whose entry is also
+    called `start.bat` — and the exporter copied it straight over A's file before
+    anything had read who owned it.
+
+    A survived only by accident: _start_bat_text() happens to be byte-identical for
+    every app, so the regeneration pass could reconstruct what had just been destroyed.
+    The day a bat carries one app-specific line, App A's entry point silently becomes a
+    launcher for App B — on a machine where both are installed, so nothing looks wrong
+    until the wrong program opens.
+
+    The bytes of A's own bat must survive the delivery of B, whatever they are.
+    """
+    store_a, store_b = tmp_path / "STORE_A", tmp_path / "STORE_B"
+    alpha = make_project(tmp_path, "Alpha Viewer")
+    beta = make_project(tmp_path, "Beta Viewer")
+    build_history(alpha, store_a, "v1.0.0")
+    build_history(beta, store_b, "v1.0.0")
+
+    machine = tmp_path / "machine"
+    store_builder.export_full_tree(store_a, machine)
+    # Mark A's own entry bat, so a file that merely LOOKS right cannot pass.
+    a_bat = machine / "start.bat"
+    original = a_bat.read_text("ascii")
+    a_bat.write_text(original + "rem OWNED-BY-APP-A\r\n", encoding="ascii")
+    a_bytes = a_bat.read_bytes()
+
+    store_builder.export_full_tree(store_b, machine)
+
+    kept = machine / f"start-{alpha.app_id}.bat"
+    assert kept.is_file(), "App A 還裝在這個資料夾裡,卻沒有任何啟動檔"
+    assert kept.read_bytes() == a_bytes, "App A 的啟動檔被 App B 的覆蓋掉了"
+    assert f"--app {alpha.app_id}" in kept.read_text("ascii")
+    assert f"--app {beta.app_id}" not in kept.read_text("ascii")
+    # ...and B got its own, which starts B and only B
+    b_bat = machine / f"start-{beta.app_id}.bat"
+    assert f"--app {beta.app_id}" in b_bat.read_text("ascii")
+    assert not (machine / "start.bat").exists()      # ambiguous with two apps
+
+
+def test_a_rename_of_the_only_file_a_user_double_clicks_is_never_reported_as_no_change(
+        stub_toolchain, tmp_path):
+    """S8. Delivering App B into App A's folder DOES remove `start.bat` — it has to, it
+    no longer says which app — and the export then told the operator, in as many words,
+    that App A's 「版本、啟動檔與管理主控台都原封不動留著」. The one file the line worker
+    had been taught to double-click was gone, and the warning about it denied it.
+
+    A warning that contradicts what the code just did is worse than no warning: it sends
+    the operator looking for a different explanation for a problem we created.
+    """
+    store_a, store_b = tmp_path / "STORE_A", tmp_path / "STORE_B"
+    alpha = make_project(tmp_path, "產線 A 檢視器", app_id="line-a-viewer")
+    beta = make_project(tmp_path, "產線 B 報表", app_id="line-b-report")
+    build_history(alpha, store_a, "v1.0.0")
+    build_history(beta, store_b, "v1.0.0")
+
+    machine = tmp_path / "machine"
+    store_builder.export_full_tree(store_a, machine)
+    assert (machine / "start.bat").is_file()
+
+    second = store_builder.export_full_tree(store_b, machine)
+
+    assert not (machine / "start.bat").exists()
+    told = [w for w in second.warnings if "start.bat" in w]
+    assert told, f"start.bat 被刪掉了,卻沒有半個字告訴操作員:{second.warnings}"
+    said = told[0]
+    # it names the app, the old file, and the new file — all three, or it is not a fix
+    assert alpha.app_id in said and alpha.display_name in said
+    assert f"start-{alpha.app_id}.bat" in said
+    assert "→" in said or "->" in said
+    # and NOTHING anywhere in this export may still claim the entry files were untouched
+    assert not any("啟動檔" in w and "原封不動" in w for w in second.warnings)
+    for line in second.warnings:
+        line.encode("cp950")
+
+
+def test_one_factory_pc_two_apps_app_a_still_starts_administers_and_remembers(
+        stub_toolchain, tmp_path):
+    """S8, THE WHOLE SCENARIO, END TO END.
+
+    One factory PC. App A has been running on it for months: it has a version, a
+    runtime, an admin console, a state.json that knows which version is good and which
+    one died. App B is built by another team, in another store, and delivered onto the
+    same machine — which is the entire reason the store layout exists (one 500 MB
+    runtime, two apps).
+
+    Everything App A has must survive that delivery: it must still START, its console
+    must still administer A (and not B), its versions and its state must be untouched,
+    and the folder must still tell the truth about both apps.
+    """
+    store_a, store_b = tmp_path / "STORE_A", tmp_path / "STORE_B"
+    alpha = make_project(tmp_path, "產線 A 檢視器", app_id="line-a-viewer")
+    beta = make_project(tmp_path, "產線 B 報表", app_id="line-b-report")
+    build_history(alpha, store_a, "v1.0.0")
+    build_history(beta, store_b, "v2.0.0")
+
+    machine = tmp_path / "machine"
+    store_builder.export_full_tree(store_a, machine)
+
+    # Months on the line: A proved v1.0.0 good, and watched v1.5.0 die.
+    a_state = state_mod.StateStore(machine / "apps" / alpha.app_id / "state")
+    a_state.mutate(lambda s: state_mod.dataclasses.replace(
+        s, candidate=None, last_known_good="v1.0.0",
+        failed_versions=[{"version": "v1.5.0", "revision": "diedhere"}]))
+    before = a_state.load()
+    a_runtime = json.loads(
+        (machine / "apps" / alpha.app_id / "versions" / "v1.0.0" / "app-package.json")
+        .read_text("utf-8"))["runtime_fingerprint"]
+
+    export = store_builder.export_full_tree(store_b, machine)   # ← App B lands
+
+    # 1. APP A STILL STARTS. It has exactly one entry bat, that bat starts A, it is
+    #    pure ASCII, and every message it prints is really in this folder.
+    a_bats = [b for b in machine.glob("start*.bat")
+              if store_builder._entry_bat_app(b) == alpha.app_id]
+    assert len(a_bats) == 1, f"App A 的啟動檔剩下 {len(a_bats)} 個"
+    a_bat = a_bats[0]
+    raw = a_bat.read_bytes()
+    assert raw.isascii()
+    assert f"--app {alpha.app_id}" in raw.decode("ascii")
+    assert f"--app {beta.app_id}" not in raw.decode("ascii")
+    for name in re.findall(r'messages\\([\w.-]+\.txt)', raw.decode("ascii")):
+        assert (machine / store_builder.MESSAGES_DIR / name).is_file(), name
+    assert a_bat.name in export.entry_bats
+
+    # 2. A's OWN NAME still reaches the person in front of it (the source store B has
+    #    never heard of App A, so this has to be read from the destination).
+    assert alpha.display_name in message(machine, f"starting-{alpha.app_id}.txt")
+    assert alpha.display_name in message(machine, f"admin-menu-{alpha.app_id}.txt")
+
+    # 3. A'S CONSOLE STILL ADMINISTERS A. The chooser offers both; A's console drives A.
+    admin = (machine / "tools" / f"admin-{alpha.app_id}.bat").read_text("ascii")
+    assert f"--app {alpha.app_id}" in admin and f"--app {beta.app_id}" not in admin
+    chooser = (machine / "tools" / "admin.bat").read_text("ascii")
+    assert f"admin-{alpha.app_id}.bat" in chooser and f"admin-{beta.app_id}.bat" in chooser
+    assert alpha.display_name in message(machine, "admin-chooser.txt")
+
+    # 4. A'S STATE IS INTACT — every field, byte for byte. This export never touched it.
+    assert a_state.load().to_dict() == before.to_dict()
+    assert a_state.load().is_failed("v1.5.0", "diedhere")
+    assert integrity.is_complete(machine / "apps" / alpha.app_id / "versions" / "v1.0.0")
+    assert integrity.verify_tree(
+        machine / "apps" / alpha.app_id / "versions" / "v1.0.0") == []
+
+    # 5. A's RUNTIME is still there — and B, built from the same lock, SHARES it. That
+    #    is the whole reason this machine has a store on it instead of two fat packages.
+    b_runtime = json.loads(
+        (machine / "apps" / beta.app_id / "versions" / "v2.0.0" / "app-package.json")
+        .read_text("utf-8"))["runtime_fingerprint"]
+    assert b_runtime == a_runtime
+    assert {p.name for p in (machine / "deps" / "runtimes").iterdir()} == {a_runtime}
+
+    # 6. B works too, and the folder tells the truth about both.
+    assert state_of(machine, beta.app_id)["current"] == "v2.0.0"
+    readme = (machine / store_builder.README_NAME).read_text("utf-8")
+    assert alpha.display_name in readme and beta.display_name in readme
+    assert a_bat.name in readme
+    readme.encode("cp950")
+    for line in export.warnings:
+        line.encode("cp950")
+
+
+# ── S8:重新交付 = 更新,更新不可以抹掉這台機器學到的東西 ────────────────────
+
+def test_redelivering_an_app_does_not_erase_what_the_machine_learned_about_bad_versions(
+        stub_toolchain, tmp_path):
+    """S8/S4, BLOCKER. The factory PC ran App B, watched v2.0.0 die on startup, and
+    rolled back. That failure is written in ITS state.json, and it is the only reason
+    the background updater does not re-stage v2.0.0 off the share tomorrow morning.
+
+    The operator then hand-delivers v3.0.0 — and the exporter wrote a FRESH state over
+    the top: failed_versions emptied, last_known_good erased, generation reset from 2
+    to 1. The machine forgot, in one copy, everything it had learned about itself the
+    hard way. Next updater pass, v2.0.0 comes straight back.
+
+    A delivery decides which version RUNS. It does not get to decide what the machine
+    remembers.
+    """
+    store = tmp_path / "STORE"
+    beta = make_project(tmp_path, "Beta Viewer")
+    build_history(beta, store, "v1.0.0")
+
+    machine = tmp_path / "machine"
+    store_builder.export_full_tree(store, machine)
+
+    # What this MACHINE learned, on the factory floor, that no build machine can know.
+    paths = state_mod.StateStore(machine / "apps" / beta.app_id / "state")
+    learned = state_mod.dataclasses.replace(
+        paths.load(), candidate=None, last_known_good="v1.0.0",
+        failed_versions=[{"version": "v2.0.0", "revision": "cafebabe"}])
+    before = paths.write_locked(learned)
+
+    build_history(beta, store, "v3.0.0")
+    export = store_builder.export_full_tree(store, machine, app_id=beta.app_id,
+                                            version="v3.0.0")
+    after = paths.load()
+
+    # 1. the delivery decides what RUNS, and puts it on trial
+    assert after.current == "v3.0.0"
+    assert after.candidate == "v3.0.0" and after.candidate_revision
+    assert after.pending is None
+
+    # 2. ...and it forgets NOTHING the machine learned
+    assert after.failed_versions == [{"version": "v2.0.0", "revision": "cafebabe"}], \
+        "這台機器親眼看著 v2.0.0 起不來,交付把那個記錄抹掉了 —— 自動更新會再裝一次"
+    assert after.is_failed("v2.0.0", "cafebabe")
+    assert after.last_known_good == "v1.0.0", "抹掉了這台機器唯一證明過能跑的版本"
+    assert after.generation > before.generation, "generation 倒退了"
+
+    # 3. the rollback floor is the version this machine was really running
+    assert after.previous == "v1.0.0"
+    assert integrity.is_complete(machine / "apps" / beta.app_id / "versions" / "v1.0.0")
+    assert export.apps == [beta.app_id]
+
+
+def test_a_first_delivery_still_gets_a_fresh_state_and_not_the_build_machines(
+        build_request, stub_toolchain, tmp_path):
+    """The other half of the same decision. A destination that has never seen this app
+    has learned NOTHING, so there is nothing to preserve — and the build machine's own
+    pending/candidate/failure history must still not travel (see S4)."""
+    root = tmp_path / "ROOT"
+    build_history(build_request, root, "v1.0.0", "v1.1.0")
+    app = build_request.app_id
+    store_mod = state_mod.StateStore(root / "apps" / app / "state")
+    store_mod.mutate(lambda s: state_mod.dataclasses.replace(
+        s, last_known_good="v1.0.0",
+        failed_versions=[{"version": "v9.9.9", "revision": "buildmachine"}]))
+
+    out = tmp_path / "deliver"
+    store_builder.export_full_tree(root, out, app_id=app, version="v1.1.0")
+
+    fresh = state_of(out, app)
+    assert fresh["current"] == "v1.1.0"
+    assert fresh["candidate"] == "v1.1.0"          # never started HERE: on trial
+    assert fresh["pending"] is None
+    assert fresh["last_known_good"] is None        # nothing has started here yet
+    assert fresh["failed_versions"] == []          # the BUILD machine's history stays home
+
+
+def test_delivering_over_a_machines_own_staged_update_cancels_it_and_says_so(
+        build_request, stub_toolchain, tmp_path):
+    """The machine's updater staged v2.0.0 and is waiting for a restart to promote it.
+    The operator walks over and hand-delivers v3.0.0. If `pending` survived the
+    delivery, the next boot would promote v2.0.0 straight over the version the operator
+    just carried across the factory — and nobody would ever know why."""
+    root = tmp_path / "ROOT"
+    build_history(build_request, root, "v1.0.0")
+    app = build_request.app_id
+
+    machine = tmp_path / "machine"
+    store_builder.export_full_tree(root, machine)
+    paths = state_mod.StateStore(machine / "apps" / app / "state")
+    paths.mutate(lambda s: state_mod.dataclasses.replace(
+        s, candidate=None, last_known_good="v1.0.0",
+        pending="v2.0.0", pending_revision="staged"))
+
+    build_history(build_request, root, "v3.0.0")
+    export = store_builder.export_full_tree(root, machine, app_id=app, version="v3.0.0")
+
+    after = paths.load()
+    assert after.current == "v3.0.0"
+    assert after.pending is None, "目標機自己排好的更新會在下次啟動蓋掉這次交付的版本"
+    warned = [w for w in export.warnings if "v2.0.0" in w]
+    assert warned, f"取消了目標機已經裝好的更新,卻沒說:{export.warnings}"
+    for line in export.warnings:
+        line.encode("cp950")
+
+
+def test_delivering_a_version_this_machine_already_watched_die_says_so(
+        build_request, stub_toolchain, tmp_path):
+    """We keep the machine's failure record (above) — so we must also say out loud when
+    the version being delivered is IN it. Silently making a known-bad version `current`
+    is how an operator ends up watching the same rollback twice."""
+    root = tmp_path / "ROOT"
+    build_history(build_request, root, "v1.0.0", "v2.0.0")
+    app = build_request.app_id
+
+    machine = tmp_path / "machine"
+    store_builder.export_full_tree(root, machine, app_id=app, version="v1.0.0")
+    revision = store_builder.version_revision(
+        store_builder.AppPaths(root, app), "v2.0.0")
+    paths = state_mod.StateStore(machine / "apps" / app / "state")
+    paths.mutate(lambda s: state_mod.dataclasses.replace(
+        s, candidate=None, last_known_good="v1.0.0",
+        failed_versions=[{"version": "v2.0.0", "revision": revision}]))
+
+    export = store_builder.export_full_tree(root, machine, app_id=app, version="v2.0.0")
+
+    warned = [w for w in export.warnings if "v2.0.0" in w and "失敗" in w]
+    assert warned, f"交付了一個這台機器已經證明起不來的版本,卻沒說:{export.warnings}"
+    assert "清除失敗記錄" in warned[0]                # ...and how to get past it
+    assert paths.load().is_failed("v2.0.0", revision)  # the record itself still stands
+    for line in export.warnings:
+        line.encode("cp950")
+
+
 # ── S2:「發最新的那一版」 ──────────────────────────────────────────────────
 
 def test_newest_version_is_the_pending_build_not_the_current_one(build_request,
@@ -758,6 +1067,263 @@ def test_export_warns_when_it_is_not_delivering_the_newest_version(build_request
     assert not any("最新" in w for w in fresh.warnings), fresh.warnings
     for warning in stale.warnings + fresh.warnings:
         warning.encode("cp950")
+
+
+# ── S8/S5:版本槽之間去重 —— 「一次改版只搬十幾 MB」必須是真的 ──────────────
+
+def apparent_size(path: Path) -> int:
+    """What `dir` and Explorer report: every directory entry's size, summed."""
+    return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
+
+
+def real_size(path: Path) -> int:
+    """What the VOLUME actually lost: each inode counted once, however many names it has.
+
+    This is the number the factory PC's disk cares about, and the number nobody was
+    measuring."""
+    seen, total = set(), 0
+    for item in path.rglob("*"):
+        if not item.is_file():
+            continue
+        stat = item.stat()
+        key = (stat.st_dev, stat.st_ino)
+        if key in seen:
+            continue
+        seen.add(key)
+        total += stat.st_size
+    return total
+
+
+def cv_viewer(tmp_path: Path, weight_mb: int = 8) -> BuildRequest:
+    """CV_Viewer's shape: one big model file that never changes, and some Python."""
+    request = make_project(tmp_path, "CV Viewer", app_id="cv-viewer")
+    models = request.project_dir / "models"
+    models.mkdir()
+    (models / "dinov2.pth").write_bytes(os.urandom(weight_mb * 1024 ** 2))
+    return request
+
+
+def test_a_second_version_costs_what_changed_not_another_copy_of_the_model_file(
+        stub_toolchain, tmp_path):
+    """S8/S5, THE PROMISE. The store layout is sold on 「一次改版只搬十幾 MB」 — that is
+    the entire reason a factory PC gets a store instead of two fat packages. For
+    CV_Viewer it was false: a version directory is a WHOLE copy of the app, so its 84 MB
+    DINOv2 weight (unchanged in a year) was written again into every single slot. Five
+    releases cost 481 MB to store five copies of one identical file.
+
+    A byte-identical file in an existing slot is now a hardlink, not a second copy: two
+    names, one inode, one lot of bytes. The slot still LOOKS full size (that is what a
+    version is), but the disk only pays once.
+    """
+    root = tmp_path / "ROOT"
+    request = cv_viewer(tmp_path)
+    weight = 8 * 1024 ** 2
+
+    first = store_builder.build_into_store(request, root, version="v1.0.0")
+    assert first.ok, first.errors
+    assert first.deduped_mb == 0                     # nothing to share with yet
+    assert first.added_mb >= 8                       # the model really did cost 8 MB
+
+    # A real incremental release: the Python moved, the model did not.
+    request.entrypoint.write_text("import streamlit as st\nst.write('v1.1')\n",
+                                  encoding="utf-8")
+    second = store_builder.build_into_store(request, root, version="v1.1.0")
+    assert second.ok, second.errors
+
+    app = request.app_id
+    versions = root / "apps" / app / "versions"
+    w1 = versions / "v1.0.0" / "application" / "models" / "dinov2.pth"
+    w2 = versions / "v1.1.0" / "application" / "models" / "dinov2.pth"
+
+    # 1. ONE inode, two names. The second version's model cost the disk nothing.
+    assert w1.stat().st_ino == w2.stat().st_ino, "第二版又複製了一份一模一樣的權重檔"
+    assert w2.stat().st_nlink == 2
+    assert second.deduped_mb >= 8
+    assert second.added_mb < 1, f"這一版只改了幾行 Python,卻付了 {second.added_mb:.0f} MB"
+    assert second.runtime_reused                     # ...and the runtime was shared too
+
+    # 2. the slot still looks like a whole version (it IS one), but the disk paid once
+    assert apparent_size(versions) >= 2 * weight
+    assert real_size(versions) < 1.5 * weight, "磁碟還是被扣了兩份"
+
+    # 3. BOTH versions still verify byte-for-byte against their own files.json — the
+    #    device checks exactly this before it will run anything.
+    for version in ("v1.0.0", "v1.1.0"):
+        assert integrity.is_complete(versions / version)
+        assert integrity.verify_tree(versions / version) == [], version
+
+
+def test_deleting_one_version_never_takes_a_byte_another_version_still_points_at(
+        stub_toolchain, tmp_path):
+    """The question a hardlink scheme lives or dies on. GC deletes an old version slot;
+    the file it shares with the version the factory is RUNNING must not go with it.
+
+    It cannot: a name goes, and the bytes go only when the LAST name goes. This test is
+    here because "cannot" is not a thing to take on faith about a factory PC's only copy
+    of an 84 MB model file."""
+    root = tmp_path / "ROOT"
+    request = cv_viewer(tmp_path, weight_mb=4)
+    assert store_builder.build_into_store(request, root, version="v1.0.0").ok
+    request.entrypoint.write_text("import streamlit as st\nst.write('v2')\n",
+                                  encoding="utf-8")
+    assert store_builder.build_into_store(request, root, version="v1.1.0").ok
+
+    versions = root / "apps" / request.app_id / "versions"
+    live = versions / "v1.1.0"
+    weight = live / "application" / "models" / "dinov2.pth"
+    before = weight.read_bytes()
+    assert weight.stat().st_nlink == 2
+
+    shutil.rmtree(versions / "v1.0.0")               # exactly what gc.py does
+
+    assert weight.is_file()
+    assert weight.read_bytes() == before, "刪掉舊版本時,把還在跑的版本的權重檔一起帶走了"
+    assert weight.stat().st_nlink == 1
+    assert integrity.verify_tree(live) == [], "刪掉舊版本之後,還在跑的版本驗不過了"
+    assert integrity.is_complete(live)
+
+
+def test_a_delivered_folder_is_self_contained_and_never_a_link_back_to_the_build_machine(
+        stub_toolchain, tmp_path):
+    """The delivered USB has to work on a machine that has never seen this store. The
+    slots inside it must be real files — a delivery whose files are directory entries
+    pointing at a build machine's inodes is not a delivery."""
+    root = tmp_path / "ROOT"
+    request = cv_viewer(tmp_path, weight_mb=4)
+    assert store_builder.build_into_store(request, root, version="v1.0.0").ok
+    request.entrypoint.write_text("import streamlit as st\nst.write('v2')\n",
+                                  encoding="utf-8")
+    assert store_builder.build_into_store(request, root, version="v1.1.0").ok
+    app = request.app_id
+
+    out = tmp_path / "deliver"
+    store_builder.export_full_tree(root, out, app_id=app, version="v1.1.0")
+
+    delivered = out / "apps" / app / "versions" / "v1.1.0"
+    weight = delivered / "application" / "models" / "dinov2.pth"
+    assert weight.is_file() and weight.stat().st_size == 4 * 1024 ** 2
+    assert weight.stat().st_nlink == 1, "交付出去的檔案還連著建置機的 inode"
+    assert integrity.verify_tree(delivered) == []
+    # ...and the source's own slots are untouched by having been exported
+    assert integrity.verify_tree(root / "apps" / app / "versions" / "v1.1.0") == []
+
+
+def test_a_filesystem_that_cannot_hardlink_still_builds_it_just_copies(
+        stub_toolchain, tmp_path, monkeypatch):
+    """FAT/exFAT — most USB sticks, and spec §9.3 promises they work — has no hard links
+    at all. `os.link` raises there, and a build that treated that as a failure would
+    refuse to run on the media this product is delivered on. It degrades to a copy, and
+    the version is byte-for-byte correct either way."""
+    root = tmp_path / "ROOT"
+    request = cv_viewer(tmp_path, weight_mb=2)
+    assert store_builder.build_into_store(request, root, version="v1.0.0").ok
+
+    def no_links_here(_src, _dst):
+        raise OSError(1, "ERROR_INVALID_FUNCTION")   # what exFAT actually gives
+
+    monkeypatch.setattr(store_builder.os, "link", no_links_here)
+    request.entrypoint.write_text("import streamlit as st\nst.write('v2')\n",
+                                  encoding="utf-8")
+    second = store_builder.build_into_store(request, root, version="v1.1.0")
+
+    assert second.ok, second.errors
+    assert second.deduped_mb == 0                    # nothing shared: it could not be
+    versions = root / "apps" / request.app_id / "versions"
+    w1 = versions / "v1.0.0" / "application" / "models" / "dinov2.pth"
+    w2 = versions / "v1.1.0" / "application" / "models" / "dinov2.pth"
+    assert w1.stat().st_ino != w2.stat().st_ino      # two real copies
+    assert w1.read_bytes() == w2.read_bytes()
+    for version in ("v1.0.0", "v1.1.0"):             # and both are still correct
+        assert integrity.verify_tree(versions / version) == []
+
+
+def test_a_file_that_really_changed_is_never_linked_to_the_old_versions_copy(
+        stub_toolchain, tmp_path):
+    """The dedup must key on CONTENT, not on the path. A model file that was retrained
+    between releases has the same name and (plausibly) the same size — linking it to the
+    old version's bytes would ship the OLD model under the new version's number, and
+    files.json would agree with itself all the way to the factory floor."""
+    root = tmp_path / "ROOT"
+    request = cv_viewer(tmp_path, weight_mb=2)
+    assert store_builder.build_into_store(request, root, version="v1.0.0").ok
+
+    retrained = os.urandom(2 * 1024 ** 2)            # same path, same size, new bytes
+    (request.project_dir / "models" / "dinov2.pth").write_bytes(retrained)
+    second = store_builder.build_into_store(request, root, version="v1.1.0")
+    assert second.ok, second.errors
+
+    versions = root / "apps" / request.app_id / "versions"
+    w1 = versions / "v1.0.0" / "application" / "models" / "dinov2.pth"
+    w2 = versions / "v1.1.0" / "application" / "models" / "dinov2.pth"
+    assert w1.stat().st_ino != w2.stat().st_ino, "改過的權重檔被連到舊版本的位元組上了"
+    assert w2.read_bytes() == retrained
+    assert w1.read_bytes() != retrained             # the old version still has the old one
+    assert second.deduped_mb < 2                    # the model was NOT shared
+    for version in ("v1.0.0", "v1.1.0"):
+        assert integrity.verify_tree(versions / version) == []
+
+
+# ── S8:「10 MB 的增量更新」到底有多大 ───────────────────────────────────────
+
+def test_an_incremental_update_package_says_how_much_of_it_is_the_same_bytes_again(
+        stub_toolchain, tmp_path, monkeypatch):
+    """S8/S5. A version directory is a WHOLE COPY of the app. CV_Viewer's 84 MB DINOv2
+    weight has not changed in a year, and it is copied into every version slot, into
+    every delivery, and into every "incremental" update package — so a release that
+    changed 10 MB of Python still costs 94 MB on the wire, every single time.
+
+    We are NOT deduplicating it (see the hardlink note in store_builder: links do not
+    survive the copytree that every export goes through, they would make gc.py's
+    reclaimed-bytes report a lie, and they would let one corrupted file corrupt every
+    version that shares it). What was actually costing the operator is that nobody ever
+    TOLD them: they sat in front of a checkbox choosing between a 「10 MB 增量包」 and a
+    「457 MB 完整包」, and the 10 MB one did not exist.
+
+    So the size is made honest, with the file named, while they are still choosing.
+    """
+    monkeypatch.setattr(store_builder, "_REDUNDANT_WARNING_BYTES", 1024 ** 2)
+    root = tmp_path / "ROOT"
+    request = make_project(tmp_path, "CV Viewer")
+    weights = request.project_dir / "weights"
+    weights.mkdir()
+    (weights / "dinov2.pth").write_bytes(b"W" * (3 * 1024 ** 2))     # never changes
+    build_history(request, root, "v1.0.0")
+
+    # A real 10 MB-of-nothing release: one line of Python moved, the model untouched.
+    request.entrypoint.write_text("import streamlit as st\nst.write('v2')\n",
+                                  encoding="utf-8")
+    build_history(request, root, "v1.1.0")
+    app = request.app_id
+    assert (root / "apps" / app / "versions" / "v1.1.0" / "application" / "weights"
+            / "dinov2.pth").is_file()
+
+    out = tmp_path / "update"
+    export = store_builder.export_update(root, app, "v1.1.0", out, include_runtime=False)
+
+    assert export.kind == "update"
+    assert export.redundant_mb >= 3, "沒算出「跟上一版一模一樣、還是又送一次」的位元組"
+    said = [w for w in export.warnings if "dinov2.pth" in w]
+    assert said, f"3 MB 的權重檔又送了一次,卻沒說:{export.warnings}"
+    assert "v1.0.0" in said[0]                       # what it is identical TO
+    # ...and the honest split, now that version slots on BOTH machines share their
+    # unchanged files by hardlink: the disk does not pay twice, the STICK does.
+    assert "硬連結" in said[0] and "FAT/exFAT" in said[0]
+    assert ".provisionignore" in said[0]             # ...and the one thing that helps
+    said[0].encode("cp950")
+
+
+def test_a_package_whose_bytes_really_did_all_change_says_nothing_about_redundancy(
+        build_request, stub_toolchain, tmp_path, monkeypatch):
+    """The other side: a warning that fires on every export is a warning nobody reads.
+    A small app whose files really did change has nothing redundant to report."""
+    monkeypatch.setattr(store_builder, "_REDUNDANT_WARNING_BYTES", 1024 ** 2)
+    root = tmp_path / "ROOT"
+    build_history(build_request, root, "v1.0.0", "v1.1.0")
+
+    export = store_builder.export_update(root, build_request.app_id, "v1.1.0",
+                                         tmp_path / "update", include_runtime=False)
+    assert export.redundant_mb < 1
+    assert not [w for w in export.warnings if "不是差異更新" in w], export.warnings
 
 
 # ── 自動更新來源 ─────────────────────────────────────────────────────────────
@@ -1582,6 +2148,49 @@ def test_a_second_runtime_names_the_pins_that_differ_instead_of_silently_costing
     assert third.ok and third.runtime_reused
     assert third.fingerprint == first.fingerprint
     assert not [w for w in third.warnings if "450 MB" in w], third.warnings
+
+
+def test_a_pin_the_app_never_imports_is_named_as_the_450mb_you_are_paying_for_nothing(
+        stub_toolchain, tmp_path):
+    """S8. Naming the pins is not enough on its own: 「pandas 2.2.0 vs 2.2.1」 leaves the
+    operator to work out whether they DARE align them, and the safe answer to a question
+    you cannot answer is always 「leave it」 — so the second 450 MB runtime lands anyway.
+
+    We can answer it. The app's own imports are right there, and the import gate already
+    resolves an import name to the distributions that provide it. When every differing
+    pin is one this app never imports, that is a 450 MB runtime bought to satisfy a
+    version number nothing in the code asks for, and it can be said in one sentence.
+    """
+    root = tmp_path / "ROOT"
+    # Neither app imports pandas — it is somebody's transitive dependency, pinned by
+    # `pip freeze`, and it is the ONLY thing keeping these two apps apart.
+    alpha = make_project(tmp_path, "Alpha Viewer", lock="streamlit==1.40.0\npandas==2.2.0\n")
+    beta = make_project(tmp_path, "Beta Viewer", lock="streamlit==1.40.0\npandas==2.2.1\n")
+    assert store_builder.build_into_store(alpha, root, version="v1.0.0").ok
+
+    second = store_builder.build_into_store(beta, root, version="v1.0.0")
+    assert second.ok and second.runtime_reused is False
+    said = [w for w in second.warnings if "450 MB" in w][0]
+    assert "pandas" in said
+    assert "沒有 import 過" in said                      # the fact that unlocks the fix
+    assert "可以共用同一份 runtime" in said               # ...and what it is worth
+    assert "pip freeze" in said                          # ...and the honest caveat
+    assert "streamlit" not in said                       # the pins that AGREE are noise
+    said.encode("cp950")
+
+    # And the other direction: a differing pin the app REALLY imports must never be
+    # described as one it does not. A wrong 「你沒用到它」 is how a build gets aligned
+    # onto a pandas its own code cannot run against.
+    gamma = make_project(tmp_path, "Gamma Viewer", lock="streamlit==1.40.0\npandas==2.2.9\n")
+    gamma.entrypoint.write_text("import streamlit as st\nimport pandas as pd\n",
+                                encoding="utf-8")
+    third = store_builder.build_into_store(gamma, root, version="v1.0.0")
+    assert third.ok
+    told = [w for w in third.warnings if "450 MB" in w][0]
+    assert "pandas" in told
+    assert "沒有 import 過" not in told
+    assert "真的會 import" in told and "確認相容" in told
+    told.encode("cp950")
 
 
 def test_a_store_build_with_no_webview2_installer_says_so_at_build_time(build_request,

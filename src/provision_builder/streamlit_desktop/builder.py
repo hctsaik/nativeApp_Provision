@@ -30,7 +30,8 @@ from .models import (
     DEFAULT_STARTUP_TIMEOUT,
     EXCLUDED_DIRS_ANY_DEPTH,
     EXCLUDED_DIRS_ROOT_ONLY,
-    EXCLUDED_FILES,
+    EXCLUDED_FILES_ANY_DEPTH,
+    EXCLUDED_FILES_ROOT_ONLY,
     PROVISIONIGNORE,
     SCHEMA_VERSION,
     BuildRequest,
@@ -137,15 +138,27 @@ def _at_project_root(rel: str | None) -> bool:
 
 def _builtin_reason(name: str, is_dir: bool, rel: str | None = None) -> str | None:
     """The built-in exclusions, applied at the depth where they actually mean what
-    their name says. See EXCLUDED_DIRS_ANY_DEPTH / EXCLUDED_DIRS_ROOT_ONLY."""
+    their name says. See EXCLUDED_DIRS_* / EXCLUDED_FILES_* in models.
+
+    Depth is the whole point. `dist/` at the root is the project's build output; one
+    level down it IS a Streamlit component. `release.zip` at the root is a release
+    artefact; `assets/data.zip` one level down is a file the app OPENS AT RUN TIME —
+    and dropping it built a package that passed every check here and then raised
+    FileNotFoundError on the factory floor, on a machine with no way to put the file
+    back. Same shape of bug, same fix: judge the name AND where it sits.
+    """
     if is_dir:
         if name in EXCLUDED_DIRS_ANY_DEPTH:
             return f"{name}/"
         if name in EXCLUDED_DIRS_ROOT_ONLY and _at_project_root(rel):
             return f"{name}/"                      # the PROJECT's build junk, at its root
-    for pattern in EXCLUDED_FILES:                 # `*.egg-info` is a DIRECTORY: match both
+    for pattern in EXCLUDED_FILES_ANY_DEPTH:       # `*.egg-info` is a DIRECTORY: match both
         if fnmatch(name, pattern):
             return pattern
+    if _at_project_root(rel):                      # an archive AT THE ROOT is a release
+        for pattern in EXCLUDED_FILES_ROOT_ONLY:   # artefact. Nested, it is DATA. Keep it.
+            if fnmatch(name, pattern):
+                return pattern
     return None
 
 
@@ -306,6 +319,14 @@ def build_manifest(request: BuildRequest, shell_name: str) -> dict:
     }
 
 
+# 自動排除是「預設值」,不是「判決」。`!樣式` 再包含功能寫好了、測過了、真的能把
+# 內建規則丟掉的檔案救回來 —— 而 README、docs 與 GUI 從頭到尾一個字都沒提過它。
+# 沒有人找得到的逃生門不是逃生門:操作員唯一能做的推論是「這個工具會亂刪東西」。
+# 每一次我們說「我幫你排掉了什麼」,就要同時說「你要怎麼把它要回來」。
+ESCAPE_HATCH_HINT = ("要保留其中某個檔案,在專案根目錄的 .provisionignore 裡寫 "
+                     "`!路徑`(例:`!assets/data.zip`);最後一條符合的規則說了算。")
+
+
 @dataclass
 class ProjectScan:
     """What the project will contribute, measured BEFORE we copy 600 MB."""
@@ -319,6 +340,14 @@ class ProjectScan:
     excluded_mb: float = 0.0
     excluded: dict[str, int] = field(default_factory=dict)   # label -> bytes
     excluded_summary: str = ""
+    # Every file over big_file_mb that WILL travel, biggest first (rel path -> bytes).
+    # Not the same list as `excluded`: these are the ones we are about to copy — into
+    # application\, and in Store mode into application\ AGAIN for every version.
+    heavy_files: list[tuple[str, int]] = field(default_factory=list)
+    # 「一個版本目錄 = application\ 的一份完整副本」的代價,已經算成句子。空字串 =
+    # 沒什麼好說的。Fat 模式不問這個問題(只有一個資料夾,重建就換掉),所以它預設
+    # 不進 warnings —— 見 version_slot_warning()。
+    version_slot_warning: str = ""
 
 
 # The GUI and the store builder both talk about a "scan result"; keep one object
@@ -327,10 +356,18 @@ ScanResult = ProjectScan
 
 
 def scan_project(request: BuildRequest, big_file_mb: int = 10,
-                 big_dir_mb: int = 25) -> ProjectScan:
+                 big_dir_mb: int = 25, versioned: bool = False) -> ProjectScan:
     """Walk the project with the EXACT exclusions the build uses, so the operator
     learns about the 85 MB screen recording now — not after a ten-minute build —
-    and learns what we quietly left out, with its size."""
+    and learns what we quietly left out, with its size.
+
+    `versioned=True` (the Store layout) additionally warns about what a version slot
+    costs: a store shares the RUNTIME between versions, never the application, so a
+    heavy file in the project is re-copied in full on every single release. See
+    version_slot_warning(). Fat mode has one folder and a rebuild replaces it, so it
+    would be a false alarm there — and a warning nobody needs to act on is how the
+    real ones stop being read.
+    """
     scan = ProjectScan()
     root = Path(request.project_dir)
     extra = ignore_patterns_for(request)
@@ -392,7 +429,8 @@ def scan_project(request: BuildRequest, big_file_mb: int = 10,
     # "data" (「專案裡的大檔:metadata.bin」 is enough), and it then travelled on
     # every single update. Match the directory, not the letters.
     named_dirs: set[str] = set()
-    for name, size in sorted(big_files, key=lambda item: item[1], reverse=True)[:3]:
+    scan.heavy_files = sorted(big_files, key=lambda item: item[1], reverse=True)
+    for name, size in scan.heavy_files[:3]:
         scan.warnings.append(f"專案裡的大檔:{name}({size / MB:.0f} MB)——確定要交付嗎?")
         head, slash, _tail = name.partition("/")
         named_dirs.add(head if slash else "(根目錄)")
@@ -400,11 +438,63 @@ def scan_project(request: BuildRequest, big_file_mb: int = 10,
         if size > big_dir_mb * MB and name not in named_dirs:
             scan.warnings.append(
                 f"大資料夾:{name}\\({size / MB:.0f} MB)——它會被整個複製進交付包。")
+
+    # 「這個檔案每次改版都要再搬一次」是一個只有現在講才有用的事實:專案結構還能改。
+    scan.version_slot_warning = version_slot_warning(scan)
+    if versioned and scan.version_slot_warning:
+        scan.warnings.append(scan.version_slot_warning)
     return scan
 
 
+# 版本槽之間現在「有」硬連結去重(store_builder 對內容相同的檔案 os.link,實測
+# CV_Viewer 的 versions\ 從 168MB 降到 84MB,第二版成本 84MB → 0MB)。所以磁碟這
+# 一半解決了。
+#
+# 但還有一半沒有,而且它是誠實的:**更新包**仍然得整包帶著那個 84MB 的權重檔——
+# 目標機上沒有那些位元組,而 USB / 網路芳鄰是 FAT/exFAT,根本沒有硬連結可用。
+# 所以「一次改版只搬十幾 MB」對這個專案「在傳輸上」仍然不成立。
+#
+# 這句話一度寫著「沒有硬連結、沒有去重」——在去重落地之後,那就變成一句我們
+# 「明知是假」的警告。出貨一句自己知道是假的話,正是這整個專案在治的病。
+VERSION_SLOT_MIN_MB = 20        # 低於這個量,重複複製不值得打斷任何人
+VERSION_SLOT_SHARE = 0.5        # 大檔要佔到版本目錄的一半,才叫「被它主宰」
+VERSION_SLOT_PROJECTION = 5     # 把「每版成本」翻譯成一個看得懂的總量
+
+
+def version_slot_warning(scan: ProjectScan,
+                         versions: int = VERSION_SLOT_PROJECTION) -> str:
+    """Store 佈局下這個專案每發一版要多吃多少磁碟,說成一句話。空字串 = 沒事。
+
+    Public on purpose: the GUI knows whether 「以 Store 佈局輸出」 is ticked and the
+    store builder knows it is the store builder, so either can ask for this text
+    directly (`scan.version_slot_warning` carries the same string).
+    """
+    if scan.application_mb < VERSION_SLOT_MIN_MB or not scan.heavy_files:
+        return ""
+    heavy_mb = sum(size for _name, size in scan.heavy_files) / MB
+    if heavy_mb < scan.application_mb * VERSION_SLOT_SHARE:
+        return ""                        # 大是大,但不是被某幾個檔案主宰:沒什麼可建議的
+    biggest, biggest_size = scan.heavy_files[0]
+    return (
+        f"這個專案有一個 {biggest_size / MB:.0f} MB 的大檔:「{biggest}」"
+        f"(整個專案 {scan.application_mb:.0f} MB)。\n"
+        "　·　磁碟:內容沒變的檔案在版本之間是「硬連結共用」的,"
+        f"所以發第二版不會再吃一份 {biggest_size / MB:.0f} MB。\n"
+        "　·　但「更新包」還是得整包帶著它:目標機上沒有那些位元組,"
+        "而 USB / 網路芳鄰(FAT、exFAT)也沒有硬連結可用。\n"
+        f"　　  所以每次發版要搬的還是 ~{scan.application_mb:.0f} MB,不是「十幾 MB」。\n"
+        f"若「{biggest}」不隨版本改變:把它移出專案(改由外部資料夾或共用磁碟提供),"
+        "或在 .provisionignore 排除它——更新包才會真的變小。"
+    )
+
+
 def _excluded_summary(excluded: dict[str, int]) -> str:
-    """e.g. 已自動排除:wheels/ 124 MB、*.pyc 18 MB(共 142 MB,不會進交付包)"""
+    """e.g. 已自動排除:wheels/ 124 MB、*.pyc 18 MB(共 142 MB,不會進交付包)。
+    要保留其中某個檔案,在專案根目錄的 .provisionignore 裡寫 `!路徑`…
+
+    每一句「我幫你排掉了 X」都必須帶著「你要怎麼把 X 要回來」。少了後半句,操作員
+    看到的是一個會自己決定刪什麼的工具,而且無從反駁 —— 逃生門明明就在那裡。
+    """
     if not excluded:
         return ""
     ranked = sorted(excluded.items(), key=lambda item: item[1], reverse=True)
@@ -412,7 +502,8 @@ def _excluded_summary(excluded: dict[str, int]) -> str:
     if not shown:                                     # all small: one honest number
         shown = [f"{label}" for label, _size in ranked[:6]]
     total = sum(excluded.values()) / MB
-    return f"已自動排除:{'、'.join(shown)}(共 {total:.0f} MB,不會進交付包)"
+    return (f"已自動排除:{'、'.join(shown)}(共 {total:.0f} MB,不會進交付包)。"
+            + ESCAPE_HATCH_HINT)
 
 
 def _rmtree_with_retry(path: Path, attempts: int = 8,

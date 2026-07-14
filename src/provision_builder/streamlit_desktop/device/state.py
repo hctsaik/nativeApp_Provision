@@ -38,6 +38,25 @@ class StateError(Exception):
 
 @dataclass
 class AppState:
+    """PROD/PREV/NEXT/LKG in one record.
+
+    WHAT `previous` MEANS: the version this machine was running BEFORE `current` —
+    a chronological record of the last move, not a "safe fallback" slot. Every
+    transition that changes `current` therefore sets it: promote_pending (we came
+    from the old current), rollback_to (we came from the version the operator fled)
+    and fail_candidate (we came from the candidate that just died). It is NOT a
+    rollback target and must never be read as one: rollback_to() and fail_candidate()
+    both put the version they left into failed_versions, so `previous` is routinely a
+    version we know to be broken. The two rollback resolvers (rollback_target() below
+    and bootstrap.resolve_rollback_target()) consult it only through an is_failed()
+    filter, which is exactly why that filter must stay.
+
+    fail_candidate() used to be the one transition that did NOT move it, so after an
+    automatic rollback `current` and `previous` held the SAME version — and 「目前版本
+    v1.0.0 / 上一版 v1.0.0」 is what an operator got read down the phone when they
+    asked what had happened to the machine overnight.
+    """
+
     app_id: str
     current: str
     previous: str | None = None
@@ -128,9 +147,30 @@ class AppState:
 
 # ── pure transitions (spec §8) ───────────────────────────────────────────────
 
-def _op(kind: str) -> dict:
-    return {"id": uuid.uuid4().hex, "kind": kind, "status": "completed",
-            "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+def _op(kind: str, *, moved_from: str | None = None, moved_to: str | None = None,
+        version: str | None = None) -> dict:
+    """What just happened — in enough detail to be READ BACK to a human.
+
+    `--status` is the screen an operator reads down a phone at 07:00 when they ask
+    「這台機器昨晚到底發生了什麼事?」. last_operation used to record a kind and a
+    timestamp and NOTHING about which versions were involved, so the best answer it
+    could ever give was 「rollback」. The from/to pair is what turns that into
+    「自動退版(v1.1.0 → v1.0.0),2026-07-14 06:12」.
+
+    The extra keys are optional BY CONSTRUCTION: from_dict() copies last_operation
+    verbatim and validates nothing in it, so a state.json written by an older build —
+    or by store_builder's "deliver" — simply has no from/to, and the status screen
+    falls back to the kind alone. No schema bump; nothing to migrate.
+    """
+    op = {"id": uuid.uuid4().hex, "kind": kind, "status": "completed",
+          "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    if moved_from:
+        op["from_version"] = moved_from
+    if moved_to:
+        op["to_version"] = moved_to
+    if version:
+        op["version"] = version
+    return op
 
 
 def _optional_str(value) -> str | None:
@@ -149,7 +189,7 @@ def promote_pending(state: AppState) -> AppState:
         state, previous=state.current, current=state.pending,
         pending=None, pending_revision=None,
         candidate=state.pending, candidate_revision=state.pending_revision,
-        last_operation=_op("promote"),
+        last_operation=_op("promote", moved_from=state.current, moved_to=state.pending),
     )
 
 
@@ -161,14 +201,16 @@ def clear_bad_pending(state: AppState, *, revision: str | None = None) -> AppSta
         {"version": state.pending, "revision": revision or state.pending_revision}]
     return dataclasses.replace(state, pending=None, pending_revision=None,
                                failed_versions=failed,
-                               last_operation=_op("clear_bad_pending"))
+                               last_operation=_op("clear_bad_pending",
+                                                  version=state.pending))
 
 
 def commit_candidate(state: AppState) -> AppState:
     """Health check passed: this version is now the last known good."""
     return dataclasses.replace(state, candidate=None, candidate_revision=None,
                                last_known_good=state.current,
-                               last_operation=_op("commit_candidate"))
+                               last_operation=_op("commit_candidate",
+                                                  version=state.current))
 
 
 def fail_candidate(state: AppState, *, revision: str | None = None,
@@ -178,6 +220,16 @@ def fail_candidate(state: AppState, *, revision: str | None = None,
     `target` lets bootstrap supply a version it resolved against the filesystem
     (an intact version dir that state alone knows nothing about). Without it we
     fall back to the state-only answer.
+
+    `previous` MOVES — to the candidate we are rolling away FROM. This was the one
+    transition that left it alone, so a machine that had just rolled itself back
+    reported 「目前版本 v1.0.0 / 上一版 v1.0.0」: the same version in two fields, to an
+    operator on the phone trying to work out what the machine did overnight. It is the
+    same rule rollback_to() has always followed (previous = the version we left), and
+    it is safe for the same reason: the version we left goes into failed_versions in
+    this very call, and BOTH rollback resolvers — rollback_target() below and
+    bootstrap.resolve_rollback_target() — filter `previous` through is_failed(). A
+    second rollback therefore cannot land on it.
     """
     if not state.candidate or state.candidate != state.current:
         raise StateError("no active candidate to fail")
@@ -191,10 +243,13 @@ def fail_candidate(state: AppState, *, revision: str | None = None,
     last_known_good = state.last_known_good
     if last_known_good == state.candidate:
         last_known_good = None  # it was never good; do not offer it as a target
-    return dataclasses.replace(state, current=target, candidate=None,
-                               candidate_revision=None,
+    return dataclasses.replace(state, current=target, previous=state.current,
+                               candidate=None, candidate_revision=None,
                                last_known_good=last_known_good,
-                               failed_versions=failed, last_operation=_op("rollback"))
+                               failed_versions=failed,
+                               last_operation=_op("rollback",
+                                                  moved_from=state.current,
+                                                  moved_to=target))
 
 
 def rollback_to(state: AppState, target: str, *, revision: str | None = None) -> AppState:
@@ -222,7 +277,7 @@ def rollback_to(state: AppState, target: str, *, revision: str | None = None) ->
         pending_revision=None if state.pending in (leaving, target) else state.pending_revision,
         candidate=None, candidate_revision=None,
         last_known_good=last_known_good, failed_versions=failed,
-        last_operation=_op("manual_rollback"))
+        last_operation=_op("manual_rollback", moved_from=leaving, moved_to=target))
 
 
 def set_pending(state: AppState, version: str, *, revision: str | None = None) -> AppState:
@@ -231,7 +286,7 @@ def set_pending(state: AppState, version: str, *, revision: str | None = None) -
         raise StateError(f"{version} is already current")
     return dataclasses.replace(state, pending=version,
                                pending_revision=_optional_str(revision),
-                               last_operation=_op("set_pending"))
+                               last_operation=_op("set_pending", version=version))
 
 
 # ── the store ────────────────────────────────────────────────────────────────
@@ -314,7 +369,8 @@ class StateStore:
         state = AppState(app_id=validate_identifier(app_id, "app_id"),
                          current=validate_identifier(current, "current"),
                          candidate=validate_identifier(current, "candidate"),
-                         generation=0, last_operation=_op("initialize"))
+                         generation=0,
+                         last_operation=_op("initialize", version=current))
         with locks_mod.app_lock(self.state_dir):
             return self.write_locked(state)
 
