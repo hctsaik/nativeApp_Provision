@@ -40,6 +40,44 @@ def _distribution_name(line: str) -> str:
     return match.group(1).lower().replace("_", "-") if match else ""
 
 
+def _is_self_reference(line: str) -> bool:
+    """Is this line the project referring to its own source tree?
+
+    `pip freeze` in a venv where the project was installed with `pip install -e .`
+    emits one of these. We tell the operator to run `pip freeze` in four different
+    places (including inside the error they hit when they do), so rejecting its
+    output left them in a closed loop with no way out.
+
+    Shapes seen in the wild:
+        -e .
+        -e /abs/path/to/project
+        -e git+https://…#egg=myapp          <- an editable of SOMEBODY ELSE: not this
+        .
+        ./subdir
+        myapp @ file:///C:/code/claude/CV_Viewer
+
+    A VCS editable (`-e git+…`) is NOT a self-reference: it is a real third-party
+    dependency that would need git and a network on the factory floor, so it must
+    keep failing loudly.
+    """
+    line = line.strip()
+    if line.startswith("-e"):
+        target = line[2:].strip()
+        return bool(target) and not re.match(r"^[a-z+]+:", target)   # not git+https:, hg+…
+    if line in {".", ".."} or line.startswith(("./", "../", ".\\", "..\\")):
+        return True
+    # `name @ file:///…` is ambiguous, and getting it wrong is expensive in one
+    # direction: silently dropping somebody else's local WHEEL means that package
+    # is simply absent on the factory machine, and the app dies there instead of
+    # here. So split on what the path points AT:
+    #   file:///C:/code/CV_Viewer            -> a source tree = this project      (drop)
+    #   file:///C:/wheels/foo-1.0-py3.whl    -> a built artifact = a real dep     (refuse, loudly)
+    if "@" in line and "file://" in line:
+        target = line.split("file://", 1)[1].strip().rstrip("/\\").lower()
+        return not target.endswith((".whl", ".tar.gz", ".zip", ".egg"))
+    return False
+
+
 class RuntimeStoreError(Exception):
     pass
 
@@ -140,12 +178,35 @@ def normalize_lock(text: str) -> list[str]:
         # produced the obvious way.
         if _distribution_name(line) in {"pip", "setuptools", "wheel"}:
             continue
+        # The project's own source, referenced by itself. `pip freeze` in a venv
+        # where the project was `pip install -e .`'d emits exactly this — and we
+        # tell the operator to run `pip freeze` in FOUR places, including in the
+        # error message below. So the advice produced the thing we rejected, with
+        # no way forward: a closed loop with the operator inside it.
+        #
+        # Dropping it is not a workaround, it is correct: the project's code
+        # travels in `application/`, not as an installed distribution, so it
+        # installs nothing on the target and rightly has no place in the
+        # dependency fingerprint either.
+        if _is_self_reference(line):
+            continue
         if line.startswith("-"):
-            raise LockfileError(f"lock 檔不可含 pip 選項(editable/-r/--hash 等):{line!r}")
+            raise LockfileError(
+                f"lock 檔不可含 pip 選項:{line!r}\n"
+                "  (-r / --hash / --index-url 這類選項在目標機上無法重現。)\n"
+                "  解法:把它展開成釘死的版本 name==1.2.3。")
         if ";" in line:
-            raise LockfileError(f"environment marker 必須在建置時凍結,不可留在 lock 檔:{line!r}")
+            raise LockfileError(
+                f"environment marker 必須在建置時凍結,不可留在 lock 檔:{line!r}\n"
+                "  目標機不會去解析 marker —— 它拿到的是「已經決定好」的相依。\n"
+                "  解法:在建置機的環境裡把它算完,只留下真正要裝的那一行。")
         if "@" in line or "://" in line:
-            raise LockfileError(f"第一版不接受 URL/VCS/local-path 相依:{line!r}")
+            raise LockfileError(
+                f"不接受 URL / VCS / 本機路徑相依:{line!r}\n"
+                "  工廠機沒有網路、也沒有 git,這一行在那裡裝不起來。\n"
+                "  解法(擇一):\n"
+                "    · 改成釘死的版本:name==1.2.3\n"
+                "    · 先 `pip wheel <那個套件>` 產出 .whl,放進專案的 wheelhouse 一起交付")
         match = _PIN.match(line)
         if not match:
             raise LockfileError(

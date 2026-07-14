@@ -70,8 +70,16 @@ Progress = Callable[[str], None]
 
 README_NAME = "讀我-使用說明.txt"
 WEBVIEW2_BAT_NAME = "安裝WebView2.bat"
-WEBVIEW2_INSTALLER = "prereq/MicrosoftEdgeWebview2Setup.exe"
-WEBVIEW2_DOWNLOAD = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
+# THE OFFLINE INSTALLER, AND ONLY THE OFFLINE ONE. See builder.py's header block:
+# the ~2 MB MicrosoftEdgeWebview2Setup.exe is the Evergreen *Bootstrapper*, which
+# contains no WebView2 and DOWNLOADS it at install time — on the air-gapped factory
+# PC this entire feature exists for, it cannot work, and shipping it in prereq\ is
+# shipping a downloader to a machine that cannot download. The ~130 MB Evergreen
+# Standalone Installer carries the runtime in the file. One name, one URL, defined
+# once in builder.py so the fat package and the store can never disagree.
+WEBVIEW2_INSTALLER = f"prereq/{builder.WEBVIEW2_INSTALLER_NAME}"
+WEBVIEW2_DOWNLOAD = builder.WEBVIEW2_DOWNLOAD
+WEBVIEW2_MIN_OFFLINE_BYTES = builder.WEBVIEW2_MIN_OFFLINE_BYTES
 # The Evergreen WebView2 runtime registers itself under this client GUID. No
 # WebView2 = the Tauri window opens blank, after a 60s startup the user waits
 # through. Check it BEFORE starting anything.
@@ -109,18 +117,25 @@ GC_EXIT_LOCKED = gc_mod.EXIT_STORE_LOCKED      # 4: an update holds the store lo
 # returns this code, every bat we have already written into a store obeys it.
 GC_EXIT_EMPTY = getattr(gc_mod, "EXIT_EMPTY_PLAN", 6)
 
-# The store's own WebView2 warning. builder.WEBVIEW2_MISSING_WARNING says 「請在建置
-# 時指定」, which in the fat path is the only remedy there is — but in a store the
-# remedy it implies (rebuild) is FORBIDDEN: a completed version directory is
-# immutable, so the operator who follows that advice is told 「版本 v1.0.0 已經在這棵
-# Store 樹裡建過了」 and has nowhere left to go. The real remedy costs nothing and
-# needs no rebuild: drop the .exe into prereq\ — tools\安裝WebView2.bat takes the
-# canonical name OR any .exe it finds there.
+# The store's own WebView2 warning. The remedy a store can offer is NOT the fat
+# path's: a completed version directory is immutable, so 「重建」 is refused outright
+# (「版本 v1.0.0 已經在這棵 Store 樹裡建過了」) and the operator who follows that
+# advice has nowhere left to go. The real remedy costs nothing: drop the .exe into
+# prereq\ — tools\安裝WebView2.bat takes any .exe it finds there.
+#
+# And it must name the RIGHT .exe. This warning used to ask for
+# MicrosoftEdgeWebview2Setup.exe, which is the 2 MB bootstrapper: an operator who
+# did exactly what it said still ended up with a factory PC that cannot install
+# WebView2, because that file downloads the runtime it does not contain.
 STORE_WEBVIEW2_MISSING_WARNING = (
     "未附 WebView2 離線安裝檔。目標機若沒有 Microsoft Edge WebView2 Runtime、"
     f"又不能上網,App 會開不起來(exit {EXIT_SHELL_ENVIRONMENT}),而且當場裝不了。"
+    "離線機器必須用「Evergreen Standalone Installer」"
+    f"({builder.WEBVIEW2_INSTALLER_NAME},約 130 MB,檔案本身就含整個 runtime);"
+    "2 MB 的 MicrosoftEdgeWebview2Setup.exe 是「需要連網」的 bootstrapper,"
+    "它執行時才去微軟網站下載,放進 prereq\\ 也裝不起來。"
     "不必重建(版本目錄一旦完成就不可變,重建只會被擋下來):"
-    "把 MicrosoftEdgeWebview2Setup.exe 複製到這棵樹的 prereq\\ 底下就行,"
+    "把安裝檔複製到這棵樹的 prereq\\ 底下就行(檔名不必改),"
     f"tools\\{WEBVIEW2_BAT_NAME} 認得那裡的任何 .exe。下載:{WEBVIEW2_DOWNLOAD}"
 )
 
@@ -278,6 +293,105 @@ def _strip_pip(runtime_dir: Path) -> None:
             pass
 
 
+def _fingerprint_for(request: BuildRequest, pins: list[str]) -> tuple[str, str, str]:
+    """(fingerprint, python_version, abi) for this lock, WITHOUT building anything.
+
+    Extracted so build_into_store can answer 「will this build a SECOND runtime?」
+    before it spends six minutes and 450 MB proving it. One implementation: a second
+    copy of this arithmetic that drifted by one field would silently kill runtime
+    reuse, and this repo has been bitten by exactly that before.
+    """
+    python_version = _python_version_of(request.runtime_template / "python.exe")
+    major, minor = python_version.split(".")[0], python_version.split(".")[1]
+    abi = f"cp{major}{minor}"
+    return (compute_fingerprint(python_version=python_version, platform="win_amd64",
+                                abi=abi, pins=pins),
+            python_version, abi)
+
+
+def _runtime_pins(root: Path) -> dict[str, list[str]]:
+    """Every runtime already in this store, and the pins it was built from."""
+    store = RuntimeStore(Path(root) / "deps")
+    found: dict[str, list[str]] = {}
+    if not store.runtimes.is_dir():
+        return found
+    for child in sorted(store.runtimes.iterdir()):
+        if not child.is_dir() or child.name.startswith("."):
+            continue
+        try:
+            meta = json.loads((child / RUNTIME_META).read_text("utf-8"))
+        except (OSError, ValueError):
+            continue                       # unreadable: it cannot be compared, so skip
+        found[child.name] = [str(pin) for pin in meta.get("pins", [])]
+    return found
+
+
+def _pin_differences(ours: list[str], theirs: list[str]) -> list[str]:
+    """The lines two locks disagree on, in the operator's terms."""
+    def by_name(pins: list[str]) -> dict[str, str]:
+        return {p.partition("==")[0]: p.partition("==")[2] for p in pins}
+
+    mine, other = by_name(ours), by_name(theirs)
+    lines: list[str] = []
+    for name in sorted(set(mine) | set(other)):
+        if name in mine and name in other:
+            if mine[name] != other[name]:
+                lines.append(f"{name}:這次是 {mine[name]},那一份是 {other[name]}")
+        elif name in mine:
+            lines.append(f"{name}=={mine[name]}:只有這次的 lock 有")
+        else:
+            lines.append(f"{name}=={other[name]}:只有那一份 runtime 有")
+    return lines
+
+
+def runtime_divergence_warning(root: Path, fingerprint: str,
+                               pins: list[str]) -> str | None:
+    """A SECOND ~450 MB runtime is about to land on a store that already has one,
+    because compute_fingerprint() hashes the ENTIRE pin set: one unrelated pin apart
+    and the two apps share nothing.
+
+    The operator came to the store layout FOR the sharing. They deserve to know they
+    are not getting it, and — since the difference is usually two or three lines —
+    exactly which pins to align to get it. Silence here costs 450 MB of a factory
+    PC's disk and nobody ever finds out why.
+
+    None when the runtime will be reused, or when this is the first runtime in the
+    tree (nothing to share with, nothing to say).
+    """
+    # Reuse is the SAME question ensure_runtime asks, asked the same way: a store that
+    # already has this exact runtime is about to share it, which is the outcome this
+    # warning exists to ask for. Warning then would be noise on a build that did
+    # everything right — and noise is how a warning that matters stops being read.
+    if RuntimeStore(Path(root) / "deps").is_complete(fingerprint):
+        return None
+    existing = {fp: other for fp, other in _runtime_pins(root).items()
+                if fp != fingerprint}
+    if not existing:
+        return None
+    # The closest one: aligning with the runtime you nearly match is the cheap move.
+    closest, differences = min(
+        ((fp, _pin_differences(pins, other)) for fp, other in existing.items()),
+        key=lambda item: len(item[1]))
+    if not differences:
+        # Same pins, different fingerprint = a different Python/ABI. Not something
+        # the operator can fix by editing a lock file, so do not pretend it is.
+        return (f"這棵樹已經有一份共用 runtime({closest}),但這次會再建一份"
+                "(約 450 MB):兩邊的套件版本完全一樣,差的是 Python 版本或 ABI。"
+                "要共用的話,兩個 App 必須用同一個可攜 Python 範本來建。")
+    shown = differences[:8]
+    lines = [f"這棵樹已經有一份共用 runtime({closest}),但這次的 lock 指紋不一樣,"
+             "所以會「再建一份」約 450 MB 的 runtime,兩個 App 共用不到。",
+             "  兩份 lock 的差別只有這幾筆:"]
+    lines += [f"  · {line}" for line in shown]
+    if len(differences) > len(shown):
+        lines.append(f"  (還有 {len(differences) - len(shown)} 筆差異)")
+    lines += ["  把它們對齊成同一個版本,兩個 App 就能共用同一份 runtime"
+              "(省下約 450 MB)。",
+              "  (要共用就得在「建這個版本之前」對齊:版本目錄一旦完成就不可變,"
+              "之後只能改用新的版本號重建。)"]
+    return "\n".join(lines)
+
+
 def ensure_runtime(root: Path, request: BuildRequest, pins: list[str],
                    progress: Progress = _noop) -> tuple[str, bool]:
     """Return (fingerprint, reused). Builds under .staging-* then renames.
@@ -289,11 +403,7 @@ def ensure_runtime(root: Path, request: BuildRequest, pins: list[str],
     for every version after the first) the gate never ran at all. It now lives
     in build_into_store(), which runs it whether the runtime was built or reused.
     """
-    template_python = request.runtime_template / "python.exe"
-    python_version = _python_version_of(template_python)
-    abi = f"cp{python_version.split('.')[0]}{python_version.split('.')[1]}"
-    fingerprint = compute_fingerprint(python_version=python_version,
-                                      platform="win_amd64", abi=abi, pins=pins)
+    fingerprint, python_version, abi = _fingerprint_for(request, pins)
     store = RuntimeStore(root / "deps")
     if store.is_complete(fingerprint):
         progress(f"runtime {fingerprint} 已存在,跳過 457MB 安裝")
@@ -555,6 +665,11 @@ _MESSAGES: dict[str, str] = {
         f"  請先雙擊 tools\\{WEBVIEW2_BAT_NAME},裝好之後再執行這個檔案。\n"
         "  它可以用一般使用者權限安裝,不需要系統管理員。\n"
         "\n"
+        "  這台機器不能上網的話,prereq\\ 底下必須有「Evergreen Standalone Installer」\n"
+        f"  ({builder.WEBVIEW2_INSTALLER_NAME},約 130 MB,檔案本身就含整個\n"
+        "  runtime);2 MB 的 MicrosoftEdgeWebview2Setup.exe 是「需要連網」的\n"
+        "  bootstrapper,它執行時才去微軟網站下載,放進 prereq\\ 也裝不起來。\n"
+        "\n"
         f"  代碼 {EXIT_SHELL_ENVIRONMENT} = 這台機器缺東西,不是這個版本壞掉。\n",
     "start-noruntime.txt":
         "這份交付不完整:deps\\runtimes\\ 底下沒有 python.exe。\n"
@@ -626,12 +741,18 @@ _MESSAGES: dict[str, str] = {
     "webview2-none.txt":
         "這份交付沒有附帶 WebView2 安裝檔,prereq\\ 是空的或不存在。\n"
         "\n"
-        "  1. 有網路的話,用瀏覽器下載「Evergreen Bootstrapper」,執行它就會安裝:\n"
+        "  1. 這台電腦有網路 → 用瀏覽器開啟下面的網址,下載安裝檔並執行它:\n"
         f"     {WEBVIEW2_DOWNLOAD}\n"
-        "  2. 沒網路的話,請向提供者索取 MicrosoftEdgeWebview2Setup.exe,\n"
-        "     放進這個資料夾的 prereq\\ 底下,再執行一次本檔案。\n"
+        "  2. 這台電腦沒有網路 → 請在「另一台有網路的電腦」開啟同一個網址,下載\n"
+        f"     「Evergreen Standalone Installer」({builder.WEBVIEW2_INSTALLER_NAME},\n"
+        "     約 130 MB,檔案本身就含整個 WebView2),複製到這個資料夾的 prereq\\ 底下\n"
+        "     (檔名不必改),再執行一次本檔案。\n"
         "\n"
-        "它可以用一般使用者權限安裝,不需要系統管理員。\n",
+        "請「不要」拿 2 MB 的 MicrosoftEdgeWebview2Setup.exe:那是需要連網的\n"
+        "bootstrapper,它本身不含 WebView2,執行時才去微軟網站下載,\n"
+        "放進 prereq\\ 也一樣裝不起來。\n"
+        "\n"
+        "WebView2 可以用一般使用者權限安裝,不需要系統管理員。\n",
     "webview2-installing.txt":
         "正在安裝 Microsoft Edge WebView2 Runtime,可能需要幾分鐘…\n",
     "webview2-done.txt":
@@ -639,6 +760,20 @@ _MESSAGES: dict[str, str] = {
     "webview2-failed.txt":
         "安裝失敗。請改用瀏覽器下載安裝:\n"
         f"  {WEBVIEW2_DOWNLOAD}\n",
+    # Printed ONLY when the install failed AND the .exe in prereq\ is under 10 MB.
+    # A sub-10 MB file is not a mystery to escalate to the supplier: it is the ~2 MB
+    # Evergreen Bootstrapper, and this machine is exactly the machine it cannot work
+    # on. Say that, instead of leaving the operator to conclude the delivery is bad.
+    "webview2-bootstrapper.txt":
+        "prereq\\ 裡的這支安裝檔小於 10 MB。\n"
+        "你手上這支是「需要連網」的 Evergreen Bootstrapper(約 2 MB):它本身不含\n"
+        "WebView2,執行時才去微軟網站下載,所以離線機器裝不起來,放進 prereq\\ 也沒用。\n"
+        "\n"
+        "離線機器要用的是「Evergreen Standalone Installer」\n"
+        f"({builder.WEBVIEW2_INSTALLER_NAME},約 130 MB,檔案本身就含整個 runtime):\n"
+        f"  {WEBVIEW2_DOWNLOAD}\n"
+        "在有網路的電腦下載好,複製到這個資料夾的 prereq\\ 底下(檔名不必改),\n"
+        "再執行一次本檔案。\n",
 }
 
 
@@ -678,12 +813,19 @@ def _write_messages(root: Path, apps: list[str], *, source: Path) -> None:
     messages.mkdir(parents=True, exist_ok=True)
 
     bodies = dict(_MESSAGES)
+    # ONE name per app, resolved ONCE. `source` first (the store we are generating
+    # FROM), then the tree itself: an export writes messages for the apps ALREADY in
+    # the destination too, and those need not exist in the source store at all.
+    # Falling straight through to the app_id prints a machine id where the operator
+    # expects a name — which is exactly what the chooser used to do (it asked
+    # `source` and nobody else), so a machine that already ran 「產線 A 檢視器」 and
+    # then received App B offered its operator a menu item called
+    # `app-line-a-viewer`. The app IS still here; only its name was lost.
+    display_of = {app_id: (_stored_display_name(source, app_id)
+                           or _display_name_of(root, app_id))
+                  for app_id in apps}
     for app_id in apps:
-        # `source` first (the store we are generating FROM), then the tree itself:
-        # an export writes messages for the apps ALREADY in the destination too, and
-        # those need not exist in the source store at all. Falling straight through
-        # to the app_id would print a machine id where the operator expects a name.
-        display = _stored_display_name(source, app_id) or _display_name_of(root, app_id)
+        display = display_of[app_id]
         # A title is expanded into `title %TITLE%`, so it IS parsed by cmd once —
         # strip the characters cmd treats as syntax. The menus are only ever
         # `type`d, so they keep the real name, parens and all.
@@ -698,8 +840,7 @@ def _write_messages(root: Path, apps: list[str], *, source: Path) -> None:
         lines = ["\n", "============================================\n",
                  "  管理主控台 - 這個資料夾裡有多個應用\n",
                  "============================================\n", "\n"]
-        lines += [f"  [{i}] {_display_name_of(source, a)}  {a}\n"
-                  for i, a in enumerate(apps, 1)]
+        lines += [f"  [{i}] {display_of[a]}  {a}\n" for i, a in enumerate(apps, 1)]
         lines += ["  [0] 離開\n"]
         bodies["admin-chooser.txt"] = "".join(lines)
 
@@ -1240,10 +1381,11 @@ rem machine has WebView2. pv=0.0.0.0 is the husk an uninstall leaves behind.
   pause
   exit /b 0
 )
-rem The canonical name build_into_store writes, then ANY .exe an operator dropped
-rem into prereq\ themselves: both bootstrappers take /silent /install, and telling
-rem someone who did the right thing with the right file that they did not is worse
-rem than useless.
+rem The canonical name first, then ANY .exe the operator dropped into prereq\
+rem themselves: build_into_store copies their file under ITS OWN name (it used to
+rem rename it, which is how a correct 130 MB standalone installer became a file
+rem named after the 2 MB bootstrapper), and every WebView2 installer Microsoft
+rem ships takes /silent /install.
 set "WV2SETUP="
 if exist "{installer}" set "WV2SETUP={installer}"
 for %%F in ("prereq\*.exe") do if not defined WV2SETUP set "WV2SETUP=prereq\%%~nxF"
@@ -1253,6 +1395,13 @@ if not defined WV2SETUP (
   pause
   exit /b 1
 )
+rem How big is it? The Evergreen Bootstrapper is ~2 MB and contains no WebView2 at
+rem all - it downloads it. The Evergreen Standalone Installer is ~130 MB and carries
+rem the runtime in the file. On the offline machine this tree exists for, that number
+rem is the whole diagnosis, and we read it BEFORE the install runs.
+set "SZ=0"
+for %%A in ("%WV2SETUP%") do set "SZ=%%~zA"
+if not defined SZ set "SZ=0"
 type "messages\webview2-installing.txt" 2>nul
 echo     %WV2SETUP%
 rem No ( ) block here: %errorlevel% inside one is expanded before the command runs.
@@ -1262,6 +1411,11 @@ if "%RC%"=="0" goto ok
 echo.
 echo [webview2][ERROR] exit code %RC%
 type "messages\webview2-failed.txt" 2>nul
+rem A failed install plus a sub-10 MB file in prereq\ is not a coincidence: it is
+rem the bootstrapper, on a machine that cannot reach the internet it wants to use.
+rem Say so, instead of sending the operator back to the supplier for the file they
+rem already have.
+if %SZ% LSS {min_bytes} type "messages\webview2-bootstrapper.txt" 2>nul
 popd
 pause
 exit /b %RC%
@@ -1420,8 +1574,13 @@ def _write_store_readme(root: Path, apps: list[str], bats: list[str], *,
         "這個視窗是用 Microsoft Edge WebView2 Runtime 顯示的,這台電腦必須要有它。",
         "大多數的 Windows 10/11 已經內建;如果沒有,啟動時會直接告訴你,不會開出空白視窗。",
         f"缺的時候:雙擊 tools\\{WEBVIEW2_BAT_NAME}。",
-        "  · 交付包若附了安裝檔,它會直接幫你裝好。",
+        "  · 交付包若附了安裝檔(prereq\\ 底下),它會直接幫你裝好,不需要網路。",
         f"  · 沒附的話,它會印出下載網址:{WEBVIEW2_DOWNLOAD}",
+        "  · 這台機器不能上網的話,要的是「Evergreen Standalone Installer」",
+        f"    ({builder.WEBVIEW2_INSTALLER_NAME},約 130 MB,檔案本身就含整個",
+        "    runtime):在有網路的電腦下載好,複製到 prereq\\ 底下(檔名不必改)。",
+        "    2 MB 的 MicrosoftEdgeWebview2Setup.exe 是「需要連網」的 bootstrapper,",
+        "    它執行時才去微軟網站下載,放進 prereq\\ 也裝不起來。",
         "  · WebView2 可以用一般使用者權限安裝,不需要系統管理員。",
         "",
         "除了 WebView2 以外,這台電腦不需要安裝 Python、Streamlit、Node 或 Rust ——",
@@ -1493,7 +1652,8 @@ def _write_tools(root: Path, apps: list[str] | None = None, *,
                               empty=GC_EXIT_EMPTY))
     _write_bat(tools / WEBVIEW2_BAT_NAME,
                _WEBVIEW2_BAT.format(webview2_check=_webview2_check(),
-                                    installer=WEBVIEW2_INSTALLER.replace("/", "\\")))
+                                    installer=WEBVIEW2_INSTALLER.replace("/", "\\"),
+                                    min_bytes=WEBVIEW2_MIN_OFFLINE_BYTES))
 
     for stale in tools.glob("admin-*.bat"):
         if stale.name[len("admin-"):-len(".bat")] not in apps:
@@ -1717,6 +1877,23 @@ def build_into_store(request: BuildRequest, root: Path, *, version: str,
         except Exception as exc:            # a scan must never kill a build
             warnings.append(f"專案掃描失敗,這次沒有大檔警告:{exc}")
 
+        # Is this build about to create a SECOND runtime on a tree that already has
+        # one? compute_fingerprint() hashes the WHOLE pin set, so two apps whose
+        # locks differ by a single unrelated pin get two 450 MB runtimes and share
+        # nothing — which is the opposite of why anyone chose the store layout.
+        # Asked BEFORE the install, so the operator can still cancel, align the two
+        # locks and get the sharing they came for.
+        _check_cancel(should_cancel)
+        try:
+            planned, _pyver, _abi = _fingerprint_for(request, pins)
+        except StoreBuildError:
+            planned = None                 # the interpreter probe is ensure_runtime's
+        if planned is not None:            # job to fail on, not this warning's
+            divergence = runtime_divergence_warning(root, planned, pins)
+            if divergence:
+                warnings.append(divergence)
+                progress("注意:" + divergence)
+
         _check_cancel(should_cancel)
         fingerprint, reused = ensure_runtime(root, request, pins, progress)
 
@@ -1758,17 +1935,29 @@ def build_into_store(request: BuildRequest, root: Path, *, version: str,
 
         _install_bootstrap(root)
         if webview2 is not None:
-            # <ROOT>/prereq/MicrosoftEdgeWebview2Setup.exe — the exact path
-            # tools\安裝WebView2.bat looks for. Nothing in this codebase ever
-            # CREATED prereq\; the exporter only copied it if it happened to
-            # exist, so on an offline factory machine with no WebView2 the
-            # delivery was unusable and said so only after the operator had
-            # walked there. Renamed to the canonical name on the way in: the bat
-            # cannot guess what the operator called the file they picked.
-            target = root / WEBVIEW2_INSTALLER
+            # <ROOT>/prereq/<the operator's own file name>. Nothing in this codebase
+            # ever CREATED prereq\; the exporter only copied it if it happened to
+            # exist, so on an offline factory machine with no WebView2 the delivery
+            # was unusable and said so only after the operator had walked there.
+            #
+            # AND WE DO NOT RENAME IT. We used to copy it to the "canonical name",
+            # which was MicrosoftEdgeWebview2Setup.exe — the ~2 MB Evergreen
+            # Bootstrapper, a downloader that installs nothing without a network. An
+            # operator who correctly fetched the 130 MB Standalone Installer had it
+            # silently relabelled as the one file that cannot work on the machine
+            # this whole feature exists for. There was never anything to gain:
+            # tools\安裝WebView2.bat runs ANY .exe in prereq\.
+            target = root / "prereq" / webview2.name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(webview2, target)
-            progress(f"已附上 WebView2 安裝檔:{target.name}(離線機器不必上網也裝得起來)")
+            progress(f"已附上 WebView2 安裝檔:prereq\\{target.name}"
+                     "(檔名保持你選的那個,離線機器不必上網也裝得起來)")
+            size = webview2.stat().st_size
+            if size < WEBVIEW2_MIN_OFFLINE_BYTES:
+                # Said HERE, on the build machine, where the right file is a 30-second
+                # download — not on the factory floor, where it is a dead end.
+                warnings.append(builder.webview2_bootstrapper_warning(webview2, size))
+                progress("注意:" + warnings[-1])
         apps = list_app_ids(root)
         bats, removed_start_bat = _write_entry_bats(root, request.display_name)
         try:
@@ -1991,7 +2180,7 @@ def _rollback_target_for(paths: AppPaths, state: AppState, deliver: str) -> str 
 
 
 def _write_target_state(dst: AppPaths, app_id: str, current: str,
-                        previous: str | None) -> None:
+                        previous: str | None, *, revision: str | None = None) -> None:
     """A FRESH state.json for the machine that receives this delivery.
 
     The exporter used to copy the build machine's state.json verbatim, which
@@ -2000,17 +2189,38 @@ def _write_target_state(dst: AppPaths, app_id: str, current: str,
         bootstrap PROMOTES pending on the next start, so the delivery silently
         installed a different version from the one the operator delivered, on
         first boot, in the factory.
-      * `candidate` — a half-proven version belonging to a machine it never met.
+      * the build machine's `candidate` — a half-proven version belonging to a
+        machine it never met.
       * `failed_versions` — a failure history from THIS build machine, which
         blocks the target from ever auto-applying those versions.
       * `last_known_good` — a claim that some version once started successfully.
         Nothing on the build machine ever started anything.
-    None of that is true of the target. So we write what IS true: it is running
-    `current`, it can fall back to `previous`, and it has no history yet.
+    None of that is true of the target. So we write what IS true.
+
+    AND WHAT IS TRUE IS THAT THE DELIVERED VERSION IS ON TRIAL. `candidate=current`,
+    with its revision. This is not a leak of the build machine's candidate (that one
+    is dropped, above); it is the fact that this version has NEVER STARTED HERE.
+
+    We used to write candidate=None, which switched the safety net OFF at the single
+    most dangerous moment in the product's life — a version's very first launch on a
+    machine it has never run on. bootstrap only auto-rolls-back a version that is the
+    candidate (`is_candidate`), so a first boot that died got no rollback at all, and
+    the 讀我 we ship with the folder promises 「萬一新版啟動失敗,系統會自動退回上一個
+    能用的版本」. StateStore.initialize() has always said this in as many words —
+    「a fresh install is itself an unproven candidate」 — and it is the exporter, not
+    the state module, that disagreed.
+
+    last_known_good stays None (nothing has started here yet, so nothing has earned
+    it) and `previous` stays: resolve_rollback_target() falls through LKG to
+    `previous`, so the first-boot rollback lands on the version we shipped for
+    exactly that purpose. On a one-version delivery `previous` is None and there is
+    genuinely nowhere to go — bootstrap says so and changes nothing, which is the
+    honest answer and the reason export_full_tree() warns about it at export time.
     """
     state = AppState(
         app_id=app_id, current=current, previous=previous,
-        pending=None, pending_revision=None, candidate=None, candidate_revision=None,
+        pending=None, pending_revision=None,
+        candidate=current, candidate_revision=revision,
         last_known_good=None, failed_versions=[], generation=0,
         last_operation={"id": uuid.uuid4().hex, "kind": "deliver",
                         "status": "completed",
@@ -2210,7 +2420,16 @@ def export_full_tree(root: Path, out_dir: Path, *, app_id: str | None = None,
                             ignore=_ignore_staging, dirs_exist_ok=True)
             versions.append(f"{a}/{name}" if len(apps) > 1 else name)
 
-        _write_target_state(dst, a, deliver, rollback)
+        # The revision of the version the target is about to boot ON TRIAL. It is the
+        # same content id release.json carries (sha256 of files.json), and it is what
+        # travels into failed_versions if that first boot dies — a failure recorded
+        # WITHOUT a revision blocks every future revision of that version number,
+        # including the fixed one.
+        try:
+            revision = version_revision(src, deliver)
+        except OSError:                       # unreadable files.json: it was verified
+            revision = None                   # complete above, so this is near-impossible
+        _write_target_state(dst, a, deliver, rollback, revision=revision)
 
         config = src.app_dir / "config.json"
         if config.is_file():
@@ -2268,16 +2487,25 @@ def export_full_tree(root: Path, out_dir: Path, *, app_id: str | None = None,
         # operator is left with a delivery they cannot fix and no way forward. They
         # do not need one: the bat takes any .exe in prereq\, so copying the
         # installer into THIS folder is the whole remedy.
-        # Checked with _has_prereq_installer(), not `MicrosoftEdgeWebview2Setup.exe
-        # is a file`: an operator who dropped their own copy in under its own name
-        # did the right thing, and telling them they did not is how they stop reading
-        # our warnings.
+        # Checked with _has_prereq_installer(), not 「the canonical name is a file」:
+        # an operator who dropped their own copy in under its own name did the right
+        # thing, and telling them they did not is how they stop reading our warnings.
+        #
+        # It must also name the file that can actually install offline. This warning
+        # used to ask for MicrosoftEdgeWebview2Setup.exe — the 2 MB bootstrapper —
+        # so an operator who followed it to the letter still ended up on the factory
+        # floor with a downloader and no network.
         warnings.append(
             "這份交付沒有附 WebView2 安裝檔(prereq\\ 底下沒有任何 .exe)。"
             "目標機如果沒有 Microsoft Edge WebView2 Runtime,而且不能上網,"
             "視窗會是一片空白,而且當場沒辦法補裝。"
-            "不必重新建置、也不必重新匯出:把 MicrosoftEdgeWebview2Setup.exe 複製到 "
-            f"{out / 'prereq'} 底下就行(tools\\{WEBVIEW2_BAT_NAME} 認得那裡的任何 .exe)。"
+            "離線機器必須用「Evergreen Standalone Installer」"
+            f"({builder.WEBVIEW2_INSTALLER_NAME},約 130 MB,檔案本身就含整個 runtime);"
+            "2 MB 的 MicrosoftEdgeWebview2Setup.exe 是「需要連網」的 bootstrapper,"
+            "它執行時才去微軟網站下載,放進 prereq\\ 也裝不起來。"
+            "不必重新建置、也不必重新匯出:把安裝檔複製到 "
+            f"{out / 'prereq'} 底下就行(檔名不必改,"
+            f"tools\\{WEBVIEW2_BAT_NAME} 認得那裡的任何 .exe)。"
             f"下載:{WEBVIEW2_DOWNLOAD}")
 
     say("寫入 start bat、tools\\ 與讀我-使用說明.txt…")

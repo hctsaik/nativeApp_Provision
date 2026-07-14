@@ -158,6 +158,74 @@ def test_a_lazy_import_inside_a_function_is_optional_not_required(tmp_path):
     assert report.optional == ["anthropic", "boto3"]  # and the operator is told
 
 
+def test_imports_in_a_function_the_module_body_calls_are_required(tmp_path):
+    """The hole in "imports inside a def are lazy": it is only true of a def nobody
+    calls at import time. `_setup()` at the bottom of the file runs while Streamlit
+    is importing the script, so `import zzz_boom` in its body executes on the first
+    render exactly like a module-level import — and the gate called it optional,
+    passed the build, and the operator met it as a red traceback.
+
+    Measured before the fix: required={'streamlit'}, optional={'zzz_boom'},
+    blocking=[]."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "app.py").write_text(
+        "import streamlit as st\n"
+        "\n"
+        "def _setup():\n"
+        "    import zzz_boom            # runs on first render: _setup() is called below\n"
+        "    return zzz_boom\n"
+        "\n"
+        "def never_called():\n"
+        "    import zzz_lazy           # genuinely lazy\n"
+        "\n"
+        "_setup()\n",
+        encoding="utf-8")
+
+    required, optional = imports_mod.classify(project, project / "app.py")
+    assert set(required) == {"streamlit", "zzz_boom"}
+    assert set(optional) == {"zzz_lazy"}
+
+    report = imports_mod.missing_from_lock(project / "app.py", project, "streamlit==1.40.0\n")
+    assert report.blocking == ["zzz_boom"]
+    assert report.optional == ["zzz_lazy"]
+    # and the operator is told WHY a function-body import is being called required
+    assert "模組層被呼叫" in report.where("zzz_boom")
+    report.failure_message().encode("cp950")
+
+
+@pytest.mark.parametrize("body,required", [
+    # called at the bottom of the file — the `_setup()` shape
+    ("def boot():\n    import zzz_x\n\nboot()\n", True),
+    # called inside a module-level `if` — still runs on import
+    ("import os\n\ndef boot():\n    import zzz_x\n\nif os.name == 'nt':\n    boot()\n", True),
+    # the return value is used at module level
+    ("def boot():\n    import zzz_x\n    return zzz_x\n\nCONFIG = boot()\n", True),
+    # a decorator that runs at import time IS a module-level call of the decorator
+    ("def boot(fn):\n    import zzz_x\n    return fn\n\n@boot\ndef page():\n    pass\n", True),
+    # nobody calls it: the AI4BI case, and it must stay optional
+    ("def boot():\n    import zzz_x\n", False),
+    # called only from inside another function — not at import time
+    ("def boot():\n    import zzz_x\n\ndef outer():\n    boot()\n", False),
+    # called under `if __name__ == '__main__'`: deliberately left optional (fail open)
+    ("def boot():\n    import zzz_x\n\nif __name__ == '__main__':\n    boot()\n", False),
+    # a guarded import inside a called function still degrades gracefully
+    ("def boot():\n    try:\n        import zzz_x\n    except ImportError:\n        pass\n\nboot()\n",
+     False),
+])
+def test_only_functions_the_module_body_really_runs_are_promoted(tmp_path, body, required):
+    """The promotion must be exact in BOTH directions: missing a real module-level
+    call ships a broken app, and promoting a def nobody calls resurrects the AI4BI
+    false positive that made a working project unbuildable."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "app.py").write_text("import streamlit\n" + body, encoding="utf-8")
+
+    names, lazy = imports_mod.classify(project, project / "app.py")
+    assert ("zzz_x" in names) is required
+    assert ("zzz_x" in lazy) is not required
+
+
 def test_a_module_level_import_in_an_if_or_try_block_is_still_required(tmp_path):
     project = tmp_path / "proj"
     project.mkdir()
@@ -187,9 +255,111 @@ def test_missing_from_lock_names_the_module_and_where_it_is_imported(tmp_path):
     message = report.failure_message()
     assert "duckdb" in message
     assert "app.py:2" in message                       # WHERE it is imported
-    assert "加進 requirements" in message               # way out #1
-    assert "選用相依,請忽略" in message                 # way out #2
+    assert "加進" in message and "requirements" in message      # way out #1
+    assert "確認它真的是選用的" in message                        # way out #2
+    assert "try/except ImportError" in message          # …and how to say so honestly
     assert "一定跑不起來" not in message                 # not an assertion
+    # the third "way out" that was never a fix: it only hid the import from us
+    assert "移到函式內" not in message
+
+
+def test_the_failure_message_never_tells_anyone_to_move_an_import_into_a_function(tmp_path):
+    """It used to offer, as one of the two ways out: 「把 import 移到函式內」.
+
+    That is not a fix. It moves the import to where this gate cannot see it — the
+    package is still not installed, the code path still runs, and the app still dies,
+    now on the factory floor with a green build behind it. We were teaching the
+    operator to disable the check instead of fixing what it found. And since a
+    function the module body calls is now REQUIRED anyway, the advice is not even
+    reliably effective at the thing it was wrongly recommending."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "app.py").write_text("import streamlit\nimport duckdb\n", encoding="utf-8")
+    message = imports_mod.missing_from_lock(project / "app.py", project,
+                                            "streamlit==1.40.0\n").failure_message()
+
+    assert "移到函式內" not in message
+    assert "用到才 import" not in message
+    # the two honest ways out, and only those
+    assert "加進" in message and "requirements" in message
+    assert "try/except ImportError" in message
+    message.encode("cp950")
+
+
+# ── the gate must not kill a build over its own alias table ──────────────────
+
+@pytest.mark.parametrize("module,distribution", [
+    # every one of these was reported MISSING while installed AND declared: the old
+    # code fell through to "the import name must be the distribution name".
+    ("Levenshtein", "python-Levenshtein==0.27.1"),
+    ("psycopg2", "psycopg2-binary==2.9.9"),
+    ("grpc", "grpcio==1.62.0"),
+    ("cv2", "opencv-contrib-python==4.10.0.84"),
+    ("MySQLdb", "mysqlclient==2.2.4"),
+])
+def test_a_declared_package_under_another_import_name_is_not_false_killed(
+        tmp_path, module, distribution):
+    """A false MISSING here does not cost six minutes — it makes the project
+    unbuildable, with an error telling the operator to add a package they already
+    declared and already have installed."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "app.py").write_text(f"import streamlit\nimport {module}\n", encoding="utf-8")
+
+    report = imports_mod.missing_from_lock(project / "app.py", project,
+                                           f"streamlit==1.40.0\n{distribution}\n")
+    assert report.blocking == [], report.failure_message()
+    assert report.required == []
+
+
+def test_the_interpreter_is_asked_before_our_own_alias_table(tmp_path):
+    """`importlib.metadata.packages_distributions()` reads the installed packages'
+    own manifests, so it cannot be stale the way a hand-written dict always is. It
+    is the FIRST question, not a fallback — and it is what will map the next
+    package nobody thought to add to the table."""
+    resolved = imports_mod.resolve_distributions("yaml")     # PyYAML is installed here
+    assert resolved.source == "metadata"
+    assert "pyyaml" in resolved.candidates
+    assert resolved.certain
+
+    # a name no table and no interpreter knows is a GUESS, and it says so
+    guessed = imports_mod.resolve_distributions("zzz_not_a_real_package")
+    assert guessed.source == "guess" and not guessed.certain
+
+
+def test_an_unrecognised_import_name_warns_instead_of_killing_the_build(tmp_path):
+    """The general case behind Levenshtein/psycopg2/grpc: when we could only GUESS
+    that the import name is the package name, and a declared package looks like it
+    could be the real provider, we must not refuse the build. A gate that guesses
+    fails OPEN — the post-install find_spec probe is ground truth and is still armed."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "app.py").write_text("import streamlit\nimport zzz_widget\n", encoding="utf-8")
+
+    lock = "streamlit==1.40.0\npython-zzz-widget==3.1.0\n"        # not in any table
+    report = imports_mod.missing_from_lock(project / "app.py", project, lock)
+
+    assert report.complete is True          # a fully-pinned lock…
+    assert report.blocking == []            # …and STILL not a reason to refuse
+    assert report.unresolved == ["zzz_widget"]
+    warning = "\n".join(report.warning_lines())
+    assert "zzz_widget" in warning and "python-zzz-widget" in warning
+    assert "安裝完成後" in warning           # what still guards it
+    warning.encode("cp950")
+
+
+def test_a_genuinely_absent_module_is_still_blocked_by_a_pinned_lock(tmp_path):
+    """The fail-open rule must not become fail-always: when nothing declared even
+    resembles the import, the answer is not a guess — it is a NO, and the whole
+    point of this gate is to say so in a second instead of after six minutes."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "app.py").write_text("import streamlit\nimport zzz_nope\n", encoding="utf-8")
+
+    report = imports_mod.missing_from_lock(project / "app.py", project,
+                                           "streamlit==1.40.0\npandas==2.2.3\n")
+    assert report.blocking == ["zzz_nope"]
+    assert report.unresolved == []
 
 
 def test_import_aliases_map_to_their_distribution_names(tmp_path):
@@ -377,6 +547,133 @@ def test_extras_that_a_lock_file_cannot_honour_are_not_dropped_in_silence(tmp_pa
     assert validate_mod.validate_request(request) == []       # a warning, not a block
 
 
+def _ai4bi_with_llm_extra(tmp_path: Path) -> tuple[Path, Path]:
+    """AI4BI exactly: deps in pyproject, `anthropic` in the `llm` optional group,
+    imported lazily inside the method that calls the model."""
+    project = tmp_path / "ai4bi"
+    project.mkdir()
+    (project / "app.py").write_text(
+        "import streamlit as st\n"
+        "\n"
+        "class Engine:\n"
+        "    def _call_anthropic(self, prompt):\n"
+        "        import anthropic\n"
+        "        return anthropic.Anthropic()\n",
+        encoding="utf-8")
+    (project / "pyproject.toml").write_text(
+        '[project]\nname = "ai4bi"\ndependencies = ["streamlit>=1.35"]\n'
+        '[project.optional-dependencies]\nllm = ["anthropic>=0.40"]\n',
+        encoding="utf-8")
+    return project, project / "app.py"
+
+
+def test_advice_names_the_optional_group_instead_of_a_requirements_file(tmp_path):
+    """「請加進 requirements」 is advice AI4BI's operator cannot follow: the project
+    has no requirements.txt, and `anthropic` is ALREADY declared — in pyproject's
+    `llm` optional group, which pip does not install unless you ask. The one action
+    that works is the GUI field 「進階設定 → 選用相依群組」, and the message must
+    name it and name the group."""
+    project, entry = _ai4bi_with_llm_extra(tmp_path)
+    request = _request(tmp_path, project, entry)
+
+    warnings = validate_mod.warnings_for(request)
+    said = "\n".join(warnings)
+
+    assert "anthropic" in said
+    assert "選用相依群組" in said and "llm" in said     # the field, and which group
+    assert "加進 requirements.txt" not in said          # the advice that cannot be followed
+    said.encode("cp950")
+    assert validate_mod.validate_request(request) == []   # still only a warning
+
+
+def test_a_module_level_call_of_a_group_only_package_still_names_the_group(tmp_path):
+    """The same advice must hold when the import is REQUIRED, not lazy: `_setup()`
+    at the bottom of the file calling `import anthropic` is a startup import, and
+    the fix is still 「填 llm」 — not 「請加進 requirements」, which for a
+    pyproject-only project points at a file that does not exist."""
+    project = tmp_path / "ai4bi"
+    project.mkdir()
+    (project / "app.py").write_text(
+        "import streamlit as st\n\ndef _setup():\n    import anthropic\n    return anthropic\n\n"
+        "_setup()\n", encoding="utf-8")
+    (project / "pyproject.toml").write_text(
+        '[project]\nname = "ai4bi"\ndependencies = ["streamlit>=1.35"]\n'
+        '[project.optional-dependencies]\nllm = ["anthropic>=0.40"]\n', encoding="utf-8")
+    request = _request(tmp_path, project, project / "app.py")
+
+    required, _optional = imports_mod.classify(project, project / "app.py")
+    assert "anthropic" in required                    # the module body calls _setup()
+
+    said = "\n".join(validate_mod.warnings_for(request))
+    assert "選用相依群組" in said and "llm" in said
+    assert "可能由其它套件帶進來" not in said          # we KNOW why it is missing
+    said.encode("cp950")
+
+
+def test_a_blocking_module_that_sits_in_an_optional_group_says_which_group(tmp_path):
+    """Same lie, blocking side: the package is declared, in a group, and the build
+    stops telling the operator to declare it."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "app.py").write_text("import streamlit\nimport anthropic\n", encoding="utf-8")
+    (project / "requirements.lock.txt").write_text("streamlit==1.40.0\n", encoding="utf-8")
+    (project / "pyproject.toml").write_text(
+        '[project]\nname = "p"\ndependencies = ["streamlit>=1.35"]\n'
+        '[project.optional-dependencies]\nllm = ["anthropic>=0.40"]\n', encoding="utf-8")
+
+    found = req_mod.resolve(project)
+    assert found.optional_groups() == {"llm": ("anthropic",)}
+
+    report = validate_mod.missing_imports(_request(tmp_path, project, project / "app.py"), found)
+    assert report.blocking == ["anthropic"]
+    message = report.failure_message()
+    assert "選用相依群組" in message and "llm" in message
+    message.encode("cp950")
+
+
+def test_store_mode_accepts_the_pip_freeze_output_it_told_the_operator_to_produce(tmp_path):
+    """We tell the operator 「pip freeze > requirements.lock.txt」 in four places —
+    including inside the very error they hit when they do it.
+
+    `pip freeze`, run in a venv where the project was `pip install -e .`'d (the
+    normal thing to do), emits `-e .` and `ai4bi @ file:///C:/code/claude/AI4BI`.
+    normalize_lock rejected exactly those lines. So our own advice produced the
+    thing we refused, with no way out: a closed loop with the operator inside it.
+
+    Dropping them is not a workaround, it is correct — the project's own source
+    travels in application/, so it installs nothing on the target and rightly has
+    no place in the dependency fingerprint either."""
+    project = tmp_path / "ai4bi"
+    entry = _ai4bi_shaped(project)
+    (project / "requirements.lock.txt").write_text(
+        "streamlit==1.40.0\npandas==2.2.3\nnumpy==2.1.3\nduckdb==1.1.3\n"
+        "-e .\n"
+        f"ai4bi @ file:///{project.as_posix()}\n", encoding="utf-8")
+    request = _request(tmp_path, project, entry)
+
+    assert validate_mod.validate_store_request(request, "v1.0.0") == []
+
+
+def test_somebody_elses_local_wheel_is_still_refused_and_says_what_to_do(tmp_path):
+    """The other half. Silently dropping a THIRD-PARTY local wheel means that
+    package is simply absent on the factory machine — the app dies there instead of
+    here. Only the project's own source tree may be dropped."""
+    from provision_builder.streamlit_desktop.device import runtime_store
+
+    with pytest.raises(runtime_store.LockfileError) as caught:
+        runtime_store.normalize_lock(
+            "streamlit==1.40.0\nfoo @ file:///C:/wheels/foo-1.0-py3-none-any.whl\n")
+    message = str(caught.value)
+    assert "foo" in message                        # WHICH line
+    assert "pip wheel" in message                  # WHAT to do about it
+    message.encode("cp950")
+
+    # …and a VCS editable stays refused too: the factory floor has no git, no network.
+    with pytest.raises(runtime_store.LockfileError):
+        runtime_store.normalize_lock(
+            "streamlit==1.40.0\n-e git+https://github.com/x/y.git#egg=y\n")
+
+
 def test_the_post_install_probe_is_always_authoritative(tmp_path, monkeypatch):
     """The staged interpreter has already had pip run against it, so what it cannot
     import will not be there at the factory. That report must keep blocking — the
@@ -466,6 +763,97 @@ def test_preflight_still_catches_a_genuinely_missing_package(tmp_path):
     assert missing == ["definitely_not_installed_pkg"]
     # and the message still names the distribution for the aliased ones
     assert "opencv-python" in launch.missing_modules_message(["cv2"], app_root)
+
+
+# ── the exclusion patterns nobody was checking ───────────────────────────────
+
+def _excludable_project(tmp_path: Path) -> tuple[Path, Path]:
+    project = tmp_path / "proj"
+    (project / "data").mkdir(parents=True)
+    (project / "recordings").mkdir()
+    (project / "app.py").write_text("import streamlit as st\nst.title('x')\n", encoding="utf-8")
+    (project / "helpers.py").write_text("def x(): pass\n", encoding="utf-8")
+    (project / "data" / "rows.csv").write_text("a,b\n", encoding="utf-8")
+    (project / "recordings" / "demo.mp4").write_bytes(b"\x00" * 16)
+    (project / "requirements.txt").write_text("streamlit>=1.35\n", encoding="utf-8")
+    return project, project / "app.py"
+
+
+def test_an_exclude_pattern_that_would_drop_the_entrypoint_is_refused(tmp_path):
+    """An entry script that is not in the package cannot start. validate never read
+    extra_excludes at all, so this was invisible until someone opened the delivered
+    folder — and the build said 建立完成."""
+    project, entry = _excludable_project(tmp_path)
+    request = _request(tmp_path, project, entry, extra_excludes=("app.py",))
+
+    errors = validate_mod.validate_request(request)
+    assert any("入口檔" in e for e in errors)
+    assert any("app.py" in e for e in errors)          # names the pattern responsible
+    "\n".join(errors).encode("cp950")
+
+
+def test_an_exclude_pattern_that_drops_the_entrypoints_folder_is_refused(tmp_path):
+    """copytree prunes a directory and never looks inside it, so excluding the
+    FOLDER kills the entry script without any pattern ever naming it."""
+    project = tmp_path / "proj"
+    (project / "src").mkdir(parents=True)
+    (project / "src" / "app.py").write_text("import streamlit\n", encoding="utf-8")
+    (project / "requirements.txt").write_text("streamlit>=1.35\n", encoding="utf-8")
+    request = _request(tmp_path, project, project / "src" / "app.py",
+                       extra_excludes=("src/",))
+
+    assert any("入口檔" in e for e in validate_mod.validate_request(request))
+
+
+def test_an_exclude_pattern_that_drops_every_py_file_is_refused(tmp_path):
+    """THE shipped bug: one pattern (`data/*`, collapsed to `*`) excluded every file
+    in the project, and the build reported 建立完成 — a delivered folder with no
+    application code in it. The matcher is fixed; this makes the class unshippable."""
+    project, entry = _excludable_project(tmp_path)
+    request = _request(tmp_path, project, entry, extra_excludes=("*",))
+
+    errors = validate_mod.validate_request(request)
+    assert any("每一個" in e and ".py" in e for e in errors)
+    "\n".join(errors).encode("cp950")
+
+
+def test_an_exclude_pattern_that_matches_nothing_is_a_warning(tmp_path):
+    """The only way a bad pattern can still hide: the operator types `recordigs/*`
+    (a typo), the GUI accepts it, the report says the exclusion is in force, and the
+    85 MB folder ships anyway. Nothing failed, so nothing was said."""
+    project, entry = _excludable_project(tmp_path)
+    request = _request(tmp_path, project, entry,
+                       extra_excludes=("recordigs/*", "recordings/*"))
+
+    warnings = validate_mod.warnings_for(request)
+    typo = [w for w in warnings if "recordigs/*" in w]
+    assert typo and "沒有比對到任何東西" in typo[0]
+    # …and the one that DOES match is not nagged about
+    assert not any("「recordings/*」" in w for w in warnings)
+    assert validate_mod.validate_request(request) == []      # a warning, not a block
+    "\n".join(warnings).encode("cp950")
+
+
+def test_a_working_exclude_pattern_is_neither_an_error_nor_a_warning(tmp_path):
+    """The gate must not become noise: the patterns that do their job say nothing."""
+    project, entry = _excludable_project(tmp_path)
+    (project / ".provisionignore").write_text("recordings/\n*.csv\n", encoding="utf-8")
+    request = _request(tmp_path, project, entry)
+
+    assert validate_mod.validate_request(request) == []
+    assert not any("排除樣式" in w for w in validate_mod.warnings_for(request))
+
+
+def test_the_exclusion_check_uses_the_builders_matcher_not_a_copy_of_it(tmp_path):
+    """Two implementations of "is this file excluded" is exactly how the build side
+    and the device side drifted apart. A Windows-style backslash pattern — what the
+    operator actually types — must be understood here because it is understood
+    THERE, not because we remembered to handle it twice."""
+    project, entry = _excludable_project(tmp_path)
+    request = _request(tmp_path, project, entry, extra_excludes=("recordings\\*",))
+
+    # the builder's matcher normalises the separator; so, therefore, do we
+    assert not any("沒有比對到任何東西" in w for w in validate_mod.warnings_for(request))
 
 
 # ── "this version works" must mean the window really opened ──────────────────

@@ -20,6 +20,7 @@ import pytest
 from provision_builder.streamlit_desktop import imports as imports_mod
 from provision_builder.streamlit_desktop import runtime as runtime_mod
 from provision_builder.streamlit_desktop import store_builder
+from provision_builder.streamlit_desktop.device import bootstrap
 from provision_builder.streamlit_desktop.device import gc as gc_mod
 from provision_builder.streamlit_desktop.device import integrity
 from provision_builder.streamlit_desktop.device import state as state_mod
@@ -252,8 +253,9 @@ def test_full_delivery_does_not_ship_the_build_machines_pending_update(build_req
     assert delivered["current"] == "v1.0.0"                # what the operator asked for
     assert delivered["pending"] is None                    # NOT a promotion time bomb
     assert delivered["pending_revision"] is None
-    assert delivered["candidate"] is None
-    assert delivered["candidate_revision"] is None
+    # The BUILD MACHINE's candidate does not travel — but the delivered version is
+    # itself on trial on a machine that has never run it (see the test below).
+    assert delivered["candidate"] == "v1.0.0"
     assert delivered["last_known_good"] is None            # nothing ever started here
     assert delivered["failed_versions"] == []
     # and the version it never should have carried is not even on the disk
@@ -310,6 +312,76 @@ def test_full_delivery_ships_a_rollback_target_so_rollback_has_somewhere_to_go(
     loaded = state_mod.StateStore(out / "apps" / app / "state").load()
     assert loaded.rollback_target() == "v1.0.0"
     assert integrity.is_complete(out / "apps" / app / "versions" / "v1.0.0")
+
+
+def test_a_freshly_delivered_version_boots_on_trial_so_rollback_can_fire(
+        build_request, stub_toolchain, tmp_path, monkeypatch):
+    """BLOCKER, and the other half of the healthy-marker fix. The exporter wrote
+    candidate=None, so a delivered version was NOT ON TRIAL on its first boot:
+    bootstrap only auto-rolls-back the candidate (`is_candidate`), so the single most
+    dangerous moment in the product's life — a version's very first launch on a
+    machine that has never run it — was the one moment the safety net was switched
+    off. Meanwhile the 讀我 in the same folder promises 「萬一新版啟動失敗,系統會自動
+    退回上一個能用的版本」.
+
+    state.py has always agreed with us: StateStore.initialize() sets candidate=current
+    「a fresh install is itself an unproven candidate」. Only the exporter disagreed.
+    """
+    root = tmp_path / "ROOT"
+    app = build_request.app_id
+    build_history(build_request, root, "v1.0.0", "v1.2.0")
+
+    out = tmp_path / "deliver"
+    store_builder.export_full_tree(root, out, version="v1.2.0")
+
+    delivered = state_of(out, app)
+    assert delivered["current"] == "v1.2.0"
+    assert delivered["candidate"] == "v1.2.0", "交付出去的版本第一次開機沒有被當成試用版"
+    assert delivered["candidate_revision"], "沒有 revision 的失敗記錄會擋掉這個版號的每一版"
+    assert delivered["candidate_revision"] == store_builder.version_revision(
+        store_builder.AppPaths(root, app), "v1.2.0")     # the same id release.json uses
+    assert delivered["previous"] == "v1.0.0"             # somewhere to roll back TO
+    assert delivered["last_known_good"] is None          # nothing has started here yet
+
+    # ...and the net really catches it: a first boot that fails rolls back to v1.0.0
+    # rather than leaving the machine dead on a version that cannot start.
+    paths = store_builder.AppPaths(out, app)
+    state = state_mod.StateStore(paths.state_dir).load()
+    assert bootstrap.resolve_rollback_target(paths, state) == "v1.0.0"
+
+    store = state_mod.StateStore(paths.state_dir)
+    store.mutate(lambda s: state_mod.fail_candidate(s, target="v1.0.0"))
+    after = state_of(out, app)
+    assert after["current"] == "v1.0.0"                  # the machine is alive again
+    assert after["candidate"] is None
+    assert [e["version"] for e in after["failed_versions"]] == ["v1.2.0"]
+    assert after["failed_versions"][0]["revision"] == delivered["candidate_revision"]
+
+
+def test_a_one_version_delivery_on_trial_has_nowhere_to_roll_back_and_says_so(
+        build_request, stub_toolchain, tmp_path):
+    """The other side of putting the delivered version on trial: with ONE version
+    there is no rollback target, and the machine must not pretend otherwise. Nothing
+    may claim a recovery that cannot happen — bootstrap resolves None and says so, and
+    the export warned about it before the folder ever left the building."""
+    root = tmp_path / "ROOT"
+    app = build_request.app_id
+    build_history(build_request, root, "v1.0.0")
+
+    out = tmp_path / "deliver"
+    export = store_builder.export_full_tree(root, out)
+
+    delivered = state_of(out, app)
+    assert delivered["candidate"] == "v1.0.0" and delivered["previous"] is None
+    paths = store_builder.AppPaths(out, app)
+    state = state_mod.StateStore(paths.state_dir).load()
+    assert state.rollback_target() is None
+    assert bootstrap.resolve_rollback_target(paths, state) is None   # honestly nothing
+    # fail_candidate REFUSES to invent one, so no false 「已恢復前一版本」 is possible
+    with pytest.raises(state_mod.StateError):
+        state_mod.fail_candidate(state, target=None)
+    # and the operator was told at export time, while they could still fix it
+    assert any("沒有可以退回的版本" in w for w in export.warnings), export.warnings
 
 
 def test_full_delivery_ships_only_the_runtimes_its_versions_reference(build_request,
@@ -473,6 +545,61 @@ def test_exporting_one_app_does_not_delete_the_other_apps_only_entry_point(stub_
     for app, request in ((alpha.app_id, alpha), (beta.app_id, beta)):
         assert f"start-{app}.bat" in readme
         assert request.display_name in readme
+
+
+def test_exporting_app_b_does_not_hijack_app_as_admin_console(stub_toolchain, tmp_path):
+    """S8. The machine on the line already runs App A. The operator exports App B onto
+    it (a second delivery into the same folder, from a DIFFERENT store — which is how
+    two apps built by two teams actually meet).
+
+    If tools\\ were written from 「what this export delivered」 rather than 「what is
+    installed in this folder」, tools\\admin.bat would take the one-app path and forward
+    to App B: the machine's admin console would silently administer the wrong app —
+    「退回上一版」 rolls back B while the operator is standing in front of A — and the
+    讀我 would deny that A is even here.
+
+    The union rule (see _write_tools / export_full_tree) is what prevents it, and this
+    is the test that keeps it honest for two SEPARATE stores, not just two apps in one.
+    """
+    store_a, store_b = tmp_path / "STORE_A", tmp_path / "STORE_B"
+    alpha = make_project(tmp_path, "產線 A 檢視器", app_id="line-a-viewer")
+    beta = make_project(tmp_path, "產線 B 報表", app_id="line-b-report")
+    build_history(alpha, store_a, "v1.0.0")
+    build_history(beta, store_b, "v1.0.0")
+
+    machine = tmp_path / "machine"
+    store_builder.export_full_tree(store_a, machine)
+    assert (machine / "tools" / "admin.bat").read_text("ascii").count("admin-") >= 1
+
+    second = store_builder.export_full_tree(store_b, machine)
+
+    # 1. the console is a CHOOSER over both apps, not a forwarder to the newcomer
+    admin = (machine / "tools" / "admin.bat").read_text("ascii")
+    assert f"admin-{alpha.app_id}.bat" in admin, "App A 的主控台被 App B 劫走了"
+    assert f"admin-{beta.app_id}.bat" in admin
+    assert admin.count("call ") == 2                     # one dispatch line per app
+    for app in (alpha.app_id, beta.app_id):
+        assert (machine / "tools" / f"admin-{app}.bat").is_file()
+        # ...and each console really drives ITS OWN app
+        own = (machine / "tools" / f"admin-{app}.bat").read_text("ascii")
+        assert f"--app {app}" in own
+        other = beta.app_id if app == alpha.app_id else alpha.app_id
+        assert f"--app {other}" not in own
+
+    # 2. the chooser's menu names both apps, in the operator's language
+    chooser = message(machine, "admin-chooser.txt")
+    assert alpha.display_name in chooser and beta.display_name in chooser
+
+    # 3. the 讀我 does not deny that App A is here
+    readme = (machine / store_builder.README_NAME).read_text("utf-8")
+    assert alpha.display_name in readme and beta.display_name in readme
+    assert f"start-{alpha.app_id}.bat" in readme
+
+    # 4. and the export SAYS the folder already held an app it did not deliver
+    assert second.apps == [beta.app_id]                  # what THIS export delivered
+    assert any(alpha.app_id in w for w in second.warnings), second.warnings
+    for line in second.warnings:
+        line.encode("cp950")
 
 
 def test_exporting_the_whole_tree_delivers_every_app_coherently(stub_toolchain, tmp_path):
@@ -1278,7 +1405,7 @@ def test_start_bat_checks_webview2_before_starting_anything(build_request, stub_
     assert store_builder.WEBVIEW2_BAT_NAME in message(root, "start-webview2.txt")
 
     installer = (root / "tools" / store_builder.WEBVIEW2_BAT_NAME).read_text("utf-8")
-    assert "MicrosoftEdgeWebview2Setup.exe" in installer
+    assert "MicrosoftEdgeWebView2RuntimeInstallerX64.exe" in installer
     assert "/silent /install" in installer
     assert store_builder.WEBVIEW2_DOWNLOAD in message(root, "webview2-none.txt")
 
@@ -1304,33 +1431,157 @@ def test_start_bat_refuses_with_the_environment_code_not_the_app_broken_code(
     assert '"%%V"=="0.0.0.0"' in block
 
 
+def offline_installer(tmp_path: Path, name: str | None = None) -> Path:
+    """A file big enough to BE the Evergreen Standalone Installer (~130 MB in the
+    field; over 10 MB is enough to prove we do not mistake it for a bootstrapper)."""
+    source = tmp_path / "downloads" / (name or store_builder.builder.WEBVIEW2_INSTALLER_NAME)
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"MZ" + b"\0" * (11 * 1024 * 1024))
+    return source
+
+
 def test_build_bundles_the_webview2_installer_into_prereq(build_request, stub_toolchain,
                                                           tmp_path):
     """A/S4. NOTHING in this codebase ever created prereq\\ — the exporter copied it
     if it happened to exist, and it never did. So the one dependency the delivery
     cannot install itself was never actually shipped, and 安裝WebView2.bat printed a
     download URL at a factory machine with no internet."""
-    source = tmp_path / "downloads" / "webview2-bootstrapper (1).exe"
-    source.parent.mkdir(parents=True, exist_ok=True)
-    source.write_bytes(b"MZ webview2 setup")
+    source = offline_installer(tmp_path)
     build_request.webview2_installer = source
 
     root = tmp_path / "ROOT"
     result = store_builder.build_into_store(build_request, root, version="v1.0.0")
     assert result.ok, result.errors
 
-    # renamed to the canonical name: the .bat cannot guess what the operator's file
-    # was called, and it is the .bat that has to find it.
-    bundled = root / "prereq" / "MicrosoftEdgeWebview2Setup.exe"
-    assert bundled.is_file() and bundled.read_bytes() == b"MZ webview2 setup"
-    assert (root / store_builder.WEBVIEW2_INSTALLER).is_file()
+    bundled = root / store_builder.WEBVIEW2_INSTALLER      # prereq/<standalone name>
+    assert bundled.is_file() and bundled.read_bytes() == source.read_bytes()
     assert store_builder.WEBVIEW2_INSTALLER.replace("/", "\\") in \
         (root / "tools" / store_builder.WEBVIEW2_BAT_NAME).read_text("utf-8")
+    assert not [w for w in result.warnings if "WebView2" in w], result.warnings
 
     out = tmp_path / "deliver"
     export = store_builder.export_full_tree(root, out)
-    assert (out / "prereq" / "MicrosoftEdgeWebview2Setup.exe").is_file()
+    assert (out / store_builder.WEBVIEW2_INSTALLER).is_file()
     assert not any("WebView2" in w for w in export.warnings), export.warnings
+
+
+def test_the_admins_chosen_installer_is_never_renamed(build_request, stub_toolchain,
+                                                      tmp_path):
+    """BLOCKER. The store copied the admin's file to a hard-coded 「canonical」 name:
+    MicrosoftEdgeWebview2Setup.exe — the ~2 MB Evergreen BOOTSTRAPPER, which contains
+    no WebView2 and downloads it at install time. An operator who correctly fetched
+    the 130 MB Standalone Installer had it silently relabelled as the one file that
+    CANNOT install on an air-gapped machine, which is the only machine prereq\\ exists
+    for. Nothing was ever gained by renaming: 安裝WebView2.bat runs any .exe there."""
+    source = offline_installer(tmp_path, "WebView2 離線版 (IT提供).exe")
+    build_request.webview2_installer = source
+
+    root = tmp_path / "ROOT"
+    assert store_builder.build_into_store(build_request, root, version="v1.0.0").ok
+
+    shipped = sorted(p.name for p in (root / "prereq").glob("*.exe"))
+    assert shipped == ["WebView2 離線版 (IT提供).exe"], shipped
+    assert not (root / "prereq" / "MicrosoftEdgeWebview2Setup.exe").exists()
+
+    # and the delivery carries THAT file, under THAT name, and does not complain
+    export = store_builder.export_full_tree(root, tmp_path / "deliver")
+    assert (Path(export.out_dir) / "prereq" / "WebView2 離線版 (IT提供).exe").is_file()
+    assert not [w for w in export.warnings if "WebView2" in w], export.warnings
+
+
+def test_a_two_megabyte_bootstrapper_is_called_out_at_build_time(build_request,
+                                                                 stub_toolchain, tmp_path):
+    """The bootstrapper cannot install anything without a network. Say so on the build
+    machine, where the right file is a 30-second download — not on the factory floor,
+    where the version directory is immutable and there is nothing left to do."""
+    boot = tmp_path / "MicrosoftEdgeWebview2Setup.exe"
+    boot.write_bytes(b"MZ" + b"\0" * (2 * 1024 * 1024))        # the real one is ~2 MB
+    build_request.webview2_installer = boot
+
+    root = tmp_path / "ROOT"
+    result = store_builder.build_into_store(build_request, root, version="v1.0.0")
+    assert result.ok, result.errors                            # a warning, not a wall
+
+    warned = [w for w in result.warnings if "bootstrap" in w.lower()]
+    assert warned, result.warnings
+    assert "需要連網" in warned[0]
+    assert store_builder.builder.WEBVIEW2_INSTALLER_NAME in warned[0]   # get THIS instead
+    warned[0].encode("cp950")
+    assert (root / "prereq" / boot.name).is_file()             # copied anyway, own name
+
+
+def test_the_whole_offline_webview2_chain_points_at_the_standalone_installer(
+        build_request, stub_toolchain, tmp_path):
+    """BLOCKER, and the one that destroys the product's reason for existing. Every
+    message, URL and constant used to name the Evergreen Bootstrapper
+    (MicrosoftEdgeWebview2Setup.exe, ~2 MB, LinkId=2124703) — a DOWNLOADER. An
+    air-gapped factory PC that followed our instructions to the letter still could not
+    install WebView2, and still could not open a window."""
+    assert store_builder.WEBVIEW2_INSTALLER == \
+        "prereq/MicrosoftEdgeWebView2RuntimeInstallerX64.exe"
+    assert store_builder.WEBVIEW2_DOWNLOAD == "https://go.microsoft.com/fwlink/?LinkId=2124701"
+
+    root = tmp_path / "ROOT"
+    result = store_builder.build_into_store(build_request, root, version="v1.0.0")
+    assert result.ok, result.errors
+
+    # every operator-facing sentence about WebView2, in the tree and in the result
+    texts = {name: message(root, name)
+             for name in ("webview2-none.txt", "start-webview2.txt",
+                          "webview2-bootstrapper.txt")}
+    texts["讀我"] = (root / store_builder.README_NAME).read_text("utf-8")
+    texts["warning"] = [w for w in result.warnings if "WebView2" in w][0]
+    texts["export"] = [w for w in store_builder.export_full_tree(
+        root, tmp_path / "deliver").warnings if "WebView2" in w][0]
+    for where, body in texts.items():
+        assert "2124703" not in body, where                    # the bootstrapper link
+        assert store_builder.builder.WEBVIEW2_INSTALLER_NAME in body, where
+        assert "需要連網" in body, where       # WHY the 2 MB file cannot be used offline
+        body.encode("cp950")
+
+    # the helper bat diagnoses it too: a failed install + a sub-10 MB file in prereq\
+    bat = (root / "tools" / store_builder.WEBVIEW2_BAT_NAME).read_text("ascii")
+    assert 'for %%A in ("%WV2SETUP%") do set "SZ=%%~zA"' in bat
+    assert f"if %SZ% LSS {store_builder.WEBVIEW2_MIN_OFFLINE_BYTES} " \
+           'type "messages\\webview2-bootstrapper.txt"' in bat
+    # the size is read BEFORE the install runs: %SZ% inside the failure branch is
+    # expanded when that block is parsed, not when it is reached
+    assert bat.index('set "SZ=') < bat.index('"%WV2SETUP%" /silent /install')
+
+
+def test_a_second_runtime_names_the_pins_that_differ_instead_of_silently_costing_450mb(
+        stub_toolchain, tmp_path):
+    """S8. compute_fingerprint() hashes the ENTIRE pin set, so two apps whose locks
+    differ by ONE unrelated pin get two ~450 MB runtimes and share nothing — which is
+    the only reason anyone chose the store layout. It happened silently: the operator
+    saw 「runtime 新建」, had no idea it was avoidable, and the second 450 MB sat on the
+    factory PC forever. Name the pins, and the fix is a one-line lock edit."""
+    root = tmp_path / "ROOT"
+    alpha = make_project(tmp_path, "Alpha Viewer", lock="streamlit==1.40.0\npandas==2.2.0\n")
+    beta = make_project(tmp_path, "Beta Viewer", lock="streamlit==1.40.0\npandas==2.2.1\n")
+    first = store_builder.build_into_store(alpha, root, version="v1.0.0")
+    assert first.ok and not first.runtime_reused
+    # the FIRST runtime in a tree has nothing to share with: no divergence warning
+    assert not [w for w in first.warnings if "450 MB" in w], first.warnings
+
+    second = store_builder.build_into_store(beta, root, version="v1.0.0")
+    assert second.ok, second.errors
+    assert second.runtime_reused is False                      # the fact being warned about
+    assert second.fingerprint != first.fingerprint
+
+    warned = [w for w in second.warnings if first.fingerprint in w]
+    assert warned, second.warnings
+    assert "pandas:這次是 2.2.1,那一份是 2.2.0" in warned[0]   # the exact pin, both sides
+    assert "streamlit" not in warned[0]                        # the pins that AGREE are noise
+    assert "450 MB" in warned[0]
+    warned[0].encode("cp950")
+
+    # a lock that MATCHES gets the sharing, and no warning about it
+    gamma = make_project(tmp_path, "Gamma Viewer", lock="streamlit==1.40.0\npandas==2.2.0\n")
+    third = store_builder.build_into_store(gamma, root, version="v1.0.0")
+    assert third.ok and third.runtime_reused
+    assert third.fingerprint == first.fingerprint
+    assert not [w for w in third.warnings if "450 MB" in w], third.warnings
 
 
 def test_a_store_build_with_no_webview2_installer_says_so_at_build_time(build_request,

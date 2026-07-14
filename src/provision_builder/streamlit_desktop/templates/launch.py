@@ -31,35 +31,49 @@ that fails identically.
 
 THE HEALTHY MARKER (CIM_HEALTHY_MARKER), and what bootstrap may conclude
 =======================================================================
-The marker is our one bit of good news, so it must mean exactly one thing:
+The marker is our one bit of good news, so it must not claim more than it knows.
+It has a BODY, and the body carries TWO different facts that used to be confused:
 
-    the marker exists  <=>  this version opened a window
-                            AND the app did not fail on arrival
+    body "no-session"  a window opened, and the app was NEVER ASKED TO RUN.
+                       Proves the MACHINE can host this version. Proves NOTHING
+                       about the version's own code — not one line of it ran.
+    body <the app url> the app was asked to run (/control/start) and did not fail
+                       on arrival. THIS is the only thing that may promote a
+                       candidate to last-known-good.
 
-We write it once the window has survived its creation phase (or exited 0 inside
-it — see run_shell), and we DELETE it again if the log later proves the app was
-never usable. bootstrap commits candidate -> last-known-good on a CLEAN EXIT with
-the marker still present; it must not commit the instant the marker appears,
-because the app script does not even run until the user presses Start.
+Why the body and not merely the file: Streamlit does not execute the app script
+until a session opens, and a session opens only when the user presses Start in the
+portal. Open the app, look at the portal, close the window without pressing Start
+— the most ordinary thing a user does — and the old marker (written the moment the
+window came up) said "healthy", the launcher exited 0, and bootstrap committed a
+version that had never executed a line as last-known-good. If that build was
+broken, the next launch died and the version it "rolled back" to was the same
+broken build. Automatic rollback was dead on the commonest daily path.
 
-  exit  marker   what happened                          bootstrap does
-  ----  -------  -------------------------------------  --------------------------
-   0    present  window opened, user closed it, app OK   commit candidate -> LKG
-   0    present  app rendered, threw LATER (red box,     commit; we printed a
-                 user carried on) -> [WARN], not a       warning to console + log
-                 failed version
-   3    absent   app never became usable (missing        version failed: roll back
-                 module / syntax error / raised on
-                 arrival / Streamlit never healthy);
-                 the marker is REVOKED if we had
-                 already written it
-   4    absent   this version's tree/manifest is wrong   version failed: roll back
-   5    absent   the window never opened at all          machine: touch no state
-   5    present  window was up, shell died non-zero      machine (SHARED shell):
-                 later                                   touch no state, no commit
+We write "no-session" once the window has survived its creation phase (or exited 0
+inside it — see run_shell), REWRITE it to the URL when /control/start arrives, and
+DELETE it if the log later proves the app was never usable.
+
+  exit  marker body  what happened                        bootstrap does
+  ----  ----------   ----------------------------------   -----------------------
+   0    <url>        app ran, user closed the window      commit candidate -> LKG
+   0    <url>        app rendered, threw LATER (red box,  commit; we printed a
+                     user carried on) -> [WARN]           warning to console + log
+   0    no-session   window opened, user never pressed    NOTHING. Not proven, not
+                     Start -> the app never ran           blamed. Still the
+                                                          candidate; retried next
+                                                          launch.
+   0    absent       nothing came up (or the marker was   treated as 3: fail + roll
+                     revoked on the way out)              back
+   3    absent       app never became usable (missing     version failed: roll back
+                     module / syntax error / raised on
+                     arrival / Streamlit never healthy);
+                     the marker is REVOKED
+   4    absent       this version's tree/manifest wrong   version failed: roll back
+   5    either       the machine is broken                machine: touch no state
 
   (--no-shell is a developer flag: no window is involved and bootstrap never
-   passes it. It writes the marker on a healthy Streamlit and nothing else.)
+   passes it. It writes the URL body on a healthy Streamlit and nothing else.)
 """
 
 from __future__ import annotations
@@ -87,6 +101,11 @@ EXIT_OK = 0
 EXIT_APP_BROKEN = 3
 EXIT_VERSION_BROKEN = 4
 EXIT_MACHINE_BROKEN = 5
+
+# The healthy marker's first state: a window came up, and nobody ever asked the app
+# to run. bootstrap READS this body — it must stay in step with the copy in
+# device/bootstrap.py, which is the other half of the contract.
+MARKER_NO_SESSION = "no-session"
 
 PKG_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_NAME = "app-package.json"
@@ -270,51 +289,145 @@ _DIST_HINT = {
 }
 
 
-def _module_level_imports(tree: ast.Module) -> set[str]:
-    """Only imports that run when the module is imported.
+# The scope labels are the BUILD SIDE's (imports.py). Both halves must say the same
+# thing to the same operator, and — far more important — must decide "does this import
+# run at startup?" the same way. Two implementations of that question is exactly how
+# the build gate and this preflight drifted apart: the gate started catching a package
+# that this side still waved through to the factory floor.
+MODULE_SCOPE = "module"          # required
+CALLED_SCOPE = "module-called"   # required: a def whose body the MODULE BODY runs
+_REQUIRED_SCOPES = (MODULE_SCOPE, CALLED_SCOPE)
 
-    An `import anthropic` inside a function body is lazy by construction: the
-    app starts fine without it. Treating those as required is how a build gets
-    hard-failed over an optional LLM backend nobody enabled. Same for anything
-    already wrapped in try/except ImportError — the author wrote the fallback.
+
+def _catches_import_error(node: ast.Try) -> bool:
+    """try/except ImportError (or bare except, or Exception) — the author wrote a
+    fallback, so the import is optional. Mirrors imports.py:_catches_import_error,
+    including the bare-except and dotted-name cases the old version here missed."""
+    for handler in node.handlers:
+        if handler.type is None:                       # bare except
+            return True
+        candidates = (handler.type.elts if isinstance(handler.type, ast.Tuple)
+                      else [handler.type])
+        for candidate in candidates:
+            name = getattr(candidate, "id", None) or getattr(candidate, "attr", None)
+            if name in ("ImportError", "ModuleNotFoundError", "Exception"):
+                return True
+    return False
+
+
+def _is_main_guard(node: ast.If) -> bool:
+    """`if __name__ == "__main__":` — the one module-level block whose CALLS we refuse
+    to treat as "the module body runs this".
+
+    Streamlit really does set `__name__ == "__main__"` on the entry script, so the
+    block does execute. We decline to promote the functions it calls anyway, on
+    purpose: doing so would turn every `main()`-style script's lazy imports into hard
+    requirements, and a wrong REQUIRED refuses an app that works. Fail open, and say
+    why. (imports.py:_is_main_guard — same rule, same reason.)
+    """
+    return any(isinstance(sub, ast.Name) and sub.id == "__name__"
+               for sub in ast.walk(node.test))
+
+
+def _called_from_module_scope(tree: ast.Module) -> set[str]:
+    """Names of this file's own functions that the MODULE BODY invokes.
+
+    `_setup()` at the bottom of the file, `CONFIG = boot()`, a call inside a
+    module-level `if`/`with`, `@register` on a module-level def — all of them run
+    while Streamlit is importing the script, so an import in their body executes on
+    the first render exactly like a module-level import. Calling those "lazy" is how
+    a missing dependency reaches the operator as a red box with a green build behind it.
+
+    What this deliberately does NOT cover (one level, same file, by design):
+      · a call two hops deep — module calls `main()`, `main()` calls `_setup()`:
+        `_setup()`'s imports stay optional.
+      · methods — `App().boot()` at module scope does not promote `boot`.
+      · a decorator that CALLS the function it decorates (`@run_now def _setup()`):
+        we see that `run_now` runs, not that `_setup` does.
+      · `if __name__ == "__main__":` — see _is_main_guard.
+    Each of those stays LAZY, i.e. not required. That is the safe direction: a wrong
+    REQUIRED refuses an app that works, while a missed one still meets `find_spec`
+    against the real runtime a moment later.
+
+    Copied in shape and rule from imports.py:_called_from_module_scope — read that
+    one before changing this one, and change both.
+    """
+    called: set[str] = set()
+
+    def scan(node: ast.AST) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                # The body is NOT module scope — but the decorators run right now,
+                # so `@register` really does execute register().
+                for decorator in child.decorator_list:
+                    target = (decorator.func if isinstance(decorator, ast.Call)
+                              else decorator)
+                    if isinstance(target, ast.Name):
+                        called.add(target.id)
+                continue
+            if isinstance(child, ast.If) and _is_main_guard(child):
+                continue
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Name):
+                called.add(child.func.id)
+            scan(child)          # into module-level if/with/try, call args, ...
+
+    scan(tree)
+    return called
+
+
+def _module_level_imports(tree: ast.Module) -> set[str]:
+    """The imports that RUN when Streamlit loads the script — the only ones a missing
+    package can break the FIRST RENDER with.
+
+    REQUIRED = module level, **or the body of a `def` that the module body calls**.
+
+    An `import anthropic` inside a function nobody calls at import time is lazy by
+    construction: the app starts fine without it, and hard-failing over an optional
+    LLM backend nobody enabled is how a good version gets refused. But a function the
+    MODULE BODY calls is not lazy at all — it runs on the first render, exactly like a
+    module-level import. Treating `def _setup(): import cv2` + `_setup()` as lazy is
+    the defect this fixes: the build gate now catches such a package, and this
+    preflight would still have let it reach the factory floor.
+
+    Promotion is same-file and ONE LEVEL DEEP; the exclusions are listed in
+    _called_from_module_scope and every one of them fails OPEN. A try/except
+    ImportError still degrades to optional even inside a promoted function — the
+    author wrote the fallback either way.
     """
     required: set[str] = set()
+    runs_on_import = _called_from_module_scope(tree)
 
-    def walk(nodes, *, guarded: bool) -> None:
-        for node in nodes:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                continue                                  # lazy: not needed to start
-            if isinstance(node, ast.Try):
-                handles_import = any(
-                    _handler_catches_import(h) for h in node.handlers)
-                walk(node.body, guarded=guarded or handles_import)
-                for handler in node.handlers:
-                    walk(handler.body, guarded=True)
-                walk(node.orelse, guarded=guarded or handles_import)
-                walk(node.finalbody, guarded=guarded)
+    def walk(node: ast.AST, *, scope: str, guarded: bool) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # Promoted from MODULE scope only, so a def nested inside a
+                # module-called def is lazy again — that is what "one level" means.
+                if (scope == MODULE_SCOPE and not guarded
+                        and child.name in runs_on_import):
+                    walk(child, scope=CALLED_SCOPE, guarded=guarded)
+                continue                     # otherwise lazy: cannot break first render
+            if isinstance(child, ast.ClassDef):
+                continue                     # a method is lazy (imports.py: CLASS_SCOPE
+                                             # is optional too — keep the sides agreeing)
+            if isinstance(child, ast.Try) and _catches_import_error(child):
+                # Body AND handlers: `except ImportError: import simplejson as json`
+                # is the fallback, not a second requirement. True inside a
+                # module-called function too: it degrades gracefully either way.
+                walk(child, scope=scope, guarded=True)
                 continue
-            if isinstance(node, ast.Import):
-                if not guarded:
-                    required.update(a.name.split(".")[0] for a in node.names)
-            elif isinstance(node, ast.ImportFrom):
-                if not guarded and node.level == 0 and node.module:
-                    required.add(node.module.split(".")[0])
-            for field in ("body", "orelse", "finalbody"):
-                child = getattr(node, field, None)
-                if isinstance(child, list):
-                    walk(child, guarded=guarded)
+            if isinstance(child, ast.Import):
+                if scope in _REQUIRED_SCOPES and not guarded:
+                    required.update(a.name.split(".")[0] for a in child.names)
+            elif isinstance(child, ast.ImportFrom):
+                if (scope in _REQUIRED_SCOPES and not guarded
+                        and child.level == 0 and child.module):
+                    required.add(child.module.split(".")[0])
+            # Module-level if/with/try(not import-guarded)/… still runs on import, so
+            # anything inside keeps the scope it inherited.
+            walk(child, scope=scope, guarded=guarded)
 
-    walk(tree.body, guarded=False)
+    walk(tree, scope=MODULE_SCOPE, guarded=False)
     return required
-
-
-def _handler_catches_import(handler: ast.ExceptHandler) -> bool:
-    names = []
-    if isinstance(handler.type, ast.Name):
-        names = [handler.type.id]
-    elif isinstance(handler.type, ast.Tuple):
-        names = [e.id for e in handler.type.elts if isinstance(e, ast.Name)]
-    return any(n in ("ImportError", "ModuleNotFoundError", "Exception") for n in names)
 
 
 def _import_roots(entrypoint: Path, app_root: Path) -> list[Path]:
@@ -472,24 +585,52 @@ class StreamlitExited(Exception):
     """Streamlit died before it became healthy — never open an empty shell."""
 
 
-# How long after THE APP IS ASKED TO RUN an error still counts as "the app failed
-# on arrival" rather than "the app broke while it was being used".
+# THE ARRIVAL WINDOW — how long after THE APP IS ASKED TO RUN an error still counts
+# as "the app failed on arrival" rather than "the app broke while it was being used".
 #
-# ANCHORED TO THE SESSION, NOT TO THE HEALTH CHECK. This used to start counting
-# when /_stcore/health first answered 200 — i.e. when the Streamlit *server* came
-# up. But the server comes up at launch, and the app script does not run until the
-# user presses "Start" in the portal, which can be minutes later. The window
-# therefore expired while the app had not executed a single line; the app was then
-# started, died on `import cv2`, and its traceback landed in the "late" half of the
-# log — which we deliberately treat as a warning (marker kept, exit 0). bootstrap
-# committed that build as last-known-good. The safety net stamped the broken
-# version good, and "the user took more than 20 seconds to press Start" is not an
-# edge case, it is the normal case.
+# ANCHORED TO THE SESSION, NOT TO THE HEALTH CHECK. This used to start counting when
+# /_stcore/health first answered 200 — i.e. when the Streamlit *server* came up. But
+# the server comes up at launch, and the app script does not run until the user
+# presses "Start" in the portal, which can be minutes later. So the clock starts at
+# _session_at (the /control/start hit), and until that exists the window CANNOT
+# close: with no session there is no app to have arrived, and anything in the log is
+# still an arrival failure.
 #
-# So the clock starts at _session_at (the /control/start hit), and until that
-# exists the window CANNOT close: with no session there is no app to have arrived,
-# and anything in the log is still an arrival failure.
+# AND IT IS NOT A WALL CLOCK. "20 seconds have passed, therefore the app has
+# rendered" is a guess, and it is wrong for precisely the apps that need the safety
+# net most: the ones with a heavy first render (a model loaded at import, a big table
+# read at module scope, a slow machine with antivirus reading every byte). Those are
+# still legitimately starting at T+20s, so a fatal error at T+30s landed in the
+# "late" half of the log, was downgraded to a warning, and the broken version was
+# committed as last-known-good.
+#
+# So the window closes on the app going QUIET, not on the clock running out:
+#
+#   * the log must have been UNCHANGED for APP_ARRIVAL_QUIET_SECONDS. A log that is
+#     still growing is an app that is still visibly working, and we do not get to
+#     declare it "arrived" while it is still talking to us.
+#   * never sooner than APP_ARRIVAL_SECONDS after the session started (the FLOOR: an
+#     app that logs nothing at all is quiet from its first breath, and we still owe
+#     it time to render before we start forgiving its errors).
+#   * always by APP_ARRIVAL_MAX_SECONDS, whatever the log is doing (the BOUND, so
+#     this always terminates).
+#
+# WHAT THE BOUND COSTS: an app that never stops writing — a progress line every
+# second, a chatty library, a polling loop — holds the window open until the bound
+# and no further. After that, its errors are warnings. So an app whose first render
+# takes longer than APP_ARRIVAL_MAX_SECONDS and only THEN dies is still committed as
+# last-known-good. That is the price of always terminating. Five minutes is far
+# beyond any first render we have measured; the alternative (no bound) is a window
+# that never closes, which turns every red box the user ever causes into a failed
+# version and an unasked-for downgrade — a worse bug than the one we are fixing.
+#
+# HONEST ABOUT WHAT THIS CANNOT DO: a SILENT slow starter (one that loads a big model
+# without logging a thing) is indistinguishable, from the log alone, from an app that
+# finished instantly and is idle. For those, only the floor protects us. Streamlit
+# reports no render, so there is no better signal available to a stdlib-only launcher.
 APP_ARRIVAL_SECONDS = 20.0
+APP_ARRIVAL_QUIET_SECONDS = 20.0
+APP_ARRIVAL_MAX_SECONDS = 300.0
 
 
 class StreamlitSupervisor:
@@ -526,8 +667,23 @@ class StreamlitSupervisor:
         self._healthy_at = None
         self._session_at = None
         self._arrival_offset = None
+        # How we tell "still starting" from "started and idle": the size of the log
+        # and when it last changed. A log that is still growing is an app that is
+        # still working — see the arrival-window constants above.
+        self._log_size = None
+        self._log_changed_at = None
 
     # -- state ---------------------------------------------------------------
+
+    @property
+    def session_started(self) -> bool:
+        """Was the app ever actually ASKED TO RUN this session?
+
+        False means the user opened the window, looked at the portal, and closed it
+        without pressing Start: Streamlit's server ran, the app's own code did not.
+        Such a session proves nothing about the version and must never promote it.
+        """
+        return self._session_at is not None
 
     @property
     def url(self) -> str | None:
@@ -571,14 +727,18 @@ class StreamlitSupervisor:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         log_path = self.log_dir / f"streamlit-{stamp}-{port}.log"
         self._log_path = log_path
-        # A fresh process writing a fresh log: a fresh arrival window. Reset all
-        # three, or the previous run's offset would declare this run's startup
-        # crash "late" and keep the marker. Note this only ever runs when we are
-        # NOT already running (start() short-circuits on `if self.running`), so a
-        # portal that presses Start twice cannot rewind its own window.
+        # A fresh process writing a fresh log: a fresh arrival window. Reset every
+        # one of these, or the previous run's offset would declare this run's startup
+        # crash "late" and keep the marker — and the previous log's size would be
+        # compared against the new log's, faking a "change" (or a false quiet) on the
+        # first tick. Note this only ever runs when we are NOT already running
+        # (start() short-circuits on `if self.running`), so a portal that presses
+        # Start twice cannot rewind its own window.
         self._healthy_at = None
         self._session_at = None
         self._arrival_offset = None
+        self._log_size = None
+        self._log_changed_at = None
         self._log_file = log_path.open("ab")
         cmd = streamlit_command(self.manifest["_python"], self.manifest["_entrypoint"], port, self.host)
         log.info("spawning Streamlit on port %d -> %s", port, log_path.name)
@@ -647,12 +807,18 @@ class StreamlitSupervisor:
         return self._log_path
 
     def note_session_start(self) -> None:
-        """The app has just been ASKED TO RUN — start the arrival clock.
+        """The app has just been ASKED TO RUN — start the arrival clock, and say so
+        in the marker.
 
         Called from the control channel's /control/start (the portal pressing
         "Start"), which is the first moment Streamlit executes the app script.
         Idempotent: a portal that presses Start twice on a running app must not
         push the window forward and turn a startup crash into a "late" error.
+
+        THE MARKER'S SECOND STATE IS WRITTEN HERE, and it is written here rather
+        than in the HTTP handler so that it cannot be forgotten: "the app was asked
+        to run" and "the marker may now speak for this version" are the same fact,
+        and a version whose app was never asked to run must never be promoted.
         """
         if self._session_at is not None:
             return
@@ -663,7 +829,23 @@ class StreamlitSupervisor:
         # let a version die and still be committed as last-known-good.
         waited = (self._session_at - self._healthy_at) if self._healthy_at else 0.0
         log.info("the app was asked to run %.1fs after the server became healthy: "
-                 "arrival window opens (%.0fs)", waited, APP_ARRIVAL_SECONDS)
+                 "arrival window opens (floor %.0fs, quiet %.0fs, bound %.0fs)",
+                 waited, APP_ARRIVAL_SECONDS, APP_ARRIVAL_QUIET_SECONDS,
+                 APP_ARRIVAL_MAX_SECONDS)
+        # THE BASELINE for "is the app still writing?": how big the log was at the
+        # moment the app was asked to run. Without it the first tick has nothing to
+        # compare against, so an app that had ALREADY written three progress lines by
+        # then would look like it had been quiet since the session started — and its
+        # window would close while it was still visibly working, which is the whole
+        # bug we are here to fix.
+        if self._log_path is not None:
+            try:
+                self._log_size = self._log_path.stat().st_size
+            except OSError:
+                self._log_size = None    # note_arrival_window seeds it on its next tick
+        url = self.url
+        if url:
+            _write_marker(url)
 
     @property
     def arriving(self) -> bool:
@@ -673,37 +855,61 @@ class StreamlitSupervisor:
     def note_arrival_window(self) -> None:
         """Freeze how much of the log belongs to "the app arriving".
 
-        Called on a tick while the shell is up (run_shell). The window opens when
-        the app is asked to run (note_session_start) and closes APP_ARRIVAL_SECONDS
-        later; whatever the app logs after that happened to an app that had already
-        rendered for the user.
+        Called on a tick while the shell is up (run_shell). The window opens when the
+        app is asked to run (note_session_start) and closes once the app has gone
+        QUIET — see the arrival-window constants above. Whatever the app logs after
+        that happened to an app that had already rendered for the user.
 
-        UNTIL THERE IS A SESSION, THE WINDOW NEVER CLOSES. The user may stare at
-        the portal for ten minutes before pressing Start; Streamlit has been
-        healthy that whole time and the app has not run a line. Closing the window
-        on that timer meant the app's dying breath was filed as a late warning and
-        the version was committed as last-known-good.
+        TWO THINGS KEEP IT OPEN, and both are the point:
+
+        UNTIL THERE IS A SESSION, IT NEVER CLOSES. The user may stare at the portal
+        for ten minutes before pressing Start; Streamlit has been healthy that whole
+        time and the app has not run a line.
+
+        WHILE THE APP IS STILL WRITING, IT NEVER CLOSES (up to the bound). A growing
+        log is an app that is still working. Closing on a bare 20-second wall clock
+        meant a slow first render was declared "arrived" while it was still starting,
+        so its dying breath was filed as a late warning and the version was committed
+        as last-known-good.
 
         Honest about the limits: Streamlit logs NOTHING on a successful run, so we
-        cannot observe a render. "It became usable" is inferred from "it was asked
-        to run, and stayed quiet, past the arrival window". An app that blows up on
-        a page the user opens a minute in is reported as a warning, not a failed
-        version — the direction we want to be wrong in: a red box the user can
-        retry is not worth downgrading a machine over.
+        cannot observe a render. "It became usable" is inferred from "it was asked to
+        run, then went quiet". An app that blows up on a page the user opens a minute
+        in is reported as a warning, not a failed version — the direction we want to
+        be wrong in: a red box the user can retry is not worth downgrading a machine
+        over.
         """
         if self._arrival_offset is not None:
             return
         session_at, log_path = self._session_at, self._log_path
         if session_at is None or log_path is None:
             return                       # nobody asked the app to run yet
-        if time.monotonic() - session_at < APP_ARRIVAL_SECONDS:
-            return
+        now = time.monotonic()
         try:
-            self._arrival_offset = log_path.stat().st_size
+            size = log_path.stat().st_size
         except OSError:
             return                       # try again on the next tick
-        log.info("arrival window closed at %d bytes of %s",
-                 self._arrival_offset, log_path.name)
+
+        if self._log_size is None:
+            self._log_size = size        # note_session_start could not stat: seed here
+        elif size != self._log_size:
+            self._log_size = size
+            self._log_changed_at = now   # still talking: still arriving
+
+        # _log_changed_at is None only while the log has not moved SINCE THE SESSION
+        # STARTED (note_session_start took that baseline) — i.e. a silent app. It has
+        # therefore been quiet for exactly as long as the session has been open.
+        quiet_since = session_at if self._log_changed_at is None else self._log_changed_at
+
+        elapsed = now - session_at
+        if elapsed < APP_ARRIVAL_SECONDS:
+            return                       # the floor: too early to call it arrived
+        if (now - quiet_since) < APP_ARRIVAL_QUIET_SECONDS and elapsed < APP_ARRIVAL_MAX_SECONDS:
+            return                       # still writing, and the bound has not hit
+        self._arrival_offset = size
+        log.info("arrival window closed at %d bytes of %s (%.0fs after the app was "
+                 "asked to run; quiet for %.0fs)",
+                 self._arrival_offset, log_path.name, elapsed, now - quiet_since)
 
     def _split_log(self) -> tuple[str, str] | None:
         """(what the app logged on arrival, what it logged once it was working)."""
@@ -1057,26 +1263,51 @@ def run_shell(manifest: dict, control: ControlServer, data_dir: Path,
 
 # ── main ─────────────────────────────────────────────────────────────────────
 
-def _write_marker(url: str) -> None:
-    """Tell bootstrap this version actually works (commit candidate → LKG)."""
+def _marker_body(path: Path) -> str | None:
+    """What the marker currently says, or None if it is not there / unreadable."""
+    try:
+        return path.read_text("utf-8").strip()
+    except OSError:
+        return None
+
+
+def _write_marker(body: str) -> None:
+    """Record in the marker's BODY what this session has actually proved.
+
+      MARKER_NO_SESSION  a window opened and the app was never asked to run. Says
+                         the MACHINE can host this version; says nothing about the
+                         version's code, because none of it ran.
+      <the app url>      the app was asked to run (/control/start). Only this may
+                         promote a candidate to last-known-good.
+
+    NEVER DOWNGRADES. on_window_ready can land AFTER /control/start — a user who
+    presses Start inside the three-second window-creation watch, or a shell that
+    exits cleanly inside it — and a "no-session" written over a real session would
+    throw away the one fact that lets a good version be committed.
+    """
     marker = os.environ.get("CIM_HEALTHY_MARKER")
     if not marker:
         return
+    path = Path(marker)
     try:
-        Path(marker).parent.mkdir(parents=True, exist_ok=True)
-        Path(marker).write_text(url, encoding="utf-8")
+        if body == MARKER_NO_SESSION:
+            current = _marker_body(path)
+            if current not in (None, "", MARKER_NO_SESSION):
+                return                    # a session is already recorded: keep it
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
     except OSError as exc:
         log.warning("could not write healthy marker %s: %s", marker, exc)
 
 
 def _revoke_marker() -> None:
-    """Take the "this version works" claim back.
+    """Take the marker back entirely — both of its states.
 
-    We write the marker once the window has survived its creation phase, because
-    that is what proves the machine can host it. But the app script only runs
-    when the user presses Start — minutes later. If it turns out it never became
-    usable, the version is NOT good, and a marker left behind would promote it to
-    last-known-good: the very version rollback would later fall back to.
+    The app was asked to run and proved it never became usable. Neither body is
+    true any more: not the URL (the app did not survive arrival) and not
+    MARKER_NO_SESSION (that would say "the user never pressed Start", and they
+    did). An absent marker with exit 3 is exactly what bootstrap reads as "this
+    version is broken, roll back".
 
     Revoked ONLY when the app is proven broken (app_error_in_log), never for an
     error the app survived — see finish_session.
@@ -1096,9 +1327,12 @@ def finish_session(supervisor: StreamlitSupervisor, shell_code: int) -> int:
     The one place the marker and the exit code are made to tell the same story:
 
       app failed on arrival  -> revoke the marker, exit 3 (version failed)
-      app raised LATER       -> keep the marker, warn loudly, exit 0
+      app raised LATER       -> keep the URL marker, warn loudly, exit 0
+      the app never ran      -> leave the marker at "no-session", exit 0. The
+                                session proves nothing: bootstrap neither commits
+                                the version nor blames it.
       the window never came  -> exit 5 (machine); the marker was never written
-      clean close            -> keep the marker, exit 0
+      clean close            -> keep the URL marker, exit 0
     """
     fatal = supervisor.app_error_in_log()
     if fatal:
@@ -1121,6 +1355,20 @@ def finish_session(supervisor: StreamlitSupervisor, shell_code: int) -> int:
               "  這不算版本失敗,不會退版,也不影響下次啟動。\n"
               f"  若這個錯誤會重複出現,請把這份記錄交給開發者:{supervisor.log_path}",
               flush=True)
+
+    if not supervisor.session_started:
+        # The user opened the window, looked at the portal, and closed it without
+        # ever pressing Start. Streamlit's SERVER ran; the app's own code did not —
+        # not one line. The marker therefore still says MARKER_NO_SESSION, and
+        # bootstrap will neither commit this version nor fail it: it stays the
+        # candidate and gets another chance next launch.
+        #
+        # This is the single most ordinary thing a user can do, and committing on it
+        # made a version that had never executed the machine's last-known-good — the
+        # very build a later rollback would fall back to.
+        log.info("the app was never asked to run (no /control/start): the marker "
+                 "stays %r, so this session neither proves nor condemns the version",
+                 MARKER_NO_SESSION)
 
     if shell_code == EXIT_MACHINE_BROKEN:
         return EXIT_MACHINE_BROKEN
@@ -1218,13 +1466,16 @@ def main(argv: list[str] | None = None) -> int:
                 pass
             return EXIT_OK
 
-        # The marker means "this version WORKS", so it must not be written until
-        # the window is really up: a missing WebView2 runtime kills the shell in
-        # a second, and that is exactly the case rollback exists for.
+        # A window that is really up proves the MACHINE can host this version — a
+        # missing WebView2 runtime kills the shell in a second, and that is exactly
+        # the case rollback exists for. So the marker is written here, but with the
+        # body MARKER_NO_SESSION: the app script has not run, and will not run until
+        # the user presses Start. note_session_start() rewrites the body to the URL
+        # if and when that happens, and ONLY that body promotes a version.
         #
         # The tick does two things, every half second, while the user works:
-        #   1. closes the app's arrival window once the app has been running for
-        #      APP_ARRIVAL_SECONDS (note_arrival_window), and
+        #   1. closes the app's arrival window once the app has been asked to run and
+        #      has gone quiet (note_arrival_window), and
         #   2. answers "is this app dying right now?" (failing_on_arrival) — a
         #      truthy tick tells run_shell to close the window instead of leaving
         #      the operator in front of a red box until they give up.
@@ -1233,7 +1484,7 @@ def main(argv: list[str] | None = None) -> int:
             return supervisor.failing_on_arrival() is not None
 
         code = run_shell(manifest, control, data_dir,
-                         on_window_ready=lambda: _write_marker(url),
+                         on_window_ready=lambda: _write_marker(MARKER_NO_SESSION),
                          on_tick=tick)
         log.info("shell exited with code %s", code)
 

@@ -272,6 +272,60 @@ def test_a_path_pattern_does_not_exclude_the_entire_project():
     assert keep("data", True, ("data/",), "data")
 
 
+def test_a_backslash_exclusion_pattern_is_not_silently_ignored(request_, stub_pip):
+    """S7. This is a WINDOWS product: the operator types `recordings\\*` into 額外排除,
+    because that is what every path on their screen looks like. `"/" not in pattern`
+    was then true, the pattern was treated as a BARE NAME, fnmatch'd against
+    「demo.mp4」, matched nothing — and the exclusion silently did nothing at all while
+    the GUI accepted it and the report listed it as in force. A pattern that is
+    accepted, appears to work, and quietly does nothing is worse than one we reject.
+    """
+    keep = builder_mod.should_ignore
+    assert keep("demo.mp4", False, ("recordings\\*",), "recordings/demo.mp4")
+    assert keep("demo.mp4", False, ("recordings/*",), "recordings/demo.mp4")   # unchanged
+    assert keep("recordings", True, ("recordings\\",), "recordings")
+    assert keep("deep.mp4", False, ("recordings\\*",), "recordings/2024/deep.mp4")
+    assert not keep("app.py", False, ("recordings\\*",), "app.py")     # and nothing else
+
+    # ...and the same pattern really does keep the file out of the package.
+    recordings = request_.project_dir / "recordings"
+    recordings.mkdir()
+    (recordings / "demo.mp4").write_bytes(b"\0" * (11 * 1024 * 1024))
+    request_.extra_excludes = ("recordings\\*",)
+
+    scan = builder_mod.scan_project(request_)
+    assert not any("demo.mp4" in w for w in scan.warnings), scan.warnings
+    assert scan.excluded_mb >= 10
+
+    pkg = build(request_).package_dir
+    assert not (pkg / "application" / "recordings").exists()
+
+
+def test_a_big_directory_still_warns_when_another_warning_merely_contains_its_name(
+        request_, stub_pip):
+    """S7. The big-directory warning was suppressed by `any(name in w for w in
+    warnings)` — a SUBSTRING search over the warning sentences. So a genuinely huge
+    `data\\` folder went unmentioned the moment some other warning happened to contain
+    the letters "data" (「專案裡的大檔:metadata.bin」 is enough), and it then travelled
+    into the package and onto every update. Suppress on the directory, not the letters.
+    """
+    (request_.project_dir / "assets").mkdir()
+    (request_.project_dir / "assets" / "metadata.bin").write_bytes(b"\0" * (11 * 1024 * 1024))
+    data = request_.project_dir / "data"
+    data.mkdir()
+    for i in range(3):                       # 30 MB, no single file big enough to warn
+        (data / f"part{i}.csv").write_bytes(b"\0" * (10 * 1024 * 1024))
+
+    scan = builder_mod.scan_project(request_)
+    assert any("metadata.bin" in w for w in scan.warnings), scan.warnings
+    big_dir = [w for w in scan.warnings if w.startswith("大資料夾:data")]
+    assert big_dir, scan.warnings
+
+    # the real suppression still holds: the directory whose own big file we NAMED
+    # does not get a second warning about the same megabytes.
+    assert not [w for w in scan.warnings if w.startswith("大資料夾:assets")], scan.warnings
+
+
 # ── a build-output NAME means different things at different depths ───────────
 
 def test_a_custom_components_compiled_frontend_survives_the_build(request_, stub_pip):
@@ -595,6 +649,7 @@ def test_cancel_stops_the_build_cleans_up_and_says_so(request_, stub_pip):
     assert result.cancelled is True
     assert result.ok is False
     assert result.message == "已取消建置,暫存目錄已清乾淨"
+    assert result.staging_left is None                       # nothing to warn a GUI about
     assert not any(request_.output_dir.glob(".staging-*"))   # nothing left behind
     assert not request_.package_dir.exists()                 # and nothing half-written
 
@@ -628,6 +683,13 @@ def test_a_cancel_that_could_not_delete_the_staging_dir_does_not_say_it_did(
     assert "下次建置會自動清掉" in result.message          # and what happens about it
     assert result.message in lines                         # the operator saw it, not just the caller
     result.message.encode("cp950")                         # a zh-TW console can print it
+
+    # S1, the other half: a GUI cannot branch on a SENTENCE. It rendered its own
+    # hardcoded 「暫存目錄已清乾淨」 over this honest message, and the operator went
+    # looking for 600 MB of disk space that had never been freed. The fact travels as
+    # a FIELD, which nothing can overwrite by accident.
+    assert result.staging_left == leftover[0]
+    assert result.staging_left.is_dir()
 
 
 def test_the_next_build_really_does_clean_up_the_staging_dir_a_cancel_left_behind(
@@ -956,22 +1018,107 @@ def test_a_package_with_no_webview2_installer_says_so_instead_of_claiming_succes
     assert "沒有" in readme and "prereq" in readme  # and the 讀我 does not promise one
 
 
+def offline_installer(tmp_path: Path, name: str | None = None) -> Path:
+    """A file big enough to BE the Evergreen Standalone Installer (~130 MB in the
+    field; anything over 10 MB is enough to prove we do not call it a bootstrapper)."""
+    installer = tmp_path / "downloads" / (name or builder_mod.WEBVIEW2_INSTALLER_NAME)
+    installer.parent.mkdir(parents=True, exist_ok=True)
+    installer.write_bytes(b"MZ" + b"\0" * (11 * 1024 * 1024))
+    return installer
+
+
 def test_the_webview2_installer_is_copied_into_prereq_where_the_helper_looks(
         request_, stub_pip, tmp_path):
-    installer = tmp_path / "MicrosoftEdgeWebview2Setup.exe"
-    installer.write_bytes(b"MZ fake webview2 bootstrapper")
+    installer = offline_installer(tmp_path)
     request_.webview2_installer = installer
     request_.__post_init__()                        # re-resolve, as the GUI would
 
     result = build(request_)
     assert result.ok, result.errors
-    shipped = result.package_dir / "prereq" / "MicrosoftEdgeWebview2Setup.exe"
+    shipped = result.package_dir / "prereq" / builder_mod.WEBVIEW2_INSTALLER_NAME
     assert shipped.is_file()
-    assert shipped.read_bytes() == b"MZ fake webview2 bootstrapper"
+    assert shipped.read_bytes() == installer.read_bytes()
     assert not [w for w in result.warnings if "WebView2" in w]   # nothing to warn about
 
     helper = (result.package_dir / "tools" / "安裝WebView2.bat").read_text("utf-8")
     assert "prereq" in helper
+
+
+def test_the_admins_chosen_installer_is_never_renamed(request_, stub_pip, tmp_path):
+    """BLOCKER. We used to copy the admin's file to a hard-coded "canonical" name —
+    MicrosoftEdgeWebview2Setup.exe, which is the ~2 MB Evergreen BOOTSTRAPPER. An
+    operator who correctly downloaded the 130 MB Standalone Installer had it silently
+    relabelled as the one file that CANNOT install on an offline machine, which is the
+    only machine prereq\\ exists for. There was never anything to gain: the helper bat
+    runs whatever .exe is in prereq\\."""
+    installer = offline_installer(tmp_path, "WebView2 離線版 (公司IT提供).exe")
+    request_.webview2_installer = installer
+    request_.__post_init__()
+
+    prereq = build(request_).package_dir / "prereq"
+    shipped = [p.name for p in prereq.glob("*.exe")]
+    assert shipped == ["WebView2 離線版 (公司IT提供).exe"], shipped
+    assert not (prereq / "MicrosoftEdgeWebview2Setup.exe").exists()
+
+
+def test_a_two_megabyte_bootstrapper_is_called_out_while_the_operator_can_still_fix_it(
+        request_, stub_pip, tmp_path):
+    """The bootstrapper installs nothing without a network. Handing it to an offline
+    factory PC is the failure this whole feature exists to prevent, so the build says
+    so HERE — where the right file is a 30-second download — not on the factory floor,
+    where it is a dead end."""
+    boot = tmp_path / "MicrosoftEdgeWebview2Setup.exe"
+    boot.write_bytes(b"MZ" + b"\0" * (2 * 1024 * 1024))     # the real one is ~2 MB
+    request_.webview2_installer = boot
+    request_.__post_init__()
+
+    result = build(request_)
+    assert result.ok, result.errors                          # it is a warning, not a wall
+    warned = [w for w in result.warnings if "bootstrap" in w.lower()]
+    assert warned, result.warnings
+    assert "需要連網" in warned[0]
+    assert builder_mod.WEBVIEW2_INSTALLER_NAME in warned[0]  # what to get INSTEAD
+    warned[0].encode("cp950")
+    # ...and it was still copied, under its own name: we never silently drop a file
+    # the operator asked us to ship.
+    assert (result.package_dir / "prereq" / boot.name).is_file()
+
+
+def test_every_webview2_message_asks_for_the_standalone_not_the_bootstrapper(
+        request_, stub_pip):
+    """The whole offline chain used to point at LinkId=2124703 — the Evergreen
+    Bootstrapper, ~2 MB, which contains no WebView2 and DOWNLOADS it at install time.
+    On the air-gapped machine this product exists for, following our own instructions
+    to the letter produced a PC that still could not open a window."""
+    assert builder_mod.WEBVIEW2_INSTALLER_NAME == "MicrosoftEdgeWebView2RuntimeInstallerX64.exe"
+    assert builder_mod.WEBVIEW2_DOWNLOAD == "https://go.microsoft.com/fwlink/?LinkId=2124701"
+    assert "2124703" not in builder_mod.WEBVIEW2_DOWNLOAD     # the bootstrapper link
+
+    pkg = build(request_).package_dir
+    for name in ("webview2-none.txt", "start-webview2.txt", "webview2-bootstrapper.txt"):
+        body = (pkg / "messages" / name).read_text("utf-8")
+        body.encode("cp950")
+        assert builder_mod.WEBVIEW2_INSTALLER_NAME in body, name
+        assert "2124703" not in body, name
+        assert "需要連網" in body, name          # WHY the 2 MB one cannot be used
+    assert builder_mod.WEBVIEW2_INSTALLER_NAME in builder_mod.WEBVIEW2_MISSING_WARNING
+    # the warning must also offer the remedy the immutable-version rule allows
+    assert "不必重建" in builder_mod.WEBVIEW2_MISSING_WARNING
+    assert "prereq" in builder_mod.WEBVIEW2_MISSING_WARNING
+
+
+def test_the_helper_bat_says_it_is_a_bootstrapper_when_the_install_fails_on_a_small_file(
+        request_, stub_pip):
+    """「安裝失敗」 plus a sub-10 MB file in prereq\\ is not a mystery to escalate: it
+    is the downloader, on a machine with no network. The bat has the file size; it
+    must spend it."""
+    helper = (build(request_).package_dir / "tools" / "安裝WebView2.bat").read_text("ascii")
+    assert 'for %%A in ("%WV2SETUP%") do set "SZ=%%~zA"' in helper
+    assert f"if %SZ% LSS {builder_mod.WEBVIEW2_MIN_OFFLINE_BYTES} " \
+           'type "messages\\webview2-bootstrapper.txt"' in helper
+    # the size is read BEFORE the install: %SZ% inside the if-block is expanded when
+    # the block is parsed, not when it runs
+    assert helper.index('set "SZ=') < helper.index('"%WV2SETUP%" /silent /install')
 
 
 def test_a_webview2_installer_that_does_not_exist_fails_the_build_loudly(

@@ -93,11 +93,17 @@ class AppState:
         return dataclasses.asdict(self)
 
     @classmethod
-    def from_dict(cls, data: dict) -> "AppState":
+    def from_dict(cls, data: dict, *, source: Path | None = None) -> "AppState":
+        """`source` is the file this came from — it is the first thing the operator
+        needs and the first thing these messages used to leave out."""
+        where = f":{source}" if source else ""
         if not isinstance(data, dict):
-            raise StateError("state.json is not a JSON object")
+            raise StateError(f"狀態檔內容不是一個 JSON 物件{where}")
         if data.get("schema_version") != SCHEMA_VERSION:
-            raise StateError(f"unsupported state schema: {data.get('schema_version')!r}")
+            raise StateError(
+                f"狀態檔的 schema 版本不支援:{data.get('schema_version')!r}"
+                f"(這個版本的程式只認得 {SCHEMA_VERSION}){where}\n"
+                "  這通常表示程式被降級了:請改用比較新的版本。")
         try:
             state = cls(
                 app_id=validate_identifier(data.get("app_id"), "app_id"),
@@ -113,9 +119,10 @@ class AppState:
                 last_operation=dict(data.get("last_operation") or {}),
             )
         except IdentifierError as exc:
-            raise StateError(str(exc)) from exc
+            raise StateError(f"狀態檔裡有不合法的名稱:{exc}{where}") from exc
         if state.generation < 1:
-            raise StateError(f"generation must be >= 1, got {state.generation}")
+            raise StateError(
+                f"狀態檔的 generation 必須 >= 1,讀到 {state.generation}{where}")
         return state
 
 
@@ -240,15 +247,37 @@ class StateStore:
         return self.path.is_file()
 
     def load(self) -> AppState:
+        """Read state.json, or say — in the operator's language, and about a file
+        they can actually go and look at — why we could not.
+
+        These messages end up on a factory machine's console, read out loud over
+        the phone by the person standing in front of it. 「corrupt state.json」 with
+        no path in it told them nothing: not which app, not which file, not what to
+        do. Every error here now names the FILE and the NEXT ACTION.
+        """
         try:
             raw = self.path.read_text("utf-8")
         except FileNotFoundError as exc:
-            raise StateError(f"missing {self.path}") from exc
+            raise StateError(
+                f"找不到狀態檔:{self.path}\n"
+                "  這個 app 還沒有安裝好(或這個資料夾不是它的安裝位置)。"
+            ) from exc
+        except OSError as exc:
+            raise StateError(
+                f"狀態檔讀不到:{self.path}\n"
+                f"  原因:{exc}\n"
+                "  常見原因:資料夾是唯讀的、權限不足,或檔案正被其他程式鎖住。"
+            ) from exc
         try:
             data = json.loads(raw)
         except ValueError as exc:
-            raise StateError(f"corrupt state.json: {exc}") from exc
-        return AppState.from_dict(data)
+            raise StateError(
+                f"狀態檔內容毀損,不是合法的 JSON:{self.path}\n"
+                f"  JSON 解析錯誤:{exc}\n"
+                "  這個檔案記錄「目前跑的是哪一版」,壞掉時系統不會亂猜,一律停下來。\n"
+                "  請把這個檔案交給開發者(不要自己改),或用 --rollback-to 重新指定版本。"
+            ) from exc
+        return AppState.from_dict(data, source=self.path)
 
     def write_locked(self, state: AppState) -> AppState:
         """Atomic replace + read-back. Caller holds the app update lock."""

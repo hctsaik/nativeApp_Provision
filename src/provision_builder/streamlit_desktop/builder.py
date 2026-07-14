@@ -43,17 +43,69 @@ TEMPLATES = Path(__file__).resolve().parent / "templates"
 # 同一個檔名,兩種佈局共用——GUI 的完成對話框會叫使用者去看它。
 README_NAME = "讀我-使用說明.txt"
 
+# MICROSOFT SHIPS WEBVIEW2 TWO WAYS, AND ONLY ONE OF THEM CAN INSTALL ON THE
+# MACHINE THIS PRODUCT EXISTS FOR.
+#
+#   * Evergreen BOOTSTRAPPER — MicrosoftEdgeWebview2Setup.exe, ~2 MB, LinkId=2124703.
+#     It does not contain WebView2. Running it DOWNLOADS WebView2 from Microsoft. On
+#     an air-gapped factory PC it cannot work, and putting it in prereq\ changes
+#     nothing: the folder is carrying a downloader onto a machine that cannot
+#     download.
+#   * Evergreen STANDALONE INSTALLER — MicrosoftEdgeWebView2RuntimeInstallerX64.exe,
+#     ~130 MB, LinkId=2124701. The whole runtime, in the file, installs with no
+#     network. This is the ONLY one worth shipping in prereq\, and it is what every
+#     message in this repo must ask for.
+#
+# We used to do the opposite: name the bootstrapper as the canonical file, print its
+# URL everywhere, and — worse — RENAME whatever installer the admin picked to the
+# bootstrapper's name, so an operator who correctly downloaded the 130 MB standalone
+# had it silently turned into the thing that cannot work. The admin's file now keeps
+# its own name (the helper bat takes any .exe in prereq\).
+WEBVIEW2_INSTALLER_NAME = "MicrosoftEdgeWebView2RuntimeInstallerX64.exe"
+WEBVIEW2_DOWNLOAD = "https://go.microsoft.com/fwlink/?LinkId=2124701"
+# The bootstrapper is ~2 MB, the standalone runtime ~130 MB. Anything under this in
+# prereq\ is the downloader, not the runtime — and on the machine that needs prereq\
+# at all, that is the difference between a fixable machine and a dead end.
+WEBVIEW2_MIN_OFFLINE_BYTES = 10 * 1024 * 1024
+
 # The build succeeds, the folder is complete, and on the machine it was built FOR
 # — an air-gapped factory PC — it cannot open a window. start.bat detects that and
 # exits 5; tools\安裝WebView2.bat offers to fix it and then finds no installer to
 # run and no network to fetch one. A clean "完成" on top of that is a lie, so the
 # result carries this. Set BuildRequest.webview2_installer and it goes away.
+#
+# It used to offer ONE remedy — 「請在建置時指定」, i.e. rebuild. In a store that
+# advice is refused outright (a completed version directory is immutable), and even
+# in fat mode a rebuild costs the operator six minutes for a file they could simply
+# copy. The remedy that always works comes first: drop the .exe into prereq\.
 WEBVIEW2_MISSING_WARNING = (
     "未附 WebView2 離線安裝檔;目標機若沒有 WebView2,App 開不起來(exit 5),"
     "而且沒有網路就裝不了。"
-    "請在建置時指定 WebView2 離線安裝檔(MicrosoftEdgeWebview2Setup.exe),"
-    "它會被放進交付包的 prereq\\ 底下。"
+    "離線機器必須用「Evergreen Standalone Installer」"
+    f"({WEBVIEW2_INSTALLER_NAME},約 130 MB,它本身就含整個 runtime);"
+    "2 MB 的 MicrosoftEdgeWebview2Setup.exe 是「需要連網」的 bootstrapper,"
+    "它執行時才去微軟網站下載,放進 prereq\\ 也裝不起來。"
+    "已經建好的包不必重建:把安裝檔複製到 <交付包>\\prereq\\ 底下就行"
+    "(tools\\安裝WebView2.bat 認得那裡的任何 .exe)。"
+    f"下載:{WEBVIEW2_DOWNLOAD}"
 )
+
+
+def webview2_bootstrapper_warning(installer: Path, size_bytes: int) -> str:
+    """The admin picked a file too small to be the offline runtime.
+
+    Said at BUILD time, on the machine that can still fix it — not on the factory
+    floor, where the only thing left to do is carry the PC to a network.
+    """
+    return (
+        f"你指定的 WebView2 安裝檔只有 {size_bytes / MB:.1f} MB"
+        f"({installer.name}),這是「需要連網」的 Evergreen Bootstrapper,"
+        "它本身不含 WebView2,執行時才去微軟網站下載 —— 離線的目標機裝不起來。"
+        "離線機器要用的是「Evergreen Standalone Installer」"
+        f"({WEBVIEW2_INSTALLER_NAME},約 130 MB):{WEBVIEW2_DOWNLOAD}"
+        "。檔案已經照你指定的放進 prereq\\ 了(檔名不會被改),"
+        "但請換成 Standalone 版再交付出去。"
+    )
 Progress = Callable[[str], None]
 ShouldCancel = Callable[[], bool]
 MB = 1024 ** 2
@@ -148,11 +200,20 @@ def _matches_ignore(pattern: str, name: str, is_dir: bool, rel: str | None = Non
     exclude pattern silently excluded every file in the project. The build still
     "succeeded": it shipped a package with no application code in it.
 
+    THE SEPARATOR IS NORMALISED IN THE PATTERN, not only in the path. This is a
+    Windows product: the operator types `recordings\\*` into 額外排除, because that
+    is what every path on their screen looks like. `"/" not in pattern` was then
+    False, so the whole thing was treated as a BARE NAME, fnmatch'd against
+    「demo.mp4」, matched nothing, and the exclusion silently did nothing at all —
+    while the GUI accepted the pattern and the report said it was in force. A
+    pattern that is accepted, looks applied and does nothing is worse than one that
+    is rejected.
+
     A leading `!` is NOT handled here: negation is a decision about the whole
     pattern list (last match wins), not about one pattern, so it lives in
     ignore_reason() and this function only ever sees the pattern body.
     """
-    pattern = pattern.strip()
+    pattern = pattern.strip().replace("\\", "/")
     if not pattern:
         return False
     dir_only = pattern.endswith("/")
@@ -323,10 +384,20 @@ def scan_project(request: BuildRequest, big_file_mb: int = 10,
     if scan.excluded_summary:
         scan.notes.append(scan.excluded_summary)
 
+    # A directory whose own big file we have ALREADY named does not need a second
+    # warning. Which directory that is, is a fact we have — the file's top-level
+    # folder — and it used to be guessed with `name in warning_text`: a SUBSTRING
+    # search over the warning sentences. So a genuinely 400 MB `data\` folder went
+    # unmentioned the moment any other warning happened to contain the letters
+    # "data" (「專案裡的大檔:metadata.bin」 is enough), and it then travelled on
+    # every single update. Match the directory, not the letters.
+    named_dirs: set[str] = set()
     for name, size in sorted(big_files, key=lambda item: item[1], reverse=True)[:3]:
         scan.warnings.append(f"專案裡的大檔:{name}({size / MB:.0f} MB)——確定要交付嗎?")
+        head, slash, _tail = name.partition("/")
+        named_dirs.add(head if slash else "(根目錄)")
     for name, size in sorted(per_dir.items(), key=lambda item: item[1], reverse=True)[:2]:
-        if size > big_dir_mb * MB and not any(name in w for w in scan.warnings):
+        if size > big_dir_mb * MB and name not in named_dirs:
             scan.warnings.append(
                 f"大資料夾:{name}\\({size / MB:.0f} MB)——它會被整個複製進交付包。")
     return scan
@@ -571,9 +642,10 @@ def build(request: BuildRequest, progress: Progress = _noop,
         shutil.copy2(TEMPLATES / "start.bat", staging / "start.bat")
         _write_messages(staging)          # the Chinese start.bat `type`s; see _write_bat
 
-        has_prereq = _stage_webview2(request, staging, progress)
+        has_prereq, webview2_notes = _stage_webview2(request, staging, progress)
         if not has_prereq:
             warnings.append(WEBVIEW2_MISSING_WARNING)
+        warnings += webview2_notes
 
         manifest = build_manifest(request, request.shell_exe.name)
         (staging / "app-package.json").write_text(
@@ -621,7 +693,13 @@ def build(request: BuildRequest, progress: Progress = _noop,
         message = ("已取消建置,暫存目錄已清乾淨" if removed
                    else f"已取消建置。{note}")
         progress(message)
+        # `staging_left` is the flag a GUI can branch on. The message alone was not
+        # enough: the completion dialog rendered its own 「暫存目錄已清乾淨」 over
+        # the honest text, so the operator was told a 600 MB directory was gone
+        # while it sat in their output folder. A field cannot be overwritten by a
+        # sentence somebody hardcoded.
         return BuildResult(ok=False, cancelled=True, message=message,
+                           staging_left=None if removed else staging,
                            warnings=warnings if removed else warnings + [note],
                            duration_seconds=time.monotonic() - started)
     except (runtime_mod.RuntimeError_, imports_mod.ImportGateError,
@@ -640,6 +718,7 @@ def build(request: BuildRequest, progress: Progress = _noop,
         if not removed:
             progress(note)
         return BuildResult(ok=False, errors=[message], log_path=saved_log,
+                           staging_left=None if removed else staging,
                            warnings=warnings if removed else warnings + [note],
                            duration_seconds=time.monotonic() - started)
 
@@ -746,18 +825,26 @@ def _swap_into_place(staging: Path, final: Path) -> None:
 
 
 def _stage_webview2(request: BuildRequest, staging: Path,
-                    progress: Progress = _noop) -> bool:
+                    progress: Progress = _noop) -> tuple[bool, list[str]]:
     """Put the WebView2 offline installer where tools\\安裝WebView2.bat looks for it.
 
-    NOTHING else in this repo ever creates prereq/ — the store builder only copies
-    one if it already exists, and it never does. So the fat package has been
-    telling the user to run 安裝WebView2.bat, whose offline branch needs
-    prereq\\MicrosoftEdgeWebview2Setup.exe, on a machine with no network. Returns
-    True if the package now carries an installer.
+    Returns (the package now carries an installer, things the operator must be told).
+
+    THE FILE KEEPS THE NAME THE ADMIN GAVE US. The helper bat runs any .exe it finds
+    in prereq\\, so there is nothing to gain by renaming — and everything to lose:
+    the store builder used to rename the admin's file to
+    「MicrosoftEdgeWebview2Setup.exe」, which is the ~2 MB Evergreen BOOTSTRAPPER, a
+    downloader that cannot install anything without a network. An operator who
+    correctly fetched the 130 MB standalone runtime got it silently relabelled as the
+    one thing that cannot work on the air-gapped machine this feature exists for.
+
+    And if the file they picked really IS the 2 MB bootstrapper, we say so now — on
+    the build machine, where a 130 MB download is thirty seconds — instead of on the
+    factory floor, where it is a dead end.
     """
     installer = getattr(request, "webview2_installer", None)
     if installer is None:
-        return False
+        return False, []
     source = Path(installer)
     if not source.is_file():
         # Loud, at build time, on the machine that can still fix it — never a
@@ -765,9 +852,15 @@ def _stage_webview2(request: BuildRequest, staging: Path,
         raise runtime_mod.RuntimeError_(f"找不到指定的 WebView2 離線安裝檔:{source}")
     prereq = staging / "prereq"
     prereq.mkdir(exist_ok=True)
-    shutil.copy2(source, prereq / source.name)
+    shutil.copy2(source, prereq / source.name)   # its own name, never renamed
     progress(f"附上 WebView2 離線安裝檔:prereq\\{source.name}")
-    return True
+
+    notes: list[str] = []
+    size = source.stat().st_size
+    if size < WEBVIEW2_MIN_OFFLINE_BYTES:
+        notes.append(webview2_bootstrapper_warning(source, size))
+        progress("注意:" + notes[-1])
+    return True, notes
 
 
 def _write_readme(staging: Path, manifest: dict, has_prereq: bool = False) -> None:
@@ -776,12 +869,18 @@ def _write_readme(staging: Path, manifest: dict, has_prereq: bool = False) -> No
                  if not port else
                  f"* 若 {port} 埠被其他程式占用,啟動程式會自動改用其他可用埠,不需手動處理。")
     # 這一段曾經無條件叫離線的使用者「向提供者索取 prereq\ 資料夾」——而 prereq\
-    # 從來沒有人產生過。現在它只講這個交付包裡真的有的東西。
+    # 從來沒有人產生過。現在它只講這個交付包裡真的有的東西,而且講對要哪一支安裝檔:
+    # 2 MB 的 Setup.exe 是需要連網的 bootstrapper,離線機器放進 prereq\ 也裝不起來。
     webview2_line = (
         "離線安裝檔已附在這個資料夾的 prereq\\ 底下,不需要網路。"
         if has_prereq else
-        "這個交付包「沒有」附離線安裝檔:安裝 WebView2 需要網路。若目標機不能連網,\n"
-        "請回頭向提供者索取 MicrosoftEdgeWebview2Setup.exe,放進這個資料夾的 prereq\\ 底下。")
+        "這個交付包「沒有」附離線安裝檔。若目標機不能連網,請向提供者索取\n"
+        f"「Evergreen Standalone Installer」({WEBVIEW2_INSTALLER_NAME},約 130 MB,\n"
+        "檔案本身就含整個 runtime),放進這個資料夾的 prereq\\ 底下,再執行\n"
+        "tools\\安裝WebView2.bat(它認得 prereq\\ 裡的任何 .exe,檔名不必改)。\n"
+        "注意:2 MB 的 MicrosoftEdgeWebview2Setup.exe 是「需要連網」的 bootstrapper,\n"
+        "它執行時才去微軟網站下載 WebView2,離線機器放進 prereq\\ 也裝不起來。\n"
+        f"下載:{WEBVIEW2_DOWNLOAD}")
     # 檔名與 GUI 完成對話框講的那個檔名必須是同一個。它們一度不同(對話框說
     # 「讀我-使用說明.txt」,資料夾裡卻只有 README.txt),於是管理員在資料夾裡
     # 找不到對話框叫他看的東西。步驟也只寫一次:曾經一份說兩步、一份說三步,
@@ -837,6 +936,12 @@ def _write_webview2_helper(staging: Path) -> None:
     both take `/silent /install`, so an operator who did the right thing with the
     right file got "沒有附安裝檔". Take whatever .exe is in prereq\\.
 
+    And when the install FAILS, size is evidence. The bootstrapper is ~2 MB and the
+    standalone runtime ~130 MB, so a sub-10 MB file in prereq\\ on a machine that
+    just failed to install is not a mystery to be escalated — it is a downloader on
+    a machine with no network, and the bat says so in one sentence instead of
+    sending the operator back to the supplier for a file they already have.
+
     No `goto`, no `:label` — see _write_bat. The control flow here is if/else and
     a captured RC, which needs neither.
     """
@@ -864,6 +969,14 @@ if not defined WV2SETUP (
   exit /b 1
 )
 
+rem How big is it? The bootstrapper is ~2 MB and does not contain WebView2 at all --
+rem it downloads it. The standalone runtime is ~130 MB. On the offline machine this
+rem package exists for, that number is the whole diagnosis, so read it BEFORE the
+rem install: %SZ% inside the if-block below is expanded when the block is parsed.
+set "SZ=0"
+for %%A in ("%WV2SETUP%") do set "SZ=%%~zA"
+if not defined SZ set "SZ=0"
+
 type "messages\webview2-installing.txt" 2>nul
 echo   %WV2SETUP%
 "%WV2SETUP%" /silent /install
@@ -874,13 +987,14 @@ set "RC=%errorlevel%"
 if not "%RC%"=="0" (
   echo [ERROR] exit code %RC%
   type "messages\webview2-failed.txt" 2>nul
+  if %SZ% LSS {min_bytes} type "messages\webview2-bootstrapper.txt" 2>nul
 ) else (
   type "messages\webview2-done.txt" 2>nul
 )
 popd
 pause
 exit /b %RC%
-""")
+""".replace("{min_bytes}", str(WEBVIEW2_MIN_OFFLINE_BYTES)))
 
 
 def _write_bat(path: Path, text: str) -> None:
@@ -946,8 +1060,11 @@ MESSAGES: dict[str, str] = {
         "  請先執行:tools\\安裝WebView2.bat\n"
         "  (可用一般使用者權限安裝,不需要系統管理員。裝完再跑一次 start.bat。)\n"
         "\n"
-        "  沒有網路的話,安裝檔必須事先附在 prereq\\ 底下;若 prereq\\ 是空的,\n"
-        "  請向提供者索取 MicrosoftEdgeWebview2Setup.exe。\n",
+        "  沒有網路的話,安裝檔必須事先放在 prereq\\ 底下;若 prereq\\ 是空的,請向提供者\n"
+        f"  索取「Evergreen Standalone Installer」({WEBVIEW2_INSTALLER_NAME},\n"
+        "  約 130 MB),放進 prereq\\ 底下(檔名不必改),再執行一次上面那個檔案。\n"
+        "  2 MB 的 MicrosoftEdgeWebview2Setup.exe 是「需要連網」的 bootstrapper,\n"
+        "  它執行時才去微軟網站下載,離線機器放進 prereq\\ 也裝不起來。\n",
     "start-failed.txt":
         "啟動失敗。詳細記錄在 data\\logs\\ 資料夾裡:\n"
         "    launcher-*.log    啟動流程\n"
@@ -955,15 +1072,34 @@ MESSAGES: dict[str, str] = {
     "webview2-none.txt":
         "這個交付包裡沒有附安裝檔(prereq\\ 是空的或不存在)。請用以下任一方式:\n"
         "\n"
-        "  1. 有網路的話,開啟這個網址下載「Evergreen Bootstrapper」並執行:\n"
-        "     https://go.microsoft.com/fwlink/p/?LinkId=2124703\n"
-        "  2. 沒網路的話,請向提供者索取 MicrosoftEdgeWebview2Setup.exe,\n"
-        "     放進這個資料夾的 prereq\\ 底下,再執行一次本檔案。\n"
+        "  1. 這台電腦有網路 → 開啟下面的網址下載安裝檔並執行它:\n"
+        f"     {WEBVIEW2_DOWNLOAD}\n"
+        "  2. 這台電腦沒有網路 → 請在「另一台有網路的電腦」上開啟同一個網址,下載\n"
+        f"     「Evergreen Standalone Installer」({WEBVIEW2_INSTALLER_NAME},\n"
+        "     約 130 MB,檔案本身就含整個 WebView2),複製到這個資料夾的 prereq\\ 底下\n"
+        "     (檔名不必改),再執行一次本檔案。\n"
         "\n"
-        "它可以用一般使用者權限安裝,不需要系統管理員。\n",
+        "請「不要」拿 2 MB 的 MicrosoftEdgeWebview2Setup.exe:那是需要連網的\n"
+        "bootstrapper,它本身不含 WebView2,執行時才去微軟網站下載,\n"
+        "放進 prereq\\ 也一樣裝不起來。\n"
+        "\n"
+        "WebView2 可以用一般使用者權限安裝,不需要系統管理員。\n",
     "webview2-installing.txt": "正在安裝 WebView2 Runtime(不需系統管理員權限)…\n",
     "webview2-done.txt": "安裝完成。請再執行一次 start.bat。\n",
     "webview2-failed.txt": "安裝失敗。請把上面的訊息回報給提供者。\n",
+    # Printed ONLY when the install failed AND the file in prereq\ is under 10 MB.
+    # That is not a coincidence to be escalated to the supplier: it is the ~2 MB
+    # bootstrapper, on a machine that cannot reach the internet it wants to use.
+    "webview2-bootstrapper.txt":
+        "prereq\\ 裡的這支安裝檔小於 10 MB。\n"
+        "你手上這支是「需要連網」的 Evergreen Bootstrapper(約 2 MB):它本身不含\n"
+        "WebView2,執行時才去微軟網站下載,所以離線機器裝不起來,放進 prereq\\ 也沒用。\n"
+        "\n"
+        "離線機器要用的是「Evergreen Standalone Installer」\n"
+        f"({WEBVIEW2_INSTALLER_NAME},約 130 MB,檔案本身就含整個 runtime):\n"
+        f"  {WEBVIEW2_DOWNLOAD}\n"
+        "在有網路的電腦下載好,複製到這個資料夾的 prereq\\ 底下(檔名不必改),\n"
+        "再執行一次本檔案。\n",
 }
 
 

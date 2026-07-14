@@ -127,7 +127,9 @@ def test_every_write_bumps_generation_and_verifies(store):
 def test_corrupt_state_is_a_loud_error(store):
     store.initialize("demo", "v1")
     store.path.write_text("{ half json", encoding="utf-8")
-    with pytest.raises(state.StateError, match="corrupt"):
+    # The message is Traditional Chinese now, and names the file — see
+    # test_a_broken_state_file_names_the_file_and_speaks_the_operators_language.
+    with pytest.raises(state.StateError, match="毀損"):
         store.load()
 
 
@@ -652,12 +654,24 @@ def test_rollback_to_current_is_a_no_op(tree):
 # ── launcher exit-code contract ──────────────────────────────────────────────
 
 class FakeLauncher:
-    """`healthy` writes the marker the way launch.py does once its WINDOW has stood
-    for ~12s. `revoke` deletes it again on the way out — which is exactly what the
-    real launcher's _revoke_marker() does when the app it was hosting dies."""
+    """`healthy` writes the marker the way launch.py does once its WINDOW is up.
+
+    The marker's BODY is the whole contract (see bootstrap's module docstring):
+
+      session=True   the user pressed Start, so the app was really asked to run and
+                     the marker carries the app's URL. This — and only this — is
+                     what may promote a candidate to last-known-good.
+      session=False  the user opened the window, looked at the portal, and closed it
+                     without pressing Start. The marker says "no-session": Streamlit's
+                     server ran, the app's own script did not. Nothing to promote,
+                     nothing to blame.
+
+    `revoke` deletes it again on the way out — exactly what the real launcher's
+    _revoke_marker() does when the app it was hosting dies.
+    """
 
     def __init__(self, env, *, healthy: bool, exit_code: int = 0, polls: int = 1,
-                 revoke: bool = False):
+                 revoke: bool = False, session: bool = True):
         self.pid = 4242
         self.returncode = None
         self._exit_code = exit_code
@@ -666,7 +680,9 @@ class FakeLauncher:
         self.marker = Path(env["CIM_HEALTHY_MARKER"])
         if healthy:
             self.marker.parent.mkdir(parents=True, exist_ok=True)
-            self.marker.write_text("http://127.0.0.1:9999", encoding="utf-8")
+            self.marker.write_text(
+                "http://127.0.0.1:9999" if session else bootstrap.MARKER_NO_SESSION,
+                encoding="utf-8")
 
     def poll(self):
         if self._polls_left > 0:
@@ -838,6 +854,87 @@ def test_a_clean_exit_with_the_marker_still_there_commits_the_candidate(tree, mo
     assert final.current == "v2" and final.failed_versions == []
 
 
+# ── THE BLOCKER: "I opened it, looked at it, and closed it" is not a proven version ──
+#
+# Streamlit does not execute the app script until a session opens, and a session opens
+# only when the user presses Start in the portal. So the most ordinary thing a user can
+# do — open the app, glance at the portal, close the window — produced exit 0 + a marker,
+# and bootstrap committed a version that had NEVER EXECUTED A LINE as last-known-good.
+# If that build was broken, the next launch died and the version we "rolled back" to was
+# the same broken build. The automatic-rollback promise was dead on the daily path.
+#
+# The fix: the marker has a BODY, and only "the app was actually asked to run" promotes.
+
+def test_a_version_the_user_never_pressed_start_on_is_not_committed_as_last_known_good(
+        tree, monkeypatch):
+    """THE reproduction, at the bootstrap end. Window opens, the user never presses
+    Start, they close it: exit 0 with a marker that says "no-session".
+
+    It must NOT become last_known_good — it has proved nothing.
+    It must NOT be failed either — the user simply did not use it. It stays the
+    candidate and is tried again next launch."""
+    arm_candidate(tree)                                # v1 = LKG, v2 = the candidate
+    monkeypatch.setattr(bootstrap.time, "sleep", lambda _s: None)
+    notified = []
+    popen = popen_factory([dict(healthy=True, session=False, exit_code=bootstrap.EXIT_OK)])
+
+    code = bootstrap.start_app(paths_of(tree), [], notify=lambda *a: notified.append(a),
+                               popen=popen)
+
+    assert code == 0
+    assert len(popen.calls) == 1                       # nothing was rolled back or relaunched
+
+    final = store_of(tree).load()
+    assert final.last_known_good == "v1", \
+        "a version whose app never ran was stamped last-known-good — the BLOCKER"
+    assert final.candidate == "v2"                     # still on trial…
+    assert final.current == "v2"
+    assert final.failed_versions == []                 # …but NOT blamed: they just did not use it
+    assert notified == []                              # and no false 「已恢復前一版本」
+
+
+def test_never_pressing_start_is_not_an_app_failure_and_never_rolls_back(tree, monkeypatch):
+    """The trap next door: having stopped committing on "no-session", it would be very
+    easy to let it fall through to the exit-0-with-no-marker branch, which is treated as
+    EXIT_APP_FAILURE. That would roll the machine back because the user did not feel like
+    using the app today. Neither promote nor blame: touch nothing."""
+    arm_candidate(tree)
+    monkeypatch.setattr(bootstrap.time, "sleep", lambda _s: None)
+    popen = popen_factory([dict(healthy=True, session=False, exit_code=bootstrap.EXIT_OK)])
+
+    outcome = bootstrap.run_version(
+        paths_of(tree), store_of(tree), runtime_store.RuntimeStore(tree / "deps"),
+        "v2", [], is_candidate=True, notify=lambda *a: None, popen=popen)
+
+    assert outcome.code == bootstrap.EXIT_OK           # NOT EXIT_APP_FAILURE
+    assert outcome.marker_at_exit is True              # a window did come up…
+    assert outcome.app_ran is False                    # …but the app was never asked to run
+    assert store_of(tree).load().last_known_good == "v1"
+
+
+def test_a_version_the_user_did_press_start_on_is_still_committed(tree, monkeypatch):
+    """The other side of the line, or the safety net has simply been disabled: the user
+    pressed Start, the app ran, they closed the window. THAT proves a version."""
+    arm_candidate(tree)
+    monkeypatch.setattr(bootstrap.time, "sleep", lambda _s: None)
+    popen = popen_factory([dict(healthy=True, session=True, exit_code=bootstrap.EXIT_OK)])
+
+    assert bootstrap.start_app(paths_of(tree), [], notify=lambda *a: None,
+                               popen=popen) == 0
+
+    final = store_of(tree).load()
+    assert final.last_known_good == "v2" and final.candidate is None
+
+
+def test_the_marker_body_bootstrap_reads_is_the_one_the_launcher_writes(tree):
+    """Two files, delivered together, that must never disagree about one string. If the
+    launcher writes "no-session" and bootstrap compares against "nosession", every
+    version that was merely looked at gets committed again and the BLOCKER is back."""
+    launch_py = (Path(__file__).resolve().parents[1] / "src" / "provision_builder" /
+                 "streamlit_desktop" / "templates" / "launch.py").read_text(encoding="utf-8")
+    assert f'MARKER_NO_SESSION = "{bootstrap.MARKER_NO_SESSION}"' in launch_py
+
+
 def test_a_clean_exit_that_never_showed_a_marker_is_still_a_failure(tree, monkeypatch):
     """Exit 0 with no marker: nothing ever came up. A 0 here is a lie, and committing
     on it would make a version that cannot even open a window last-known-good."""
@@ -902,6 +999,227 @@ def test_an_unknown_exit_from_a_window_that_never_came_up_is_still_the_versions_
     assert len(popen.calls) == 2                       # rolled back and relaunched
     final = store_of(tree).load()
     assert final.current == "v1" and final.is_failed("v2")
+
+
+# ── a version nobody will roll back for you must at least SAY so ─────────────
+
+def test_a_broken_non_candidate_tells_the_operator_which_button_to_press(
+        tree, monkeypatch, capsys):
+    """Automatic rollback only fires for a CANDIDATE. A version that is not on trial —
+    most commonly the FIRST BOOT of a fresh delivery, whose state.json has
+    candidate=None — fails and nobody comes. We used to return the code in silence, so
+    the operator sat in front of a window that would not open while 讀我 promised them
+    an automatic recovery that was never going to happen."""
+    monkeypatch.setattr(bootstrap.time, "sleep", lambda _s: None)
+    make_version(tree, "v2", body="two")
+    # exactly what store_builder._write_target_state() hands a factory machine:
+    # current=v2, previous=v1, candidate=None, last_known_good=None.
+    store_of(tree).mutate(lambda s: state.dataclasses.replace(
+        s, current="v2", previous="v1", candidate=None, last_known_good=None))
+    popen = popen_factory([dict(healthy=False, exit_code=bootstrap.EXIT_APP_FAILURE)])
+
+    code = bootstrap.start_app(paths_of(tree), [], notify=lambda *a: None, popen=popen)
+
+    assert code == bootstrap.EXIT_APP_FAILURE
+    assert len(popen.calls) == 1                   # no automatic rollback happened…
+    err = capsys.readouterr().err
+    assert "這一版壞了" in err                      # …so SAY so, and say what to do
+    assert "tools\\admin.bat" in err and "[2] 退回上一版" in err
+    assert "--rollback" in err                     # the CLI route, for a remote operator
+    assert "v1" in err                             # and name the version it would land on
+    err.encode("cp950")                            # a zh-TW console must be able to print it
+
+
+def test_a_first_boot_with_nowhere_to_roll_back_to_says_how_to_get_the_line_running(
+        tree, monkeypatch, capsys):
+    """THE dead end, and it is now reachable: store_builder ships state.json with
+    candidate=current, so a one-version delivery IS on trial at its first boot — on a
+    machine that has no previous version by definition. When that boot fails there is
+    nothing to roll back to.
+
+    「啟動失敗,而且沒有任何可以退回的版本」 is honest and useless: it leaves a line
+    operator in front of a dead machine with no next step. There IS one — put a working
+    version on from the USB stick — and it is the only thing that gets the line running
+    again."""
+    monkeypatch.setattr(bootstrap.time, "sleep", lambda _s: None)
+    # exactly a fresh single-version delivery: on trial, and no previous.
+    store_of(tree).mutate(lambda s: state.dataclasses.replace(
+        s, candidate="v1", previous=None, last_known_good=None))
+    popen = popen_factory([dict(healthy=False, exit_code=bootstrap.EXIT_APP_FAILURE)])
+
+    code = bootstrap.start_app(paths_of(tree), [], notify=lambda *a: None, popen=popen)
+
+    assert code == bootstrap.EXIT_APP_FAILURE
+    assert len(popen.calls) == 1                    # there was nothing to relaunch
+    err = capsys.readouterr().err
+    assert "沒有任何可以退回的版本" in err            # what failed…
+    assert "tools\\admin.bat" in err and "[3] 套用已複製進來的更新包" in err   # …and what to DO
+    assert "--install" in err                      # the CLI route
+    err.encode("cp950")
+
+
+def test_a_non_candidate_killed_from_task_manager_is_not_called_a_broken_version(
+        tree, monkeypatch, capsys):
+    """The trap in the fix above. 'Not a candidate' and 'exit code 1' are both true when
+    a user End-Tasks a perfectly good, already-proven version — and telling them
+    「這一版壞了。請退回上一版」 for that would talk them into downgrading a working
+    machine. An unknown code after a window that came up is an abnormal session, whoever
+    the version is."""
+    monkeypatch.setattr(bootstrap.time, "sleep", lambda _s: None)
+    store_of(tree).mutate(state.commit_candidate)     # v1 is proven: NOT a candidate
+    popen = popen_factory([dict(healthy=True, exit_code=1, revoke=False)])
+
+    code = bootstrap.start_app(paths_of(tree), [], notify=lambda *a: None, popen=popen)
+
+    assert code == 1
+    out, err = capsys.readouterr()
+    assert "這一版壞了" not in err                    # not blamed…
+    assert "非正常結束" in out                        # …reported honestly instead
+    assert store_of(tree).load().failed_versions == []
+
+
+# ── one app, one instance; and logs that do not grow forever ─────────────────
+
+def test_a_second_start_does_not_launch_a_second_instance(tree, monkeypatch, capsys):
+    """Double-clicking start.bat twice started a second EVERYTHING: a second launcher,
+    a second Streamlit on a second port, two processes writing one state.json. The
+    store lock did not stop it — locks.acquire() WAITS 30s and then proceeds anyway.
+
+    The second copy must say「已經在執行中」and leave, WITHOUT spawning a launcher."""
+    monkeypatch.setattr(bootstrap.time, "sleep", lambda _s: None)
+    paths = paths_of(tree)
+    paths.ensure_data_dirs()
+    held = locks.acquire_single_instance(paths.data_dir)   # a live first instance
+    try:
+        popen = popen_factory([])                          # …must never be called
+        code = bootstrap.start_app(paths, [], notify=lambda *a: None, popen=popen)
+    finally:
+        held.release()
+
+    assert code == bootstrap.EXIT_OK                       # NOT a failure
+    assert popen.calls == [], "a second launcher was spawned"
+    out = capsys.readouterr().out
+    assert "已經在執行中" in out
+    out.encode("cp950")
+
+
+def test_a_second_start_never_marks_the_version_failed_or_applies_the_update(
+        tree, monkeypatch):
+    """Two traps next door.
+
+    Exit 0 is not decoration: any non-zero code here would be read by the rest of this
+    module as a failed launch — blame the version, mark it failed, roll the machine
+    back — because a user double-clicked an icon.
+
+    And the second copy must bail BEFORE promote_if_pending: applying a staged update
+    behind the back of the instance that is already running would swap the version out
+    from under a live session."""
+    arm_candidate(tree)                                    # v1 running, v2 staged (pending)
+    monkeypatch.setattr(bootstrap.time, "sleep", lambda _s: None)
+    paths = paths_of(tree)
+    paths.ensure_data_dirs()
+    held = locks.acquire_single_instance(paths.data_dir)
+    try:
+        code = bootstrap.start_app(paths, [], notify=lambda *a: None,
+                                   popen=popen_factory([]))
+    finally:
+        held.release()
+
+    assert code == bootstrap.EXIT_OK
+    final = store_of(tree).load()
+    assert final.failed_versions == []                     # nothing blamed
+    assert final.current == "v1"                           # nothing rolled back…
+    assert final.pending == "v2"                           # …and the update NOT applied
+    assert final.last_known_good == "v1"                   # nothing promoted either
+
+
+def test_the_instance_lock_is_released_so_the_next_launch_can_start(tree, monkeypatch):
+    """Held past the session, the app could never be started again — a far worse bug
+    than the one we are fixing. The lock must go back on the way out, including when
+    the launch raised."""
+    monkeypatch.setattr(bootstrap.time, "sleep", lambda _s: None)
+    paths = paths_of(tree)
+    bootstrap.start_app(paths, [], notify=lambda *a: None,
+                        popen=popen_factory([dict(healthy=True)]))
+
+    second = locks.acquire_single_instance(paths.data_dir)  # would raise if still held
+    second.release()
+
+
+def test_the_live_sessions_log_is_never_rotated_away(tree, monkeypatch):
+    """Retention must not delete the log of the session that is starting RIGHT NOW (nor
+    one still running). gc keeps anything under an hour old, whatever the count."""
+    logs = tree / "apps" / APP / "data" / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    for i in range(gc_mod.LOG_KEEP_RECENT + 8):            # plenty of old launcher logs
+        write_log(logs, f"launcher-old-{i:02d}.log", kb=8, age_seconds=90 * 86400 + i)
+    live = logs / "launcher-live.log"                      # …and one from right now
+    live.write_bytes(b"x" * 1024)
+
+    bootstrap._rotate_logs(paths_of(tree))
+
+    assert live.exists(), "the running session's log was deleted underneath it"
+    survivors = sorted(p.name for p in logs.glob("launcher-*.log"))
+    assert len(survivors) == gc_mod.LOG_KEEP_RECENT + 1    # the newest 10 + the live one
+    assert "launcher-live.log" in survivors
+
+
+def test_every_launch_rotates_the_logs_that_quietly_filled_the_disk(tree):
+    """Nothing ever deleted a log: launcher-*, streamlit-* and bootstrap-* piled up for
+    months, and on a machine that has been running since spring that is a real part of
+    what fills the disk. Each family keeps its newest few; the rest go."""
+    logs = tree / "apps" / APP / "data" / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    for family in ("launcher", "streamlit", "bootstrap"):
+        for i in range(gc_mod.LOG_KEEP_RECENT + 5):
+            write_log(logs, f"{family}-{i:02d}.log", kb=64, age_seconds=90 * 86400 + i)
+    before = len(list(logs.glob("*.log")))
+
+    bootstrap._rotate_logs(paths_of(tree))
+
+    remaining = list(logs.glob("*.log"))
+    assert len(remaining) < before, "logs were never rotated"
+    for family in ("launcher", "streamlit", "bootstrap"):
+        kept = [p for p in remaining if p.name.startswith(f"{family}-")]
+        assert len(kept) == gc_mod.LOG_KEEP_RECENT, family
+
+
+def test_rotation_is_wired_into_the_path_every_single_launch_takes(tree, monkeypatch):
+    """A rotate_logs nobody calls is a fix nobody gets. It belongs where the logs are
+    CREATED — _setup_logging, which runs on every launch — not only in a GC the
+    operator has to remember to run."""
+    called = []
+    monkeypatch.setattr(bootstrap, "_rotate_logs", lambda p: called.append(p))
+    monkeypatch.setattr(bootstrap.logging, "basicConfig", lambda **_kw: None)
+
+    bootstrap._setup_logging(paths_of(tree))
+
+    assert called, "_setup_logging does not rotate: the logs grow forever"
+
+
+def test_log_rotation_never_costs_the_user_their_app(tree, monkeypatch):
+    """Housekeeping is not worth a launch. An old deployment whose gc.py predates
+    rotate_logs, a locked file, a permission error — none of them may stop the app
+    from starting."""
+    monkeypatch.setattr(bootstrap.gc_mod, "rotate_logs",
+                        lambda *_a, **_k: (_ for _ in ()).throw(OSError("access denied")))
+    bootstrap._rotate_logs(paths_of(tree))                 # must not raise
+
+    monkeypatch.setattr(bootstrap.time, "sleep", lambda _s: None)
+    assert bootstrap.start_app(paths_of(tree), [], notify=lambda *a: None,
+                               popen=popen_factory([dict(healthy=True)])) == 0
+
+
+def test_bootstrap_imports_the_stores_gc_not_pythons_garbage_collector():
+    """`gc` is a BUILT-IN module name and BuiltinImporter beats sys.path, so a plain
+    `import gc` in the shipped loose-file layout (start.bat runs `python bootstrap\\
+    bootstrap.py`, so __package__ is empty) hands back Python's garbage collector —
+    while every test, which imports bootstrap as a package, sees the real gc.py. That
+    is green in CI and dead in the factory. Pin the module we actually got."""
+    assert hasattr(bootstrap.gc_mod, "rotate_logs")
+    assert hasattr(bootstrap.gc_mod, "LOG_KEEP_RECENT")
+    assert not hasattr(bootstrap.gc_mod, "collect"),  \
+        "this is Python's built-in gc, not the store's gc.py"
 
 
 def test_unknown_failure_classification():
@@ -1669,3 +1987,339 @@ def test_held_helper_does_not_deadlock_on_itself(tmp_path):
     with locks.held(lock, timeout=1):
         assert (tmp_path / "l.lock").is_file()
     assert not (tmp_path / "l.lock").exists()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# S9, round 6: 現場 IT,工廠機 C 槽快滿,要清出空間
+#
+# Four things made GC useless to that person:
+#   1. it could not SEE what actually fills a long-running machine — apps/<app>/
+#      data/logs (never rotated: one launcher-*.log + one streamlit-*.log +
+#      one bootstrap-*.log per launch, forever) and data/cache (pycache)
+#   2. an already-clean store answered 「沒有可回收的項目」 and stopped — true, and
+#      useless to somebody whose C: drive is full: it never said where the space
+#      went, and never once called shutil.disk_usage()
+#   3. one unreadable file made an entire 450 MB runtime report as 「0 MB」
+#   4. double-clicking start.bat started a SECOND app: the lock waited 30 seconds
+#      and then proceeded anyway
+# ═════════════════════════════════════════════════════════════════════════════
+
+def write_log(log_dir: Path, name: str, *, kb: int = 100, age_seconds: float = 0.0) -> Path:
+    """A log file with a real age — retention is decided on mtime, not on the name."""
+    import time as _time
+    log_dir.mkdir(parents=True, exist_ok=True)
+    path = log_dir / name
+    path.write_bytes(b"x" * (kb * 1024))
+    stamp = _time.time() - age_seconds
+    os.utime(path, (stamp, stamp))
+    return path
+
+
+def fake_disk(monkeypatch, *, total_gb: float, free_mb: float) -> None:
+    """A nearly-full C:. shutil.disk_usage() had ZERO uses in the whole repo."""
+    import types
+    total = int(total_gb * 1024 ** 3)
+    free = int(free_mb * 1024 ** 2)
+    monkeypatch.setattr(gc_mod.shutil, "disk_usage",
+                        lambda _p: types.SimpleNamespace(
+                            total=total, used=total - free, free=free))
+
+
+# ── (3) an unreadable file does not make a 450 MB runtime report as 0 MB ─────
+
+def test_an_unreadable_file_does_not_make_a_450_mb_runtime_report_as_zero_mb(
+        tree, monkeypatch):
+    """GcPlan._mb() wrapped the WHOLE directory walk in one try/except and returned
+    0.0 on any OSError. One file held open by a running App (or antivirus, or
+    Explorer) and a 450 MB runtime was reported as 「0 MB」 — so the operator, who
+    came to reclaim exactly that 450 MB, was told there was nothing to gain."""
+    orphan = build_runtime(tree, FP2)
+    (orphan / "big.bin").write_bytes(b"0" * (2 * 1024 * 1024))   # the 450 MB, in miniature
+    (orphan / "locked.bin").write_bytes(b"0" * (1024 * 1024))    # the file the App has open
+
+    real_size = gc_mod._entry_size
+
+    def in_use(entry):
+        if entry.name == "locked.bin":
+            raise PermissionError(32, "the file is in use by another process")
+        return real_size(entry)
+
+    monkeypatch.setattr(gc_mod, "_entry_size", in_use)
+
+    plan = gc_mod.collect_plan(tree)
+    measured = plan.measure(orphan)
+
+    assert measured.mb > 1.5               # NOT 0.0 — the whole point
+    assert measured.unreadable == 1        # …and we know exactly what we missed
+    assert measured.partial and "至少" in measured.text()
+    assert plan.reclaimable_mb() > 1.5     # the forecast the operator acts on
+    assert plan.measurement_is_partial() and plan.unmeasured_count == 1
+    [(path, why)] = plan.unmeasured
+    assert path.endswith("locked.bin") and "使用中" in why
+
+    text = plan.summary()
+    assert "至少" in text and "量不到大小" in text      # said out loud, not swallowed
+    assert f"可刪 runtime:{FP2}(0 MB)" not in text     # the lie this test kills
+    text.encode("cp950")
+
+
+# ── (1) GC can finally see what actually fills the disk ──────────────────────
+
+def test_gc_offers_the_unrotated_logs_and_cache_that_actually_filled_the_disk(tree):
+    """Every launch writes launcher-*.log + streamlit-*.log + bootstrap-*.log and
+    NOTHING has ever rotated one; PYTHONPYCACHEPREFIX points every .pyc the app
+    compiles at data/cache/pycache. After months, THAT is the disk — and
+    collect_plan() looked only at versions, runtimes, shells and leases."""
+    logs = tree / "apps" / APP / "data" / "logs"
+    month = 30 * 86400
+    for i in range(25):                                     # 25 launches' worth
+        write_log(logs, f"launcher-2026-{i:02d}.log", kb=100,
+                  age_seconds=month + (25 - i) * 3600)
+        write_log(logs, f"streamlit-2026-{i:02d}-8501.log", kb=200,
+                  age_seconds=month + (25 - i) * 3600)
+    cache = tree / "apps" / APP / "data" / "cache" / "pycache"
+    cache.mkdir(parents=True)
+    (cache / "app.cpython-311.pyc").write_bytes(b"0" * (512 * 1024))
+
+    plan = gc_mod.collect_plan(tree)
+
+    assert not plan.is_empty()                              # …it used to be
+    [log_group] = plan.delete_logs
+    assert log_group.count == 2 * (25 - gc_mod.LOG_KEEP_RECENT)   # newest 10 per family stay
+    assert plan.logs_mb() > 1 and plan.cache_mb() > 0.4
+    # …and they are reported SEPARATELY from versions/runtimes, which is the point:
+    # the operator has to see WHERE the disk went, not just a lump sum.
+    kinds = {consumer.kind for consumer in plan.consumers}
+    assert {"logs", "cache", "versions", "runtime"} <= kinds
+    text = plan.summary()
+    assert "可刪舊記錄檔" in text and "可刪快取" in text
+    text.encode("cp950")
+
+    before = plan.store_mb()
+    done = gc_mod.run_gc(tree, apply=True, log=lambda *_a: None)
+
+    survivors = sorted(path.name for path in logs.iterdir())
+    assert len(survivors) == 2 * gc_mod.LOG_KEEP_RECENT     # the newest of each family
+    assert "launcher-2026-24.log" in survivors              # the newest launch
+    assert "launcher-2026-00.log" not in survivors          # …and the oldest is gone
+    assert not any(cache.parent.iterdir())                  # pycache is regenerable: gone
+    assert (tree / "apps" / APP / "versions" / "v1").is_dir()   # current: untouched
+
+    # The REPORT is measured from the tree that exists NOW. Printing the scan's
+    # breakdown (「記錄檔 33 MB,其中 31 MB 可以回收」) after the reclaim would be the
+    # same past-tense forecast that once had operators looking for space that had
+    # never been freed.
+    assert done.store_mb() < before
+    assert all(c.reclaimable_mb == 0 for c in done.consumers)
+    report = done.report()
+    assert "實際回收合計" in report
+    assert "可回收合計" not in report and "可刪" not in report
+    report.encode("cp950")
+
+
+def test_the_log_of_a_session_that_is_running_right_now_is_never_reclaimed(tree):
+    """A machine can be launched a hundred times in one day. 「keep the newest N」
+    cannot be the only rule, or the log of the session that is being written right
+    now — the one the operator is on the phone about — becomes reclaimable."""
+    logs = tree / "apps" / APP / "data" / "logs"
+    for i in range(20):
+        write_log(logs, f"launcher-old-{i:02d}.log", age_seconds=30 * 86400 + i)
+    live = write_log(logs, "launcher-now.log", age_seconds=0.0)     # this session
+
+    doomed = gc_mod.stale_logs(logs)
+    assert live not in doomed
+    assert doomed and all(path.name.startswith("launcher-old-") for path in doomed)
+
+    gc_mod.rotate_logs(logs)
+    assert live.is_file()
+
+
+def test_rotate_logs_is_the_retention_the_launcher_never_had(tree):
+    """The GC-side reclaim is a mop. THIS is the tap: one call on every launch,
+    wherever the logs are created (bootstrap.py, right after ensure_data_dirs())."""
+    logs = tree / "apps" / APP / "data" / "logs"
+    for i in range(30):
+        write_log(logs, f"bootstrap-2026-{i:02d}.log", kb=50,
+                  age_seconds=30 * 86400 + (30 - i) * 60)
+    assert len(list(logs.iterdir())) == 30
+
+    removed = gc_mod.rotate_logs(logs)
+
+    assert len(removed) == 30 - gc_mod.LOG_KEEP_RECENT
+    kept = sorted(path.name for path in logs.iterdir())
+    assert len(kept) == gc_mod.LOG_KEEP_RECENT
+    assert "bootstrap-2026-29.log" in kept        # the newest survives
+    assert "bootstrap-2026-00.log" not in kept    # the oldest does not
+    # …and it is safe on a machine that has never been launched (a fresh install).
+    assert gc_mod.rotate_logs(tree / "apps" / APP / "data" / "nope") == []
+
+
+# ── (2) an empty plan on a full disk still tells the operator where it went ──
+
+def test_an_empty_plan_on_a_full_disk_still_says_where_the_space_went(
+        tree, monkeypatch, capsys):
+    """「沒有可回收的項目」 is a true answer to a question the operator did not ask.
+    They asked where their C: drive went. GC never called shutil.disk_usage() — zero
+    uses in the entire repo — so it could not even tell them whether the disk was
+    full, let alone that this tree is not what filled it."""
+    (tree / "deps" / "runtimes" / FP1 / "big.bin").write_bytes(b"0" * (3 * 1024 * 1024))
+    fake_disk(monkeypatch, total_gb=120, free_mb=800)       # C: is full
+
+    plan = gc_mod.collect_plan(tree)
+
+    assert plan.is_empty()                                  # nothing to reclaim: true
+    assert plan.disk.known and plan.disk.nearly_full()      # …and the disk IS full
+    assert 700 < plan.disk.free_mb < 900
+    assert plan.store_mb() > 2                              # what this tree holds
+    assert plan.biggest(3)[0].kind == "runtime"             # the biggest consumer, named
+    assert not plan.store_is_the_problem()                  # 3 MB is not why C: is full
+
+    text = plan.summary()
+    assert "磁碟" in text and "可用" in text                 # how much is left…
+    assert "不是被它吃掉的" in text                          # …and that it is not us
+    assert f"runtime {FP1}" in text                         # …and what the big things are
+    assert "沒有可回收的項目" in text                        # still true, still said
+    assert "沒有可回收的項目" in plan.headline()
+    text.encode("cp950")
+
+    # …and the same through the real entry point, on --apply.
+    code = gc_main(tree, monkeypatch, ["--apply"])
+    assert code == gc_mod.EXIT_EMPTY_PLAN
+    out = capsys.readouterr().out
+    assert "磁碟" in out and "不是被它吃掉的" in out
+    assert "已刪除" not in out and "實際回收合計" not in out    # because nothing was
+    out.encode("cp950")
+
+
+def test_when_the_store_really_is_the_hog_gc_says_so_instead_of_pointing_elsewhere(
+        tree, monkeypatch):
+    """The mirror image has to work too: on a small disk this tree IS the problem,
+    and sending the operator off to look somewhere else would send them hunting for
+    space that is sitting right here."""
+    (tree / "deps" / "runtimes" / FP1 / "big.bin").write_bytes(b"0" * (8 * 1024 * 1024))
+    fake_disk(monkeypatch, total_gb=0.05, free_mb=10)       # a 51 MB disk, 41 MB used
+
+    plan = gc_mod.collect_plan(tree)
+
+    assert plan.store_is_the_problem()
+    text = plan.summary()
+    assert "不是被它吃掉的" not in text
+    assert "快滿了" in text
+    text.encode("cp950")
+
+
+def test_a_gui_can_read_where_the_space_went_without_re_deriving_it(tree, monkeypatch):
+    """The fields a portal/GUI shows. A pre-rendered console string is neither
+    queryable nor clickable."""
+    (tree / "deps" / "runtimes" / FP1 / "big.bin").write_bytes(b"0" * (2 * 1024 * 1024))
+    for i in range(gc_mod.LOG_KEEP_RECENT + 5):        # more launches than we keep
+        write_log(tree / "apps" / APP / "data" / "logs", f"launcher-old-{i:02d}.log",
+                  kb=64, age_seconds=90 * 86400 + i)
+    fake_disk(monkeypatch, total_gb=120, free_mb=900)
+
+    plan = gc_mod.collect_plan(tree)
+
+    assert plan.disk.total_mb > plan.disk.free_mb > 0
+    assert plan.disk.path                                   # "C:" — what they call it
+    assert plan.store_mb() >= sum(c.mb for c in plan.biggest(1))
+    [runtime] = [c for c in plan.consumers if c.kind == "runtime"]
+    assert runtime.label.startswith("runtime ") and runtime.mb > 1
+    assert runtime.reclaimable_mb == 0                      # FP1 is `current`: kept
+    [logs] = [c for c in plan.consumers if c.kind == "logs"]
+    assert logs.mb > 0 and logs.reclaimable_mb > 0          # …the logs, we CAN reclaim
+    for consumer in plan.consumers:                         # everything shows a size
+        consumer.line().encode("cp950")
+
+
+# ── (5) a second start.bat does not start a second instance ──────────────────
+
+def test_a_second_start_bat_does_not_start_a_second_instance(tmp_path):
+    """There was no single-instance check at all. The app update lock is taken only
+    around the state WRITE, so it is free the entire time the app runs — and
+    FileLock.acquire() defaults to timeout=30: a user who double-clicked start.bat
+    got a second launcher that waited half a minute and then started anyway. Two
+    launchers, two Streamlits, one state.json."""
+    import time as _time
+    data_dir = tmp_path / "data"
+
+    first = locks.acquire_single_instance(data_dir)         # the window they opened
+    try:
+        started = _time.monotonic()
+        with pytest.raises(locks.AlreadyRunning) as caught:
+            locks.acquire_single_instance(data_dir)         # the second double-click
+        waited = _time.monotonic() - started
+    finally:
+        first.release()
+
+    assert waited < 5                                       # it does NOT sit out 30s…
+    message = str(caught.value)
+    assert "這個 App 已經在執行中" in message               # …and it says so
+    assert caught.value.owner.get("pid") == os.getpid()     # …and who is holding it
+    assert "工作管理員" in message                          # …and what to do if it hung
+    message.encode("cp950")
+
+    # …and it is not a one-way door: when the first copy exits, the next launch
+    # starts normally.
+    again = locks.acquire_single_instance(data_dir)
+    again.release()
+
+
+def test_an_app_that_crashed_does_not_lock_the_machine_out_of_its_own_app(tmp_path):
+    """A single-instance lock a dead process can hold forever is worse than no lock:
+    the operator could never start the app again. PID + process start time, so a
+    reused PID cannot inherit a dead app's lock either."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / locks.INSTANCE_LOCK_NAME).write_text(json.dumps({
+        "pid": 999999999, "process_start_time": 12345,
+        "operation_id": "dead", "what": "app instance lock"}), encoding="utf-8")
+
+    lock = locks.acquire_single_instance(data_dir)          # takes over the corpse
+    try:
+        assert json.loads((data_dir / locks.INSTANCE_LOCK_NAME)
+                          .read_text("utf-8"))["pid"] == os.getpid()
+    finally:
+        lock.release()
+
+
+def test_the_instance_lock_is_not_the_update_lock(tree):
+    """Different files, on purpose. The instance lock is held for the WHOLE session;
+    the update lock is taken for one state.json write. Holding the update lock for
+    a session would block every updater for the length of a shift."""
+    paths = paths_of(tree)
+    assert locks.instance_lock(paths.data_dir).path != locks.app_lock(paths.state_dir).path
+
+    running = locks.acquire_single_instance(paths.data_dir)
+    try:
+        # …an update can still be staged while the app is open — which is exactly
+        # what the updater does all day.
+        assert store_of(tree).mutate(lambda s: state.set_pending(s, "v2")).pending == "v2"
+    finally:
+        running.release()
+
+
+# ── (4) the message a person reads down the phone, from a factory floor ──────
+
+def test_a_broken_state_file_names_the_file_and_speaks_the_operators_language(store):
+    """state.py raised 「corrupt state.json: Expecting value…」 — English, and with no
+    path in it. The person reading it is standing in a factory, on the phone, in
+    front of a machine that has several state.json files on it."""
+    store.initialize("demo", "v1")
+    store.path.write_text("{ half json", encoding="utf-8")
+
+    with pytest.raises(state.StateError) as caught:
+        store.load()
+
+    message = str(caught.value)
+    assert str(store.path) in message         # WHICH file
+    assert "毀損" in message                  # …in a language they read
+    assert "版本" in message                  # …and what it is for / what to do
+    message.encode("cp950")                   # …on a zh-TW console
+
+
+def test_a_missing_state_file_says_which_one_and_what_it_means(store):
+    with pytest.raises(state.StateError) as caught:
+        store.load()
+    message = str(caught.value)
+    assert str(store.path) in message and "找不到" in message
+    message.encode("cp950")

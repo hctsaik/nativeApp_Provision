@@ -758,6 +758,50 @@ class ProvisionApp(tk.Tk):
         if value:
             self.sd_update_source_var.set(value)
 
+    @staticmethod
+    def _disk_story(plan) -> str:
+        """「沒有可回收的項目」對一個 C 槽快滿的人來說,正確但無用。
+
+        他要的是「空間到底去哪了」。GC 現在量得出來:磁碟剩多少、這棵樹佔多少、
+        最大的幾個吃空間的東西是什麼(版本 / log / cache / runtime)——
+        而且如果問題不在這棵樹上,就直接說「不是它吃掉的,請往別處找」。"""
+        lines: list[str] = []
+        disk = getattr(plan, "disk", None)
+        if disk is not None and getattr(disk, "known", False):
+            lines.append(f"{disk.label}:剩 {disk.free_mb / 1024:.1f} GB / 共 "
+                         f"{disk.total_mb / 1024:.1f} GB（{disk.free_pct:.0f}% 可用）")
+        if hasattr(plan, "store_mb"):
+            lines.append(f"這棵 Store 樹佔:{plan.store_mb():.0f} MB")
+        if hasattr(plan, "store_is_the_problem") and not plan.store_is_the_problem():
+            lines.append("→ C 槽的空間不是被這棵樹吃掉的,請往別處找"
+                         "（下載資料夾、其他程式的快取、Windows 更新暫存…）。")
+        elif hasattr(plan, "biggest"):
+            biggest = plan.biggest(3)
+            if biggest:
+                lines.append("最大的幾項:")
+                lines += [f"　·　{c.label}:{c.mb:.0f} MB"
+                          + ("（可回收）" if getattr(c, "reclaimable_mb", 0) > 1 else "")
+                          for c in biggest]
+        return "\n".join(lines) if lines else "（量不到磁碟資訊。）"
+
+    @staticmethod
+    def _cancel_message(result) -> str:
+        """取消之後,講「真的發生了什麼」——builder 已經查證過了,不要覆蓋它。
+
+        builder 在 rmtree 之後會回頭確認 staging 到底還在不在(剛殺完 pip 程序樹,
+        Windows 常常還鎖著那些檔案),把答案放進 result.staging_left:
+        None = 真的刪掉了;有值 = 那個目錄還躺在磁碟上。
+
+        判斷要看這個欄位,不要去解析訊息字串——GUI 曾經無條件蓋成
+        「暫存目錄已清乾淨」,對著一個還躺著 600 MB 的磁碟。"""
+        told = (getattr(result, "message", "") or "").strip()
+        left = getattr(result, "staging_left", None)
+        if left:
+            return (told or "已取消建置。") + (
+                f"\n\n暫存目錄還在磁碟上（有檔案被系統鎖住,暫時刪不掉）:\n{left}\n"
+                "下次建置時會自動清掉;要立刻回收空間,關掉防毒掃描後手動刪除即可。")
+        return told or "已取消建置,暫存目錄已清乾淨。"
+
     def _open_existing_store(self) -> None:
         """讓「發一版出去」與「清磁碟」不再綁在「這個 session 剛建過」上。
 
@@ -928,15 +972,25 @@ class ProvisionApp(tk.Tk):
             messagebox.showerror("回收失敗", str(exc))
             return
         reclaimable = plan.reclaimable_mb()
-        if reclaimable < 1:
+        # 「有沒有東西可回收」要問計畫本身,不要用 MB 數去猜。
+        # reclaimable_mb() 是一個「量測」——而 _mb() 整個包在 try/except 裡:
+        # 只要有一個檔案讀不到(被執行中的 App 鎖住,這是常態),整份 450 MB 的
+        # runtime 就會回報成 0 MB,於是我們對著一個滿的磁碟說「沒有可回收的項目」。
+        empty = plan.nothing_to_reclaim() if hasattr(plan, "nothing_to_reclaim") \
+            else (not plan.delete_versions and not plan.delete_runtimes
+                  and not plan.delete_shells)
+        if empty:
             note = ""
             if getattr(plan, "self_hosted", None):
                 # 「沒有東西可回收」跟「唯一能回收的那份,正是我腳下這一份」是兩件事。
                 note = ("\n\n不過:GC 正在用 " + str(plan.self_hosted) +
                         " 這份 runtime 執行,\n所以它自己即使沒被引用也不會被刪除。\n"
                         "要回收它,請改用另一份 runtime 的 python.exe 重跑一次。")
+            # 對一個「C 槽快滿」的人說「沒有可回收的項目」然後閉嘴,是正確而無用的。
+            # 他來這裡不是想聽「沒事」,是想知道空間到底去哪了。
+            note += "\n\n" + self._disk_story(plan)
             messagebox.showinfo("沒有可回收的項目",
-                                "沒有任何未被引用的版本或 runtime。" + note)
+                                "這棵樹裡沒有任何「沒被引用」的版本或 runtime。" + note)
             return
         if not messagebox.askyesno(
                 "確認回收",
@@ -1352,10 +1406,15 @@ class ProvisionApp(tk.Tk):
                     self._set_desktop_busy(False)
                     result = payload
                     if getattr(result, "cancelled", False):
-                        self.sd_status_var.set("已取消建置，暫存已清乾淨。")
-                        self._append_desktop_log("已取消：沒有產生版本，也沒有動到既有的樹。")
-                        messagebox.showinfo("已取消", "建置已中止。\n\n"
-                                                      "沒有建立新版本，Store 樹維持原狀。")
+                        # builder 已經「驗證過才宣告」——它知道 staging 到底刪掉了沒有
+                        # （剛殺完 pip 程序樹之後,Windows 常常還鎖著那些檔案）。
+                        # 這裡曾經無條件覆蓋成「已清乾淨」,把它辛苦查證的事實丟掉,
+                        # 然後對著一個還躺著 600MB 的磁碟說「乾淨了」。
+                        told = self._cancel_message(result)
+                        self.sd_status_var.set(told.splitlines()[0])
+                        self._append_desktop_log(told)
+                        messagebox.showinfo("已取消",
+                                            "建置已中止。沒有建立新版本，Store 樹維持原狀。\n\n" + told)
                     elif result.ok:
                         self._sd_last_store = result.root
                         self._sd_last_app = result.app_id
@@ -1416,10 +1475,11 @@ class ProvisionApp(tk.Tk):
                     self._set_desktop_busy(False)
                     result = payload
                     if getattr(result, "cancelled", False):
-                        self.sd_status_var.set("已取消建置，暫存已清乾淨。")
-                        self._append_desktop_log("已取消：pip 已中止，.staging-* 已刪除，沒有產生交付資料夾。")
-                        messagebox.showinfo("已取消", "建置已中止，暫存目錄已清乾淨。\n\n"
-                                                      "沒有產生可交付資料夾。")
+                        told = self._cancel_message(result)
+                        self.sd_status_var.set(told.splitlines()[0])
+                        self._append_desktop_log(told)
+                        messagebox.showinfo("已取消",
+                                            "建置已中止，沒有產生可交付資料夾。\n\n" + told)
                     elif result.ok:
                         self._sd_last_store = None      # fat 包沒有 store 可匯出/回收
                         self._sd_last_package = result.package_dir

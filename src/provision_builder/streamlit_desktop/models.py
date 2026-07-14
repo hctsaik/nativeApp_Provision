@@ -171,9 +171,15 @@ class BuildRequest:
     # [project.optional-dependencies] groups the admin opted in, e.g. ("llm",).
     # Only meaningful when the deps come from pyproject: a lock file is the truth.
     extras: tuple[str, ...] = ()
-    # The WebView2 offline installer (MicrosoftEdgeWebview2Setup.exe, or the
-    # standalone x64 runtime installer). Set it and build() copies it into
-    # <package>/prereq/, which is the ONLY place tools\安裝WebView2.bat looks.
+    # The WebView2 OFFLINE installer: the Evergreen Standalone Installer
+    # (MicrosoftEdgeWebView2RuntimeInstallerX64.exe, ~130 MB), which carries the
+    # runtime inside the file. NOT the ~2 MB MicrosoftEdgeWebview2Setup.exe — that
+    # is the Evergreen *Bootstrapper*, it contains no WebView2, and it downloads one
+    # at install time, so on the air-gapped machine this field exists for it cannot
+    # work. Both builders accept whatever file is given, copy it into <package>/prereq/
+    # UNDER ITS OWN NAME (never renamed), and warn when it is small enough to be the
+    # bootstrapper. prereq/ is the ONLY place tools\安裝WebView2.bat looks, and it
+    # runs any .exe it finds there.
     # Leave it None and the build still succeeds — but it emits a warning saying
     # so, because the package we just handed the operator cannot start on an
     # air-gapped machine that lacks WebView2, and that machine is the whole point
@@ -242,9 +248,17 @@ class BuildResult:
     log_path: Path | None = None
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
-    # The operator pressed 取消. NOT a failure: nothing is broken, nothing is
-    # left behind — but the caller must never render it as "完成".
+    # The operator pressed 取消. NOT a failure: nothing is broken — but the caller
+    # must never render it as "完成", and it must not claim a cleanup that did not
+    # happen either.
     cancelled: bool = False
+    # WHAT IS STILL ON THE DISK. A cancel during the pip install kills a process
+    # tree whose handles Windows keeps open for a moment; the rmtree then fails and
+    # ~600 MB of staging stays in the operator's output folder. `message` already
+    # says so in words — but a GUI cannot branch on a sentence, so it rendered its
+    # own hardcoded 「暫存目錄已清乾淨」 over the top of it and the operator went
+    # looking for the disk space that was never freed. None = really gone.
+    staging_left: Path | None = None
     message: str = ""
 
     @property

@@ -15,12 +15,23 @@ purpose to keep mock-mode free of the dependency, became unbuildable after a
 six-minute pip install. An import that only runs when a function is called cannot
 crash the app on startup, so it can never be a reason to refuse a build.
 
-The rule, therefore, is about SCOPE:
+The rule, therefore, is about SCOPE — but the scope that matters is "does this run
+on the first render", not "is it lexically indented":
 
     module level (incl. module-level `if` / `with` / `try` blocks)
         REQUIRED — it runs on the first render; if it is missing, the app dies.
 
-    inside a def / async def / class body
+    inside a def that THE MODULE BODY CALLS — `_setup()` at the bottom of the file,
+    a `main()` invoked at top level, a `@register` decorator
+        REQUIRED. This is the hole the first version of the rule left: "imports
+        inside a def are lazy" is only true of a def nobody calls at import time.
+        If the module body calls it, its body runs while Streamlit is importing the
+        script, and a missing package there is a red traceback on the first render —
+        indistinguishable from a module-level import, except that the gate could not
+        see it. Same file, one level deep (see `_called_from_module_scope` for what
+        that deliberately does not cover).
+
+    inside any other def / async def / class body
     inside a try/except ImportError guard (its body AND its fallbacks)
         OPTIONAL — reported as a warning, never fails a build.
 
@@ -50,6 +61,20 @@ entrypoint alone made this gate blind to every multipage app's pages, so an
 build shipped. `pages.py` — shared with the device-side launcher, which had the
 rule right — is the ONE answer to "what does Streamlit actually load", and both
 sides now seed from it.
+
+The fourth trap is our own ALIAS TABLE. To decide whether `import grpc` is
+declared, you have to know that grpc comes from the `grpcio` distribution — and
+the first version answered that from a hand-written dict, falling through to "the
+import name must be the package name" whenever the dict was silent. That is wrong
+for grpc/grpcio, psycopg2/psycopg2-binary, Levenshtein/python-Levenshtein — real
+packages, correctly declared, correctly installed, and reported as MISSING. A
+false MISSING here does not cost six minutes; it makes the project unbuildable.
+
+So we ask the interpreter first (`importlib.metadata.packages_distributions()`,
+stdlib, no network, reads the installed packages' own manifests), fall back to the
+table, and when we are down to the identity guess we DOWNGRADE TO A WARNING rather
+than block — see `satisfied_by`. The post-install `find_spec` probe is ground truth
+and it is still there. A gate that guesses must fail OPEN.
 """
 
 from __future__ import annotations
@@ -70,10 +95,49 @@ from .models import EXCLUDED_DIRS
 # import name -> the distribution(s) that provide it, where they differ. A tuple,
 # because `cv2` is equally satisfied by opencv-python, -headless or -contrib, and
 # demanding the exact one we happen to know would be a false alarm of its own.
+#
+# This table is the FALLBACK, not the first answer: `_metadata_distributions()`
+# asks the interpreter, which cannot be out of date the way a hand-written list
+# always is. Everything here is a name the build machine may not have installed —
+# and a name missing from BOTH is a guess, which by `resolve_distributions()` can
+# only ever warn, never block.
 _KNOWN_ALIASES: dict[str, tuple[str, ...]] = {
     "cv2": ("opencv-python", "opencv-python-headless", "opencv-contrib-python",
             "opencv-contrib-python-headless"),
     "PIL": ("pillow",),
+    # Each of these was a false MISSING on a project that declared the package and
+    # had it installed: the import name is simply not the distribution name, and the
+    # old code fell through to "they must be equal".
+    "Levenshtein": ("levenshtein", "python-levenshtein"),
+    "psycopg2": ("psycopg2", "psycopg2-binary", "psycopg2cffi"),
+    "psycopg": ("psycopg", "psycopg-binary"),
+    "grpc": ("grpcio",),
+    "grpc_status": ("grpcio-status",),
+    "grpc_tools": ("grpcio-tools",),
+    "MySQLdb": ("mysqlclient",),
+    "pymysql": ("pymysql",),
+    "redis": ("redis",),
+    "magic": ("python-magic", "python-magic-bin"),
+    "Crypto": ("pycryptodome", "pycryptodomex"),
+    "Cryptodome": ("pycryptodomex",),
+    "lxml": ("lxml",),
+    "regex": ("regex",),
+    "ruamel": ("ruamel-yaml",),
+    "zmq": ("pyzmq",),
+    "cairo": ("pycairo",),
+    "gi": ("pygobject",),
+    "wx": ("wxpython",),
+    "Xlib": ("python-xlib",),
+    "slugify": ("python-slugify",),
+    "multipart": ("python-multipart",),
+    "jose": ("python-jose",),
+    "snappy": ("python-snappy",),
+    "memcache": ("python-memcached",),
+    "tkcalendar": ("tkcalendar",),
+    "sqlalchemy": ("sqlalchemy",),
+    "google.oauth2": ("google-auth",),
+    "googleapiclient": ("google-api-python-client",),
+    "OpenGL": ("pyopengl",),
     "sklearn": ("scikit-learn",),
     "skimage": ("scikit-image",),
     "yaml": ("pyyaml",),
@@ -103,14 +167,17 @@ _KNOWN_ALIASES: dict[str, tuple[str, ...]] = {
 }
 
 MODULE_SCOPE = "module"          # required
+CALLED_SCOPE = "module-called"   # required: a def whose body the MODULE BODY runs
 FUNCTION_SCOPE = "function"      # optional: only runs when someone calls it
 CLASS_SCOPE = "class"            # optional (per spec: never a startup crash we own)
 GUARDED_SCOPE = "guarded"        # optional: try/except ImportError = degrade gracefully
 
+_REQUIRED_SCOPES = (MODULE_SCOPE, CALLED_SCOPE)
 _OPTIONAL_SCOPES = (FUNCTION_SCOPE, CLASS_SCOPE, GUARDED_SCOPE)
 
 _SCOPE_LABEL = {
     MODULE_SCOPE: "模組層級 import",
+    CALLED_SCOPE: "函式內 import,但這個函式在模組層被呼叫(啟動時就會執行)",
     FUNCTION_SCOPE: "函式內延遲 import",
     CLASS_SCOPE: "class 內 import",
     GUARDED_SCOPE: "try/except ImportError 保護的 import",
@@ -150,7 +217,7 @@ class ImportSite:
 
     @property
     def required(self) -> bool:
-        return self.scope == MODULE_SCOPE
+        return self.scope in _REQUIRED_SCOPES
 
     def where(self, root: Path | None = None) -> str:
         shown = self.path
@@ -190,17 +257,61 @@ class MissingReport:
     # The distribution names the source declared — used to point at the package
     # that most likely drags a missing module in ("numpy 可能由 pandas 帶進來").
     declared: frozenset[str] = frozenset()
+    # Required names we could not map to a distribution with any confidence, where
+    # something declared looks like it might well provide them anyway
+    # (`import psycopg2` + `psycopg2-binary==2.9.9`). We had a guess, and a guess
+    # may not refuse a build — these warn and the post-install probe decides.
+    unsure: list[str] = field(default_factory=list)
+    # Where the declarations came from, and what the project can opt INTO. Both are
+    # only here to make the advice true: telling someone to 「加進 requirements」
+    # when their project has no requirements.txt and the package sits in a
+    # pyproject optional group is advice that cannot be followed.
+    source_label: str = ""
+    optional_groups: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
     @property
     def blocking(self) -> list[str]:
         """Modules that WILL be missing. The only reason to refuse a build."""
-        return list(self.required) if self.complete else []
+        if not self.complete:
+            return []
+        return [name for name in self.required if name not in self.unsure]
 
     @property
     def undeclared(self) -> list[str]:
         """Modules not named in a non-closure source: maybe transitive, maybe not.
         Worth saying; never worth blocking on."""
         return [] if self.complete else list(self.required)
+
+    @property
+    def unresolved(self) -> list[str]:
+        """Modules absent from a CLOSURE that we still refuse to block on, because
+        all we had was a guess at their distribution name."""
+        return [name for name in self.unsure if name in self.required] if self.complete else []
+
+    def group_for(self, name: str) -> str:
+        """The pyproject optional-dependency group that declares this import's
+        package ("llm" for anthropic), or "" — there is a GUI field for that group,
+        and it is the only advice that actually works for this project's shape."""
+        candidates = set(candidate_distributions(name))
+        for group, dists in self.optional_groups.items():
+            if candidates & {_normalize(d) for d in dists}:
+                return group
+        return ""
+
+    def _how_to_declare(self, name: str) -> str:
+        """The ONE sentence that tells this operator, with this project, what to add
+        and where. Not a menu of everything a Python project could theoretically do."""
+        group = self.group_for(name)
+        if group:
+            return (f"這個套件已經宣告在 pyproject.toml 的 "
+                    f"[project.optional-dependencies] 的「{group}」群組裡,"
+                    f"預設不會安裝。要帶它,請在「進階設定 → 選用相依群組」填 {group},"
+                    "再重新建置。")
+        if "pyproject" in self.source_label:
+            return ("請把它加進 pyproject.toml 的 [project].dependencies"
+                    "(若它只是某條路徑才需要,也可以放進 [project.optional-dependencies] "
+                    "的某個群組,再於「進階設定 → 選用相依群組」勾選),再重新建置。")
+        return ("請把它加進 requirements.txt / requirements.lock.txt,再重新建置。")
 
     # Older callers do `if missing:` / `for name in missing:` and mean the hard
     # failures. Keep them honest instead of accidentally truthy.
@@ -218,38 +329,66 @@ class MissingReport:
 
     def failure_message(self) -> str:
         """What the operator reads when the build stops. Not an accusation: the
-        module, where it is imported from, and the two ways out."""
+        module, where it is imported from, and the ways out that are actually ways
+        out.
+
+        There used to be a third one: 「把 import 移到函式內」. It made the build
+        pass, so it read like a fix — and it fixes nothing. Moving the import into a
+        function only moves it where this gate cannot see it; the package is still
+        not installed, the code path still runs, and the app still dies, now on the
+        factory floor with a green build behind it. We were teaching the operator to
+        disable the check instead of fixing the thing it found. It is gone.
+        """
         lines = ["這些模組在 App 啟動時就會被 import,但相依宣告裡沒有:"]
         for name in self.blocking:
             hint = suggest_distribution(name)
-            extra = f"(套件名可能是 {hint})" if hint and hint != name else ""
+            extra = f"(套件名可能是 {hint})" if hint and _normalize(hint) != _normalize(name) else ""
             lines.append(f"  · {name}{extra}")
             lines.append(f"      import 位置:{self.where(name)}")
-        lines += [
-            "",
-            "兩條路,擇一即可:",
-            "  1. 加進 requirements:把它寫進 requirements.txt / requirements.lock.txt,"
-            "或 pyproject 的 [project].dependencies,再重新建置。",
-            "  2. 這是選用相依,請忽略:如果 App 沒有它也能跑,把該 import 移到函式內"
-            "(用到才 import),或用 try/except ImportError 包起來——這樣它就只會是警告。",
-        ]
+        if self.source_label:
+            lines.append("")
+            lines.append(f"目前的相依來源:{self.source_label}")
+        lines += ["", "兩條路,擇一即可:"]
+        first = self.blocking[0] if self.blocking else ""
+        lines.append(f"  1. 加進相依宣告:{self._how_to_declare(first)}")
+        lines.append(
+            "  2. 確認它真的是選用的:如果 App 少了它也能跑,請用 try/except ImportError "
+            "把 import 包起來,讓程式碼自己說明「沒有它會怎麼降級」——這樣它就只會是警告。")
         return "\n".join(lines)
 
     def warning_lines(self) -> list[str]:
         """Everything worth saying out loud and nothing worth failing on: the
-        lazy/guarded imports, plus (when the source is not a closure) the
-        module-level ones that are probably someone else's transitive dependency."""
+        lazy/guarded imports, the module-level ones that are probably someone else's
+        transitive dependency, and the ones whose package name we could only guess."""
         out = []
         for name in self.undeclared:
+            group = self.group_for(name)
+            if group:
+                # Not a "maybe it arrives transitively" at all: we know EXACTLY why
+                # it is missing — the project declares it in an optional group that
+                # nobody opted into. Guessing about carriers here would bury the one
+                # action that works.
+                out.append(
+                    f"「{name}」不會被安裝(import 位置:{self.where(name)})。"
+                    f"{self._how_to_declare(name)}")
+                continue
             carrier = _likely_carrier(name, self.declared)
             via = f"{name} 可能由 {carrier} 帶進來" if carrier else f"{name} 可能由其它套件帶進來"
             out.append(
                 f"「{name}」沒有列在相依宣告裡(import 位置:{self.where(name)})。"
                 f"requirements.txt / pyproject 只宣告直接相依,{via};"
                 "安裝完成後會再驗一次,真的缺才會擋下來。")
+        for name in self.unresolved:
+            near = "、".join(sorted(d for d in self.declared if _looks_related(name, d)))
+            out.append(
+                f"「{name}」的套件名我們認不出來(import 位置:{self.where(name)}),"
+                f"但相依宣告裡的「{near}」看起來就是提供它的套件。"
+                "import 名稱和套件名稱不一樣是很常見的事(grpc 來自 grpcio、"
+                "psycopg2 來自 psycopg2-binary),我們不會因為自己猜不出來就擋下建置;"
+                "安裝完成後會用交付包裡的 Python 實際 import 一次,真的缺才會擋。")
         for name in self.optional:
             out.append(f"選用相依「{name}」沒有宣告,但只在 {self.where(name)} 用到,"
-                       "不會擋住啟動;若那條路徑要能用,請把它加進 requirements。")
+                       f"不會擋住啟動;若那條路徑要能用,{self._how_to_declare(name)}")
         return out
 
 
@@ -292,6 +431,63 @@ def import_sites(path: Path) -> list[ImportSite]:
     return sites
 
 
+def _is_main_guard(node: ast.If) -> bool:
+    """`if __name__ == "__main__":` — the one module-level block we do NOT treat as
+    "the module body runs this".
+
+    Strictly speaking Streamlit DOES set `__name__ == "__main__"` on the entry
+    script, so this block really does run there. We skip it anyway, on purpose:
+    promoting its calls would make every `main()`-style script's lazy imports hard
+    requirements, and a wrong REQUIRED refuses a build that works. Skipping keeps
+    those imports optional — a warning — and the post-install probe still sees them.
+    Fail open, and say why.
+    """
+    return any(isinstance(sub, ast.Name) and sub.id == "__name__"
+               for sub in ast.walk(node.test))
+
+
+def _called_from_module_scope(tree: ast.Module) -> set[str]:
+    """Names of this file's own functions that the MODULE BODY invokes.
+
+    `_setup()` at the bottom of the file, `main()` called at top level, `@register`
+    on a module-level def — all of them run while Streamlit is importing the script,
+    so an import in their body executes on the first render exactly like a
+    module-level import. Calling those "lazy" is how a missing dependency reaches
+    the factory floor with a green build behind it.
+
+    What this deliberately does NOT cover (one level, same file, by design):
+      · a call two hops deep — module calls `main()`, `main()` calls `_setup()`:
+        `_setup()`'s imports stay optional.
+      · methods — `App().boot()` at module scope does not promote `boot`.
+      · a decorator that CALLS the function it decorates (`@run_now def _setup()`):
+        we see that `run_now` runs, not that `_setup` does.
+      · anything imported from another module and called here.
+    Each of those stays OPTIONAL, i.e. a warning — the safe direction. The
+    post-install `find_spec` probe is still behind all of them.
+    """
+    called: set[str] = set()
+
+    def scan(node: ast.AST) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                # The body is NOT module scope — but the decorators run right now,
+                # so `@register` really does execute register().
+                for decorator in child.decorator_list:
+                    target = (decorator.func if isinstance(decorator, ast.Call)
+                              else decorator)
+                    if isinstance(target, ast.Name):
+                        called.add(target.id)
+                continue
+            if isinstance(child, ast.If) and _is_main_guard(child):
+                continue
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Name):
+                called.add(child.func.id)
+            scan(child)          # into module-level if/with/try, call args, ...
+
+    scan(tree)
+    return called
+
+
 def _parse_import_sites(path: Path) -> list[ImportSite]:
     try:
         tree = ast.parse(path.read_text("utf-8", errors="replace"), filename=str(path))
@@ -299,6 +495,7 @@ def _parse_import_sites(path: Path) -> list[ImportSite]:
         return []
 
     found: list[ImportSite] = []
+    runs_on_import = _called_from_module_scope(tree)
 
     def visit(node: ast.AST, scope: str) -> None:
         for child in ast.iter_child_nodes(node):
@@ -310,15 +507,24 @@ def _parse_import_sites(path: Path) -> list[ImportSite]:
                     found.append(ImportSite(child.module, path, child.lineno, scope,
                                             tuple(alias.name for alias in child.names)))
             elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                # Only runs when someone calls it: it cannot break the first render.
-                # A method inside a class is still a function — say so, or the
-                # operator goes looking for a class-body import that is not there.
-                visit(child, GUARDED_SCOPE if scope == GUARDED_SCOPE else FUNCTION_SCOPE)
+                if scope == MODULE_SCOPE and child.name in runs_on_import:
+                    # The module body calls it, so its body runs on the first render
+                    # just like a module-level import. Not lazy — REQUIRED.
+                    # Nested defs / try-ImportError blocks inside it fall back to the
+                    # optional scopes below, which is what "one level deep" means.
+                    visit(child, CALLED_SCOPE)
+                else:
+                    # Only runs when someone calls it: it cannot break the first
+                    # render. A method inside a class is still a function — say so,
+                    # or the operator goes looking for a class-body import that is
+                    # not there.
+                    visit(child, GUARDED_SCOPE if scope == GUARDED_SCOPE else FUNCTION_SCOPE)
             elif isinstance(child, ast.ClassDef):
                 visit(child, scope if scope in _OPTIONAL_SCOPES else CLASS_SCOPE)
             elif isinstance(child, ast.Try) and _catches_import_error(child):
                 # Body AND handlers: `except ImportError: import simplejson as json`
-                # is the fallback, not a second requirement.
+                # is the fallback, not a second requirement. True inside a
+                # module-called function too: it degrades gracefully either way.
                 visit(child, GUARDED_SCOPE)
             else:
                 # Module-level if/with/try(not import-guarded)/... still runs on
@@ -588,13 +794,99 @@ def declared_distributions(requirements_text: str) -> set[str]:
     return names
 
 
-def candidate_distributions(dotted: str) -> tuple[str, ...]:
-    """Which distribution names would satisfy this import name."""
+@lru_cache(maxsize=1)
+def _metadata_distributions() -> dict[str, tuple[str, ...]]:
+    """import name -> the distributions that ACTUALLY provide it, asked of the
+    interpreter instead of guessed.
+
+    `importlib.metadata.packages_distributions()` reads the installed
+    distributions' own file lists, so it knows what no hand-written table can keep
+    up with: that `grpc` comes from grpcio, `cv2` from whichever opencv build is
+    installed, `psycopg2` from psycopg2-binary. It is stdlib (3.10+) and needs no
+    network — the build machine has it by definition, because it is running us.
+
+    Its limit is honest and worth stating: it only sees what is installed HERE.
+    A package the build machine does not have is simply absent from the answer,
+    which is why `resolve_distributions()` treats "not in here" as "ask the table",
+    and "not in the table either" as "we are guessing" — never as "it is missing".
+    """
+    try:
+        from importlib.metadata import packages_distributions
+        raw = packages_distributions()
+    except Exception:                      # a broken/partial site-packages, mostly
+        return {}
+    return {name: tuple(_normalize(d) for d in dists) for name, dists in raw.items()}
+
+
+@lru_cache(maxsize=1)
+def _metadata_provides() -> dict[str, frozenset[str]]:
+    """The same truth, read backwards: distribution -> the import names it provides.
+
+    This is what answers 「the project declares opencv-contrib-python; does that
+    give it `cv2`?」 without any table at all — as long as the build machine has
+    the package. Forward and backward together are why the table only has to cover
+    what is NOT installed here.
+    """
+    provides: dict[str, set[str]] = {}
+    for name, dists in _metadata_distributions().items():
+        for dist in dists:
+            provides.setdefault(dist, set()).add(name)
+    return {dist: frozenset(names) for dist, names in provides.items()}
+
+
+@dataclass(frozen=True)
+class DistributionMatch:
+    """Which distributions could provide an import name, and how sure we are.
+
+    `source` is the whole point. "metadata" and "table" are knowledge; "guess" is
+    the old code's silent assumption that an import name IS a distribution name —
+    true for numpy, false for `grpc` (grpcio), `psycopg2` (psycopg2-binary),
+    `Levenshtein` (python-Levenshtein). A guess may warn. A guess may never block.
+    """
+    candidates: tuple[str, ...]
+    source: str                    # "metadata" | "table" | "guess"
+
+    @property
+    def certain(self) -> bool:
+        return self.source != "guess"
+
+
+def resolve_distributions(dotted: str) -> DistributionMatch:
+    """Which distribution names would satisfy this import name, and how we know.
+
+    Order — most authoritative first:
+      1. the interpreter (`packages_distributions()`): it reads the installed
+         packages' own manifests and cannot be stale.
+      2. `_KNOWN_ALIASES`: for packages the BUILD machine does not have installed,
+         which is most of them — the build machine is not the app's venv.
+      3. the identity guess (import name == distribution name). Right most of the
+         time, and wrong exactly where it costs a build. Marked as a guess.
+
+    1 and 2 are UNIONed rather than short-circuited on purpose: the build machine
+    happening to have opencv-python installed must not turn a project that declares
+    opencv-contrib-python into a false MISSING. More candidates can only make this
+    gate more forgiving, and forgiving is the safe direction.
+    """
     top = dotted.split(".")[0]
+    found: list[str] = []
+    for name in dict.fromkeys((dotted, top)):          # dotted first, dedup
+        found += _metadata_distributions().get(name, ())
+    from_metadata = bool(found)
+
     for key in (dotted, top):
         if key in _KNOWN_ALIASES:
-            return tuple(_normalize(n) for n in _KNOWN_ALIASES[key])
-    return (_normalize(top),)
+            found += (_normalize(n) for n in _KNOWN_ALIASES[key])
+            break
+
+    if found:
+        return DistributionMatch(tuple(dict.fromkeys(found)),
+                                 "metadata" if from_metadata else "table")
+    return DistributionMatch((_normalize(top),), "guess")
+
+
+def candidate_distributions(dotted: str) -> tuple[str, ...]:
+    """Which distribution names would satisfy this import name."""
+    return resolve_distributions(dotted).candidates
 
 
 def suggest_distribution(dotted: str) -> str:
@@ -602,12 +894,63 @@ def suggest_distribution(dotted: str) -> str:
     return candidates[0] if candidates else ""
 
 
+def _looks_related(import_name: str, distribution: str) -> bool:
+    """Could this declared distribution plausibly be the one providing this import?
+
+    Only ever asked when we are already GUESSING (neither the interpreter nor the
+    table knew), and only ever used to soften a block into a warning. The shapes it
+    catches are the ones that actually bite: `psycopg2` / psycopg2-binary,
+    `grpc` / grpcio, `Levenshtein` / python-Levenshtein, `serial` / pyserial — the
+    distribution name is the import name with something bolted on.
+    """
+    imp, dist = _normalize(import_name), _normalize(distribution)
+    if imp == dist:
+        return True
+    if len(imp) < 3 or len(dist) < 3:      # two-letter names match far too much
+        return False
+    return imp in dist or dist in imp
+
+
+def satisfied_by(dotted: str, declared: frozenset[str] | set[str]) -> tuple[bool, bool]:
+    """(satisfied, certain) — is this import name provided by something declared?
+
+    `certain` is what decides whether a NO may stop a build. A gate that guesses
+    must fail OPEN: a false positive here does not cost six minutes, it makes a
+    perfectly good project impossible to build at all, with an error message
+    telling the operator to add a package they already have.
+    """
+    match = resolve_distributions(dotted)
+    if set(match.candidates) & set(declared):
+        return True, True
+
+    # The interpreter, read backwards: does a DECLARED distribution actually ship
+    # this import name? Needs no table, and it is ground truth wherever the build
+    # machine has the package.
+    top = dotted.split(".")[0]
+    provides = _metadata_provides()
+    for dist in declared:
+        if top in provides.get(dist, ()):
+            return True, True
+
+    if match.certain:
+        return False, True                 # we KNOW what provides it; nothing does
+
+    # All we ever had was "the import name must be the package name". If any
+    # declared package even looks like it could be the real provider, we do not
+    # know enough to refuse the build — say so and let the post-install find_spec
+    # probe, which is ground truth, be the one that fails.
+    related = any(_looks_related(top, dist) for dist in declared)
+    return False, not related
+
+
 def _sites_of(name: str, buckets: dict[str, list[ImportSite]], root: Path) -> list[str]:
     return [site.where(root) for site in buckets.get(name, [])]
 
 
 def missing_from_lock(entrypoint: Path, project_dir: Path,
-                      requirements_text: str) -> MissingReport:
+                      requirements_text: str, *, source_label: str = "",
+                      optional_groups: dict[str, tuple[str, ...]] | None = None
+                      ) -> MissingReport:
     """The same gate, answered from the DECLARATIONS alone — no interpreter, no
     pip, no I/O beyond reading the project's own .py files.
 
@@ -623,13 +966,27 @@ def missing_from_lock(entrypoint: Path, project_dir: Path,
     required, optional = classify(project_dir, entrypoint)
     declared = declared_distributions(requirements_text)
 
+    unsure: list[str] = []
+
     def unsatisfied(names) -> list[str]:
-        return sorted(name for name in names
-                      if not (set(candidate_distributions(name)) & declared))
+        out = []
+        for name in sorted(names):
+            ok, certain = satisfied_by(name, declared)
+            if ok:
+                continue
+            out.append(name)
+            if not certain:
+                # We guessed at the package name and something declared looks like
+                # it. Report it, never block on it.
+                unsure.append(name)
+        return out
 
     report = MissingReport(required=unsatisfied(required), optional=unsatisfied(optional),
                            complete=is_pinned_closure(requirements_text),
-                           declared=frozenset(declared))
+                           declared=frozenset(declared),
+                           source_label=source_label,
+                           optional_groups=dict(optional_groups or {}))
+    report.unsure = unsure
     for name in report.required:
         report.sites[name] = _sites_of(name, required, project_dir)
     for name in report.optional:
@@ -681,12 +1038,20 @@ def importable_in(python: Path, names: set[str]) -> set[str]:
 
 
 def missing_dependencies(entrypoint: Path, project_dir: Path,
-                         python: Path) -> MissingReport:
+                         python: Path, *, source_label: str = "",
+                         optional_groups: dict[str, tuple[str, ...]] | None = None
+                         ) -> MissingReport:
     """Imports the app makes that the PACKAGED runtime cannot satisfy.
 
     The proof after the install, where `missing_from_lock()` is the prediction
     before it: a distribution can be declared and still not import (wrong ABI, a
     wheel that quietly failed), and only the staged interpreter knows.
+
+    Nothing here is ever `unsure`: this asks `find_spec` inside the runtime we are
+    about to ship, so no distribution-name guessing is involved. What it says is
+    missing IS missing. `source_label`/`optional_groups` only shape the ADVICE —
+    「在『進階設定 → 選用相依群組』填 llm」 beats 「請加進 requirements」 for a
+    project whose package is sitting in a pyproject extra.
     """
     entrypoint, project_dir = Path(entrypoint), Path(project_dir)
     # Tolerate the two call orders: this used to be (project_dir, entrypoint, ...)
@@ -697,7 +1062,8 @@ def missing_dependencies(entrypoint: Path, project_dir: Path,
     required, optional = classify(project_dir, entrypoint)
     wanted = set(required) | set(optional)
     if not wanted:
-        return MissingReport()
+        return MissingReport(source_label=source_label,
+                             optional_groups=dict(optional_groups or {}))
 
     available = importable_in(python, wanted)          # raises if it cannot tell
     report = MissingReport(
@@ -706,6 +1072,8 @@ def missing_dependencies(entrypoint: Path, project_dir: Path,
         # The staged interpreter IS the closure: whatever pip was going to drag in
         # is already on disk. Absence here is proof, and it blocks (complete=True).
         complete=True,
+        source_label=source_label,
+        optional_groups=dict(optional_groups or {}),
     )
     for name in report.required:
         report.sites[name] = _sites_of(name, required, project_dir)

@@ -34,6 +34,21 @@ class LockTimeout(Exception):
     pass
 
 
+class AlreadyRunning(Exception):
+    """A live copy of this app already holds the instance lock.
+
+    NOT an error, and NOT a lock failure: it is the answer to 「我按了兩次
+    start.bat」. The second launcher must say so and leave — see
+    acquire_single_instance().
+    """
+
+    def __init__(self, message: str, *, owner: dict | None = None,
+                 path: Path | None = None):
+        super().__init__(message)
+        self.owner = owner or {}
+        self.path = path
+
+
 # ── process identity ─────────────────────────────────────────────────────────
 
 def process_start_time(pid: int) -> int | None:
@@ -141,8 +156,7 @@ class FileLock:
     def acquire(self, timeout: float = 30.0, poll: float = 0.2) -> "FileLock":
         deadline = time.monotonic() + timeout
         token = uuid.uuid4().hex
-        body = json.dumps({**my_identity(), "operation_id": token,
-                           "created_at": time.time(), "what": self.what})
+        body = self._body(token)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(f".claim-{token}.tmp")
         try:
@@ -158,6 +172,46 @@ class FileLock:
                 os.remove(tmp)
             except OSError:
                 pass
+
+    def try_acquire(self) -> bool:
+        """ONE attempt, no waiting. True = it is ours; False = somebody ALIVE has it.
+
+        This is what a single-instance check needs and what acquire() cannot be:
+        acquire() waits (30 seconds, by default) and then hands the lock over
+        anyway — which is how double-clicking start.bat produced a second launcher,
+        a second Streamlit and two writers of one state file.
+
+        Two passes, because the first _claim() may only have BROKEN a stale lock
+        (a previous run that was killed): a dead owner must never lock the app out
+        of its own machine forever.
+        """
+        token = uuid.uuid4().hex
+        body = self._body(token)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_name(f".claim-{token}.tmp")
+        try:
+            for _attempt in range(2):
+                if self._claim(tmp, body):
+                    self._token = token
+                    return True
+            return False
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+    def owner(self) -> dict:
+        """Who holds it right now — {} if nobody, or if the body is unreadable."""
+        try:
+            meta = json.loads(self.path.read_text("utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return meta if isinstance(meta, dict) else {}
+
+    def _body(self, token: str) -> str:
+        return json.dumps({**my_identity(), "operation_id": token,
+                           "created_at": time.time(), "what": self.what})
 
     def _claim(self, tmp: Path, body: str) -> bool:
         """One attempt. True = we own the lock. False = held; caller retries."""
@@ -294,3 +348,54 @@ def store_gc_lock(deps_dir: Path) -> FileLock:
     and an unexpected entry in every listing of the runtime store.
     """
     return FileLock(Path(deps_dir) / ".locks" / "gc.lock", what="store GC lock")
+
+
+# ── single instance ──────────────────────────────────────────────────────────
+#
+# There was no such check. A user who double-clicks start.bat (and they do — the
+# first click shows nothing for several seconds while the runtime is verified)
+# got a SECOND launcher: a second Streamlit on a second port, a second control
+# channel, two processes writing one state.json, and two windows the user cannot
+# tell apart. Nothing stopped it — the app update lock is taken only around the
+# state WRITE, so it is free the entire time the app is actually running.
+#
+# The instance lock is a lock nobody waits on. Held for the whole session, checked
+# with try_acquire(): if a live owner has it, the second copy says so and leaves.
+# A crashed owner leaves a stale lock, which try_acquire() takes over (pid +
+# process start time — a reused PID cannot keep a dead app's lock alive).
+
+INSTANCE_LOCK_NAME = "instance.lock"
+ALREADY_RUNNING_MESSAGE = "這個 App 已經在執行中。"
+
+
+def instance_lock(data_dir: Path) -> FileLock:
+    """The 「這個 App 已經在執行中」 lock. Lives in the app's DATA dir (which is
+    per-app and writable), not in state/ — it has nothing to do with state.json,
+    and it is held for the entire session, which the update lock must never be."""
+    return FileLock(Path(data_dir) / INSTANCE_LOCK_NAME, what="app instance lock")
+
+
+def acquire_single_instance(data_dir: Path) -> FileLock:
+    """Hold the app's instance lock, or raise AlreadyRunning IMMEDIATELY.
+
+    Immediately is the point. The alternative — acquire(timeout=30) — makes the
+    second copy of the app sit there for thirty seconds and then start anyway,
+    which is both the slowest possible way to do the wrong thing and the reason
+    two Streamlits ended up sharing one state file.
+
+    Callers (bootstrap.start_app) should release it in a `finally`, print
+    exc.args[0] on AlreadyRunning, and exit 0: a user who pressed start twice has
+    not broken anything, and their app IS running.
+    """
+    lock = instance_lock(data_dir)
+    if lock.try_acquire():
+        return lock
+    owner = lock.owner()
+    pid = owner.get("pid")
+    who = f"(PID {pid})" if isinstance(pid, int) else ""
+    raise AlreadyRunning(
+        f"{ALREADY_RUNNING_MESSAGE}{who}\n"
+        "  請切換到已經開著的那個視窗(工作列上應該找得到),不用再開一個。\n"
+        "  如果畫面上根本沒有這個 App(它可能當掉了):請到「工作管理員」把它結束掉,"
+        "再重新啟動一次。",
+        owner=owner, path=lock.path)

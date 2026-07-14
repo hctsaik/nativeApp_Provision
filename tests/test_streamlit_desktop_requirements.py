@@ -189,6 +189,96 @@ def test_asking_for_an_extra_that_does_not_exist_is_an_actionable_error(tmp_path
         req_mod.resolve(tmp_path, staging=tmp_path / "s", extras=("gpu",))
 
 
+def test_a_foreign_local_wheel_is_not_dropped_as_if_it_were_the_project_itself(tmp_path):
+    """The other half of the VCS bug. `internal-lib @ file:///C:/wheels/…whl` is
+    SOMEBODY ELSE's package sitting on this build machine: dropping it makes it
+    simply ABSENT at the factory — and it was being dropped under the message
+    「專案自己的原始碼會直接打包進去」, which is a lie about a package the operator
+    now has no idea they lost. Name it, say why, say what to do."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    lock = tmp_path / "requirements.lock.txt"
+    lock.write_text(
+        "streamlit==1.40.0\n"
+        "-e .\n"
+        "internal-lib @ file:///C:/wheels/internal_lib-1.0-py3-none-any.whl\n",
+        encoding="utf-8")
+
+    said: list[str] = []
+    for_pip = req_mod.sanitize_for_pip(lock, tmp_path / "staging", progress=said.append,
+                                       project_dir=project)
+    body = for_pip.read_text("utf-8")
+    assert "internal_lib" not in body and "-e ." not in body   # pip sees neither
+    assert "streamlit==1.40.0" in body
+
+    message = "\n".join(said)
+    assert "internal_lib-1.0-py3-none-any.whl" in message      # WHICH line
+    assert "pip wheel" in message and "==" in message          # WHAT to do
+    assert "wheelhouse" in message                             # …and where to put it
+    # and the project's own-source line is not claimed for somebody else's wheel
+    own = [s for s in said if "專案自己的原始碼" in s]
+    assert own and "internal_lib" not in "".join(own)
+    message.encode("cp950")
+
+
+def test_the_project_itself_is_still_recognised_and_dropped_quietly(tmp_path):
+    """`pip freeze` in a venv where the project was `pip install -e .`'d writes the
+    project as `-e .` or `ai4bi @ file:///C:/code/claude/AI4BI`. That one really IS
+    packaged in application/, and must not be dressed up as a lost dependency."""
+    project = tmp_path / "AI4BI"
+    project.mkdir()
+    lock = tmp_path / "requirements.lock.txt"
+    lock.write_text(
+        f"streamlit==1.40.0\nai4bi @ file:///{project.as_posix()}\n", encoding="utf-8")
+
+    said: list[str] = []
+    req_mod.sanitize_for_pip(lock, tmp_path / "staging", progress=said.append,
+                             project_dir=project)
+    message = "\n".join(said)
+    assert "專案自己的原始碼會直接打包進去" in message
+    assert "pip wheel" not in message          # nothing to vendor: it is the app
+    message.encode("cp950")
+
+
+def test_pip_freeze_advice_warns_about_the_line_pip_freeze_itself_emits(tmp_path):
+    """We tell the operator 「pip freeze > requirements.lock.txt」 in four places,
+    and `pip freeze` in a project venv emits `-e .` / `pkg @ file:///…` — which
+    Store mode's normalize_lock then REJECTS outright. Sending someone down a path
+    we ourselves refuse to accept, with no next step, is a dead end. Say it here."""
+    with pytest.raises(req_mod.RequirementsError) as exc:
+        req_mod.resolve(tmp_path)
+
+    message = str(exc.value)
+    assert "pip freeze" in message
+    assert "-e ." in message and "file://" in message     # the lines it will emit
+    assert "刪掉" in message                               # …and what to do with them
+    message.encode("cp950")
+
+
+def test_optional_groups_are_exposed_for_the_advice_that_depends_on_them(tmp_path):
+    """`resolve()` knows the project's optional-dependency groups; the import gate
+    needs them to say 「填 llm」 instead of 「請加進 requirements」. Carried even when
+    the requirements themselves came from a lock file."""
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "ai4bi"\ndependencies = ["streamlit>=1.35"]\n'
+        '[project.optional-dependencies]\nllm = ["anthropic>=0.40"]\ndev = ["pytest>=7"]\n',
+        encoding="utf-8")
+
+    found = req_mod.resolve(tmp_path)
+    assert found.optional_groups() == {"llm": ("anthropic",), "dev": ("pytest",)}
+
+    # a lock wins as the install source, but the groups still explain a miss
+    (tmp_path / "requirements.lock.txt").write_text("streamlit==1.40.0\n", encoding="utf-8")
+    locked = req_mod.resolve(tmp_path)
+    assert locked.path.name == "requirements.lock.txt"
+    assert locked.optional_groups() == {"llm": ("anthropic",), "dev": ("pytest",)}
+
+
+def test_a_project_without_pyproject_has_no_optional_groups(tmp_path):
+    (tmp_path / "requirements.txt").write_text("streamlit>=1.0\n", encoding="utf-8")
+    assert req_mod.resolve(tmp_path).optional_groups() == {}
+
+
 @pytest.mark.parametrize("line,expected", [
     ("pip @ file:///D:/x/pip.whl", "pip"),
     ("opencv-python-headless==5.0.0.93", "opencv-python-headless"),

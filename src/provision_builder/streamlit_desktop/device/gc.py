@@ -71,6 +71,40 @@ Before this, all four failures exited 2 — and 0 covered both "deleted every tr
 and "there was nothing to delete", which is how 「上面列出的項目都已經刪掉了」 came
 to be printed over a run that listed nothing and freed 0 bytes.
 
+WHAT ACTUALLY FILLS THE DISK IS NOT THE VERSIONS
+================================================
+GC used to look at version dirs, runtimes, shells and leases — and nothing else.
+But nothing in this system ever rotated a log: every launch writes a
+launcher-*.log AND a streamlit-*.log AND a bootstrap-*.log, forever, and
+PYTHONPYCACHEPREFIX points every .pyc the app compiles at data/cache/pycache. On
+a machine that has been running for months, THAT is where the C: drive went — and
+it was the one thing GC could not see. So:
+
+  * apps/<app>/data/logs/  is scanned, and every log except the newest
+    LOG_KEEP_RECENT of each family (launcher-/streamlit-/bootstrap-) is offered
+    for reclamation, reported SEPARATELY from versions and runtimes.
+  * apps/<app>/data/cache/ (pycache) is offered too: it is regenerated on the
+    next launch and costs nothing but a slightly slower start.
+  * rotate_logs() is the retention half — call it wherever the logs are created
+    (bootstrap.py, right after ensure_data_dirs()) so this stops happening.
+
+AND: AN EMPTY PLAN IS NOT AN ANSWER TO 「C 槽快滿了」
+====================================================
+「沒有可回收的項目」 is true and useless to somebody whose disk is full. Every run
+now also reports WHERE THE SPACE WENT: shutil.disk_usage() (free space on the
+drive), the size of this tree, and the biggest consumers inside it — including how
+much of it is logs. If the store is not the culprit, GC says so out loud
+(「這棵樹只佔 x MB;C 槽的空間不是被它吃掉的」), which is the answer they came for
+even though it reclaims nothing.
+
+AND: A SIZE THAT COULD NOT BE MEASURED IS NOT ZERO
+=================================================
+GcPlan._mb() wrapped the whole rglob in try/except and returned 0.0 — so ONE file
+held open by a running App made a 450 MB runtime report as 「0 MB」, and the
+operator concluded there was nothing to gain. Measurement now walks per entry,
+counts what it could not read (Measured.unreadable), and says 「至少 N MB」 instead
+of pretending a runtime is empty.
+
 WHAT A GUI SHOULD READ (never re-derive any of this from the plan's forecast):
     plan.applied            did --apply actually run?
     plan.deleted            [(label, mb)] — what ACTUALLY went away
@@ -83,6 +117,22 @@ WHAT A GUI SHOULD READ (never re-derive any of this from the plan's forecast):
                             never 「已刪除」 and never a reclaimed total
     plan.headline()         one honest cp950-safe line, safe to show verbatim
     plan.exit_code()        the table above
+
+    …and, for the person whose C: drive is full — valid even when the plan is EMPTY:
+    plan.disk               DiskSpace: .total_mb .used_mb .free_mb .free_pct
+                            .nearly_full() .path ("C:") .known (False = unreadable)
+    plan.disk_after         the same, re-measured after --apply (None on a dry run)
+    plan.store_mb()         how much of the disk THIS TREE is holding
+    plan.consumers          [Consumer] — .label .kind .mb .reclaimable_mb .partial
+                            kinds: versions|logs|cache|data|staging|runtime|shell|other
+    plan.biggest(n)         the same, largest first: which runtime, how big, how
+                            much of it is logs
+    plan.delete_logs        [GcGroup] — old rotated logs (.count .mb .paths .root)
+    plan.delete_caches      [GcGroup] — data/cache (regenerable)
+    plan.logs_mb() / plan.cache_mb()        what the plan would reclaim from each
+    plan.store_is_the_problem()  False → 「C 槽的空間不是被這棵樹吃掉的」
+    plan.unmeasured         [(path, why)] — files we could NOT size (a running App
+                            holds them). Sizes near these are 「至少」, never exact.
 """
 
 from __future__ import annotations
@@ -92,7 +142,9 @@ import sys
 
 sys.dont_write_bytecode = True  # we run under the shared runtime; never mutate it
 
+import os
 import shutil
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -153,6 +205,31 @@ KEEP_LEASE = "正在執行中(lease)"
 IN_USE_HINT = "檔案使用中:請把 App 完全關掉(所有視窗),再重跑一次回收。"
 OTHER_HINT = "請先排除上面的錯誤,再重跑一次回收。"
 
+# ── log retention (the reason the disk filled up in the first place) ─────────
+#
+# Nothing rotated these, ever. Every launch appends one more launcher-*.log, one
+# more streamlit-*.log and one more bootstrap-*.log to apps/<app>/data/logs, and
+# they are all still there months later. Keep the newest few of each family — that
+# is every log anyone ever reads — and let GC (and rotate_logs()) reclaim the rest.
+LOG_KEEP_RECENT = 10          # per family: launcher-*, streamlit-*, bootstrap-*
+# A log written seconds ago belongs to a session that is probably still running.
+# Never touch it, whatever the count says: keeping too much is a wasted MB, and
+# deleting the log of a live session is a support call nobody can answer.
+LOG_FRESH_SECONDS = 3600.0
+LOG_SUFFIX = ".log"
+
+# How many unreadable paths we keep as examples. The COUNT is always exact; the
+# list is a sample, because a locked runtime can produce thousands.
+_UNMEASURED_SAMPLE = 20
+
+# The disk is "nearly full" at either of these — whichever bites first. 10% of a
+# 2 TB disk is 200 GB (not full at all), and 1 GB free on a 128 GB SSD is.
+DISK_LOW_PERCENT = 10.0
+DISK_LOW_MB = 1024.0
+# Below this share of the disk's USED space, this tree cannot be why C: is full,
+# and saying so is the most useful sentence GC can print on an already-clean store.
+STORE_BLAME_SHARE = 0.10
+
 
 class GcError(Exception):
     pass
@@ -201,6 +278,212 @@ class GcSurvivor:
         return f"{self.path}:{self.reason}"
 
 
+@dataclass
+class Measured:
+    """A size that knows what it could NOT see.
+
+    The old _mb() wrapped the entire directory walk in one try/except and returned
+    0.0 on any error — so a single file held open by a running App (antivirus,
+    Explorer, the App itself) made a 450 MB runtime report as 「0 MB」. The operator
+    read 「可回收 0 MB」, concluded there was nothing to gain, and stopped. A number
+    we could not measure is not zero: it is 「至少 N MB」, plus a count of what we
+    could not read.
+    """
+    mb: float = 0.0
+    files: int = 0
+    unreadable: int = 0          # files/dirs we could not stat or list
+
+    @property
+    def partial(self) -> bool:
+        return self.unreadable > 0
+
+    def add(self, other: "Measured") -> "Measured":
+        self.mb += other.mb
+        self.files += other.files
+        self.unreadable += other.unreadable
+        return self
+
+    def text(self) -> str:
+        if self.partial:
+            return (f"至少 {self.mb:,.0f} MB"
+                    f"(有 {self.unreadable} 個檔案量不到大小,實際可能更多)")
+        return f"{self.mb:,.0f} MB"
+
+
+def _entry_size(entry) -> int:
+    """The ONE place a file's size is read.
+
+    A single function so that "a file a running App has open" is a thing that can
+    be tested, instead of a thing we hope we handled.
+    """
+    return entry.stat(follow_symlinks=False).st_size
+
+
+@dataclass
+class DiskSpace:
+    """How full the drive actually is. Nobody in this repo had ever asked.
+
+    The operator did not run GC because they wanted a tidy store; they ran it
+    because C: is full. An answer that never mentions the disk is not an answer.
+    """
+    path: str = ""               # "C:" — for a GUI
+    total_mb: float = 0.0
+    used_mb: float = 0.0
+    free_mb: float = 0.0
+    error: str | None = None     # the disk itself would not answer
+
+    @property
+    def known(self) -> bool:
+        return self.error is None and self.total_mb > 0
+
+    @property
+    def label(self) -> str:
+        """「C 槽」 — what the person on the phone calls it. (self.path is "C:",
+        which reads as 「C::」 the moment you put a colon after it.)"""
+        if len(self.path) == 2 and self.path[1] == ":" and self.path[0].isalpha():
+            return f"{self.path[0].upper()} 槽"
+        return self.path or "這個磁碟"
+
+    @property
+    def free_pct(self) -> float:
+        return (100.0 * self.free_mb / self.total_mb) if self.total_mb else 0.0
+
+    def nearly_full(self) -> bool:
+        return self.known and (self.free_pct < DISK_LOW_PERCENT
+                               or self.free_mb < DISK_LOW_MB)
+
+    def line(self) -> str:
+        if not self.known:
+            return f"磁碟空間讀不到({self.error})"
+        verdict = "快滿了" if self.nearly_full() else "還夠用"
+        return (f"{self.label}:總共 {self.total_mb:,.0f} MB、"
+                f"用掉 {self.used_mb:,.0f} MB、可用 {self.free_mb:,.0f} MB"
+                f"(剩 {self.free_pct:.0f}%,{verdict})")
+
+
+def disk_space(path: Path) -> DiskSpace:
+    """shutil.disk_usage() of the volume `path` lives on — zero uses of it in this
+    repo before now, on a system whose whole job is disk space."""
+    path = Path(path)
+    try:
+        usage = shutil.disk_usage(str(path))
+    except OSError as exc:
+        return DiskSpace(path=str(path), error=str(exc))
+    try:
+        drive = os.path.splitdrive(str(path.resolve()))[0]
+    except OSError:
+        drive = ""
+    return DiskSpace(path=drive or str(path),
+                     total_mb=usage.total / 1024 ** 2,
+                     used_mb=usage.used / 1024 ** 2,
+                     free_mb=usage.free / 1024 ** 2)
+
+
+@dataclass
+class Consumer:
+    """One line of 「你的磁碟到底被誰吃掉了」.
+
+    Reported for EVERY run, including the ones with nothing to reclaim — that is
+    the whole point: an operator with a full C: drive needs to know where the space
+    went even (especially) when GC cannot give any of it back.
+    """
+    label: str
+    kind: str                    # versions|logs|cache|data|staging|runtime|shell|other
+    mb: float = 0.0
+    reclaimable_mb: float = 0.0  # how much of it THIS run could take back
+    partial: bool = False        # some of it could not be measured
+    path: str | None = None
+
+    def line(self) -> str:
+        size = f"至少 {self.mb:,.0f} MB" if self.partial else f"{self.mb:,.0f} MB"
+        if self.reclaimable_mb >= 1:
+            return f"{self.label}:{size}(其中 {self.reclaimable_mb:,.0f} MB 這次可以回收)"
+        return f"{self.label}:{size}"
+
+
+@dataclass
+class GcGroup:
+    """Hundreds of small files that are ONE decision for the operator.
+
+    400 rotated logs are not 400 choices; they are 「舊記錄檔」. The group keeps
+    every path (so a partial failure names exactly what stayed) and prints as a
+    single line (so the console stays readable).
+    """
+    kind: str                    # "logs" | "cache"
+    app_id: str
+    label: str
+    root: Path
+    paths: list = field(default_factory=list)
+    mb: float = 0.0
+    partial: bool = False
+
+    @property
+    def count(self) -> int:
+        return len(self.paths)
+
+    def line(self) -> str:
+        size = f"至少 {self.mb:,.0f} MB" if self.partial else f"{self.mb:,.0f} MB"
+        return f"{self.label}:{self.count} 個({size})"
+
+
+# ── log retention ────────────────────────────────────────────────────────────
+
+def _log_family(name: str) -> str:
+    """launcher-20260712-101500.log -> "launcher". The family is what we keep N of."""
+    return name.split("-", 1)[0].lower()
+
+
+def stale_logs(log_dir: Path, *, keep: int = LOG_KEEP_RECENT,
+               fresh_seconds: float = LOG_FRESH_SECONDS) -> list:
+    """Every log EXCEPT the newest `keep` of each family and anything just written.
+
+    Nobody has ever read the 300th-newest launcher log. Everybody needs the last
+    couple, and the ones from a session that is running right now — so those are
+    exactly what survives.
+    """
+    try:
+        entries = [e for e in os.scandir(Path(log_dir)) if e.is_file()]
+    except OSError:
+        return []                    # no logs dir (or unreadable): nothing to do
+    now = time.time()
+    families: dict = {}
+    for entry in entries:
+        if not entry.name.lower().endswith(LOG_SUFFIX):
+            continue
+        try:
+            mtime = entry.stat().st_mtime
+        except OSError:
+            continue                 # cannot judge its age -> never delete it
+        if now - mtime < fresh_seconds:
+            continue                 # a live session is writing it
+        families.setdefault(_log_family(entry.name), []).append((mtime, Path(entry.path)))
+    doomed: list = []
+    for items in families.values():
+        items.sort(key=lambda item: (item[0], str(item[1])), reverse=True)
+        doomed += [path for _mtime, path in items[keep:]]
+    return sorted(doomed)
+
+
+def rotate_logs(log_dir: Path, *, keep: int = LOG_KEEP_RECENT) -> list:
+    """RETENTION. Delete all but the newest `keep` logs of each family; return what
+    went. Best-effort and silent: a log the App still has open is simply left for
+    next time.
+
+    THIS IS THE FIX FOR THE ROOT CAUSE, and it belongs wherever the logs are
+    CREATED — one call, right after the log dir is ensured (bootstrap.py's
+    _setup_logging / start_app, which runs on every single launch). GC can only
+    ever mop up afterwards; this is what stops the puddle.
+    """
+    removed: list = []
+    for path in stale_logs(log_dir, keep=keep):
+        try:
+            os.remove(path)
+        except OSError:
+            continue                 # in use / no permission: next launch gets it
+        removed.append(path)
+    return removed
+
+
 def _emit(log, message: str) -> None:
     """Write to the console without ever letting the console kill the run.
 
@@ -232,6 +515,12 @@ class GcPlan:
     delete_runtimes: list = field(default_factory=list)  # (fingerprint, Path)
     delete_shells: list = field(default_factory=list)    # (fingerprint, Path)
     delete_staging: list = field(default_factory=list)   # (what, Path)
+    # What ACTUALLY fills a machine that has been running for months, and what GC
+    # could not see at all until now: one launcher-*.log + one streamlit-*.log +
+    # one bootstrap-*.log per launch, never rotated, plus every .pyc the app ever
+    # compiled (PYTHONPYCACHEPREFIX -> data/cache/pycache).
+    delete_logs: list = field(default_factory=list)      # [GcGroup] kind="logs"
+    delete_caches: list = field(default_factory=list)    # [GcGroup] kind="cache"
     # Scope. apps_considered is what --app selected (default: everything); the rest
     # of apps_all is scanned for the KEEP-set (a shared runtime belongs to the
     # machine, not to one app) but nothing under it is deleted.
@@ -258,6 +547,18 @@ class GcPlan:
     applied: bool = False
     deleted: list = field(default_factory=list)          # (label, mb) — MEASURED
     survivors: list = field(default_factory=list)        # GcSurvivor
+    # WHERE THE SPACE WENT — filled in by collect_plan() on EVERY run, valid even
+    # when there is nothing to reclaim. An operator with a full C: drive is owed an
+    # answer, and 「沒有可回收的項目」 is not one.
+    disk: DiskSpace = field(default_factory=DiskSpace)
+    disk_after: DiskSpace | None = None                  # re-measured after --apply
+    consumers: list = field(default_factory=list)        # [Consumer], the breakdown
+    # Files we could NOT size (a running App holds them open). Every total near one
+    # of these is 「至少」, never exact — and NEVER 0 MB, which is what the old
+    # blanket try/except reported for an entire 450 MB runtime.
+    unmeasured: list = field(default_factory=list)       # sample of (path, why)
+    unmeasured_count: int = 0                            # …the exact count
+    _sizes: dict = field(default_factory=dict, repr=False)   # path -> Measured
 
     @property
     def failures(self) -> list:
@@ -266,37 +567,217 @@ class GcPlan:
         back is exactly the bug this module exists to not have."""
         return [survivor.line() for survivor in self.survivors]
 
+    # ── measurement ──────────────────────────────────────────────────────────
+    #
+    # The old version was `try: sum(...rglob...) except OSError: return 0.0`. One
+    # unreadable file — an antivirus scan, Explorer sitting in the folder, the App
+    # itself still running — and an entire 450 MB runtime reported as 0 MB. The
+    # operator was told there was nothing to reclaim, and believed it.
+
+    def measure(self, path: Path) -> Measured:
+        """Size a tree, reporting what could not be read instead of calling it 0."""
+        key = str(path)
+        found = self._sizes.get(key)
+        if found is None:
+            found = self._walk(Path(path))
+            self._sizes[key] = found
+        return found
+
+    def _walk(self, path: Path) -> Measured:
+        result = Measured()
+        if path.is_file():
+            try:
+                result.mb = path.stat().st_size / 1024 ** 2
+                result.files = 1
+            except OSError as exc:
+                result.unreadable = 1
+                self._note_unreadable(path, exc)
+            return result
+        total = 0
+        stack = [path]
+        while stack:
+            current = stack.pop()
+            try:
+                entries = list(os.scandir(current))
+            except FileNotFoundError:
+                continue                      # not there = genuinely 0, not unknown
+            except OSError as exc:
+                result.unreadable += 1
+                self._note_unreadable(current, exc)
+                continue
+            for entry in entries:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(Path(entry.path))
+                        continue
+                    total += _entry_size(entry)
+                    result.files += 1
+                except OSError as exc:
+                    # THE line this whole class exists for: one locked file costs
+                    # us one file, not the entire runtime.
+                    result.unreadable += 1
+                    self._note_unreadable(Path(entry.path), exc)
+        result.mb = total / 1024 ** 2
+        return result
+
+    def _note_unreadable(self, path: Path, exc: OSError) -> None:
+        self.unmeasured_count += 1
+        if len(self.unmeasured) < _UNMEASURED_SAMPLE:
+            self.unmeasured.append((str(path), _why(exc)))
+
+    def measurement_is_partial(self) -> bool:
+        """True when at least one file could not be sized: every 「MB」 we print is
+        a floor, not a total."""
+        return self.unmeasured_count > 0
+
+    def refresh_usage(self, root: Path) -> None:
+        """Re-measure the tree AFTER --apply.
+
+        The breakdown collect_plan() took is a snapshot of a tree that no longer
+        exists: printing 「記錄檔 33 MB(其中 31 MB 這次可以回收)」 in the report of
+        the run that just reclaimed them is the same past-tense forecast that made
+        operators believe they had freed space rmtree never took. Measure again,
+        and quote no forecast at all.
+        """
+        self._sizes.clear()
+        self.consumers = []
+        self.unmeasured = []
+        self.unmeasured_count = 0
+        _measure_store(self, Path(root), forecast=False)
+
     def _mb(self, path: Path) -> float:
-        try:
-            return sum(f.stat().st_size for f in Path(path).rglob("*")
-                       if f.is_file()) / 1024 ** 2
-        except OSError:
-            return 0.0
+        return self.measure(path).mb
+
+    # ── the plan ─────────────────────────────────────────────────────────────
+
+    def groups(self) -> list:
+        """The bulk items (old logs, cache), which are deleted file by file but
+        decided — and reported — as one thing each."""
+        return list(self.delete_logs) + list(self.delete_caches)
 
     def is_empty(self) -> bool:
         return not (self.delete_versions or self.delete_runtimes
-                    or self.delete_shells or self.delete_staging)
+                    or self.delete_shells or self.delete_staging
+                    or self.delete_logs or self.delete_caches)
+
+    def logs_mb(self) -> float:
+        """How much of the plan is old logs — the number that explains a disk that
+        filled up 'by itself'."""
+        return sum(group.mb for group in self.delete_logs)
+
+    def cache_mb(self) -> float:
+        return sum(group.mb for group in self.delete_caches)
 
     def reclaimable_mb(self) -> float:
         return sum(self._mb(p) for _fp, p in self.delete_runtimes) \
             + sum(self._mb(p) for _fp, p in self.delete_shells) \
             + sum(self._mb(p) for _a, _v, p in self.delete_versions) \
-            + sum(self._mb(p) for _w, p in self.delete_staging)
+            + sum(self._mb(p) for _w, p in self.delete_staging) \
+            + self.logs_mb() + self.cache_mb()
 
     def reclaimed_mb(self) -> float:
         return sum(mb for _label, mb in self.deleted)
 
     def items(self) -> list:
-        """Everything to delete, as (label, path), in deletion order."""
+        """Every TREE to delete, as (label, path), in deletion order. The bulk file
+        groups (logs, cache) are groups(), not items(): 400 rotated logs must not
+        become 400 console lines and 400 entries in `deleted`."""
         return ([(f"版本 {a}/{v}", p) for a, v, p in self.delete_versions]
                 + [(f"runtime {fp}", p) for fp, p in self.delete_runtimes]
                 + [(f"shell {fp}", p) for fp, p in self.delete_shells]
                 + [(f"建置殘留 {w}", p) for w, p in self.delete_staging])
 
+    def item_count(self) -> int:
+        return len(self.items()) + len(self.groups())
+
     def nothing_to_reclaim(self) -> bool:
         """There is nothing to delete — before --apply and after it alike. NOT a
         failure, and NOT a reclaim: the disk is exactly as full as it was."""
         return self.is_empty()
+
+    # ── where the space went (true even when nothing can be reclaimed) ───────
+
+    def store_mb(self) -> float:
+        return sum(consumer.mb for consumer in self.consumers)
+
+    def biggest(self, limit: int = 5) -> list:
+        """The biggest things in this tree, largest first: which runtime, how big,
+        how much of it is logs."""
+        ranked = sorted(self.consumers, key=lambda c: c.mb, reverse=True)
+        return [consumer for consumer in ranked if consumer.mb >= 0.5][:limit]
+
+    def store_is_the_problem(self) -> bool:
+        """Could this tree plausibly be why the disk is full?
+
+        When it could not (it is a rounding error next to what the disk has used),
+        saying so is the single most useful thing GC can tell a person who came
+        here to free space — and it costs one line.
+        """
+        if not self.disk.known:
+            return True             # unknowable: never send them looking elsewhere
+        return self.store_mb() >= STORE_BLAME_SHARE * self.disk.used_mb
+
+    def space_headline(self) -> str:
+        """One line, for the operator standing in front of a full C: drive."""
+        store = self.store_mb()
+        if not self.disk.known:
+            return f"這棵樹目前佔用 {store:,.0f} MB。"
+        if not self.store_is_the_problem():
+            return (f"這棵樹只佔 {store:,.0f} MB,{self.disk.label}的空間不是被它吃掉的"
+                    f"(可用 {self.disk.free_mb:,.0f} MB)。")
+        return (f"這棵樹目前佔用 {store:,.0f} MB;"
+                f"{self.disk.label}可用 {self.disk.free_mb:,.0f} MB"
+                f"{'(快滿了)' if self.disk.nearly_full() else ''}。")
+
+    def space_lines(self) -> list[str]:
+        """WHERE THE SPACE WENT — printed on every run, including the ones that
+        reclaim nothing.
+
+        「沒有可回收的項目」 is a true answer to a question the operator did not ask.
+        They asked where their C: drive went. This is that answer: how full the disk
+        is, how much of it is this tree, what the biggest pieces are, and how much
+        of it is just logs nobody ever rotated.
+        """
+        lines = ["", "磁碟空間:", f"  {self.disk.line()}"]
+        store = self.store_mb()
+        note = "(至少;有檔案量不到大小)" if self.measurement_is_partial() else ""
+        share = ""
+        if self.disk.known and self.disk.used_mb >= 1:
+            percent = 100.0 * store / self.disk.used_mb
+            if percent >= 1:
+                share = f",佔{self.disk.label}已用空間的 {percent:.0f}%"
+        lines.append(f"  這棵樹(整個交付資料夾)目前佔用:{store:,.0f} MB{note}{share}")
+        for consumer in self.biggest(5):
+            lines.append(f"    - {consumer.line()}")
+        if not self.applied:
+            reclaim_logs, reclaim_cache = self.logs_mb(), self.cache_mb()
+            if reclaim_logs >= 1 or reclaim_cache >= 1:
+                lines.append(f"  其中舊記錄檔 {reclaim_logs:,.0f} MB、"
+                             f"快取 {reclaim_cache:,.0f} MB 這次可以回收"
+                             f"(記錄檔一直沒有人輪替,每啟動一次就多一份)")
+        if self.applied and self.disk_after is not None and self.disk_after.known:
+            lines.append(f"  {self.disk.label}可用空間:{self.disk.free_mb:,.0f} MB "
+                         f"-> {self.disk_after.free_mb:,.0f} MB")
+        if not self.store_is_the_problem():
+            lines.append(f"  這棵樹只佔 {store:,.0f} MB,{self.disk.label}的空間不是被它"
+                         "吃掉的:請往別處找(使用者的下載/桌面、Windows 更新暫存、"
+                         "其他程式的資料夾)。")
+        elif self.disk.nearly_full():
+            lines.append(f"  {self.disk.label}快滿了(可用 {self.disk.free_mb:,.0f} MB)。")
+        lines += self.unmeasured_lines()
+        return lines
+
+    def unmeasured_lines(self) -> list[str]:
+        """Files we could not size. Silence here is what let one locked file turn a
+        450 MB runtime into 「0 MB」 and send the operator away empty-handed."""
+        if not self.measurement_is_partial():
+            return []
+        lines = [f"  有 {self.unmeasured_count} 個檔案量不到大小(通常是 App 還開著,"
+                 "或防毒/檔案總管正在讀),所以上面的數字是「至少」,不是「全部」:"]
+        lines += [f"    - {path}:{why}" for path, why in self.unmeasured[:5]]
+        if self.unmeasured_count > 5:
+            lines.append(f"    …還有 {self.unmeasured_count - 5} 個")
+        return lines
 
     def exit_code(self) -> int:
         """What the caller (tools\\gc.bat) is told. See the contract table.
@@ -330,12 +811,14 @@ class GcPlan:
         """
         if not self.applied:                                   # a plan, not an outcome
             if not self.is_empty():
-                return (f"試算:可回收 {len(self.items())} 項、"
+                return (f"試算:可回收 {self.item_count()} 項、"
                         f"約 {self.reclaimable_mb():.0f} MB(還沒有刪除任何東西)。")
             if self.self_hosted:
                 return (f"沒有其他可回收的項目;還有一份沒人在用的 runtime "
                         f"{self.self_hosted},但 GC 正在用它執行,這次回收不掉。")
-            return "沒有可回收的項目。"
+            # An empty plan is NOT the end of the conversation. The person reading
+            # this has a full disk; tell them where the space actually is.
+            return f"沒有可回收的項目。{self.space_headline()}"
         if self.deleted and self.survivors:
             return (f"部分回收:刪掉 {len(self.deleted)} 項,"
                     f"實際回收 {self.reclaimed_mb():.0f} MB;"
@@ -349,7 +832,8 @@ class GcPlan:
         if self.self_hosted:
             return ("沒有刪掉任何東西:除了 GC 自己正在執行的那份 runtime 之外,"
                     "沒有可回收的項目。")
-        return "沒有可回收的項目:這次沒有刪掉任何東西,磁碟空間沒有變化。"
+        return (f"沒有可回收的項目:這次沒有刪掉任何東西,磁碟空間沒有變化。"
+                f"{self.space_headline()}")
 
     def scope_lines(self) -> list[str]:
         """Which apps this run even looked at. On a two-app store, a reclaim that
@@ -401,12 +885,13 @@ class GcPlan:
         point (tools\\gc.bat) picks `python.exe` from whichever runtime folder
         sorts last, so it lands on the orphan by pure luck of the fingerprint.
         """
-        size = self._mb(self.self_hosted_path) if self.self_hosted_path else 0.0
+        size = (self.measure(self.self_hosted_path).text()
+                if self.self_hosted_path else "0 MB")
         head = ("沒有其他可回收的項目,但是有一份沒人在用的 runtime 這次回收不掉:"
                 if self.is_empty() else "另外有一份沒人在用的 runtime 這次回收不掉:")
         lines = [
             f"\n[注意] {head}",
-            f"  runtime {self.self_hosted}({size:.0f} MB)沒有任何版本引用它,"
+            f"  runtime {self.self_hosted}({size})沒有任何版本引用它,"
             f"但 GC 正是用它裡面的 python.exe 在執行,不能砍掉自己腳下的地板。",
         ]
         if self.alternate_python:
@@ -429,10 +914,16 @@ class GcPlan:
         lines = self.scope_lines() + self.keep_lines()
         lines += [f"保留 runtime:{sorted(self.keep_fingerprints)}",
                   f"保留 shell:{sorted(self.keep_shells)}"]
-        lines += [f"可刪版本:{a}/{v}({self._mb(p):.0f} MB)" for a, v, p in self.delete_versions]
-        lines += [f"可刪 runtime:{fp}({self._mb(p):.0f} MB)" for fp, p in self.delete_runtimes]
-        lines += [f"可刪 shell:{fp}({self._mb(p):.0f} MB)" for fp, p in self.delete_shells]
-        lines += [f"可刪建置殘留:{w}({self._mb(p):.0f} MB)" for w, p in self.delete_staging]
+        lines += [f"可刪版本:{a}/{v}({self.measure(p).text()})" for a, v, p in self.delete_versions]
+        lines += [f"可刪 runtime:{fp}({self.measure(p).text()})" for fp, p in self.delete_runtimes]
+        lines += [f"可刪 shell:{fp}({self.measure(p).text()})" for fp, p in self.delete_shells]
+        lines += [f"可刪建置殘留:{w}({self.measure(p).text()})" for w, p in self.delete_staging]
+        # Reported SEPARATELY from versions/runtimes, because they are a different
+        # answer to a different question: this is the space a machine loses simply
+        # by being used, and nobody was ever shown it.
+        lines += [f"可刪舊記錄檔:{group.line()}" for group in self.delete_logs]
+        lines += [f"可刪快取:{group.line()}(刪掉會自動重建,只是下次啟動稍慢)"
+                  for group in self.delete_caches]
         if not self.is_empty():
             lines.append(f"可回收合計:{self.reclaimable_mb():.0f} MB")
         elif not self.self_hosted:
@@ -440,6 +931,7 @@ class GcPlan:
             # empty delete lists are not the absence of an orphan — they are the
             # orphan we are standing in.
             lines.append("沒有可回收的項目。")
+        lines += self.space_lines()          # …and WHERE THE SPACE WENT, regardless
         if self.self_hosted:
             lines.append(self.self_hosted_note())
         return "\n".join(lines)
@@ -479,6 +971,10 @@ class GcPlan:
             lines.append("  請把 App 完全關掉(所有視窗),再重跑一次。")
             if self.deleted:
                 lines.append("  已經刪掉的那些不會再刪一次,重跑只會處理上面這幾項。")
+        # Even after a reclaim that freed nothing, the question that brought them
+        # here stands: WHERE DID THE DISK GO? (Past tense here — space_lines()
+        # prints no forecast once applied is set.)
+        lines += self.space_lines()
         if self.self_hosted:
             lines.append(self.self_hosted_note())
         return "\n".join(lines)
@@ -512,6 +1008,153 @@ def _collect_staging(plan: GcPlan, label: str, parent: Path, *,
         if prefixed and not child.name.startswith(STAGING_PREFIX):
             continue
         plan.delete_staging.append((f"{label}/{child.name}", child))
+
+
+def _collect_logs(plan: GcPlan, app_id: str, paths: paths_mod.AppPaths) -> None:
+    """The logs nobody ever rotated.
+
+    Every launch writes launcher-*.log + streamlit-*.log + bootstrap-*.log into
+    apps/<app>/data/logs, and NOTHING has ever deleted one. On a factory machine
+    that has been up for months this is frequently the single biggest thing in the
+    tree — and GC could not see it at all. The newest few of each family stay
+    (those are the ones anyone actually reads, and a live session's log is always
+    among them); the rest is offered for reclamation.
+    """
+    log_dir = paths.data_dir / "logs"
+    doomed = stale_logs(log_dir)
+    if not doomed:
+        return
+    group = GcGroup(kind="logs", app_id=app_id, root=log_dir, paths=doomed,
+                    label=f"{app_id} 的舊記錄檔"
+                          f"(每一種只留最近 {LOG_KEEP_RECENT} 份)")
+    total = Measured()
+    for path in doomed:
+        total.add(plan.measure(path))
+    group.mb, group.partial = total.mb, total.partial
+    plan.delete_logs.append(group)
+
+
+def _collect_cache(plan: GcPlan, app_id: str, paths: paths_mod.AppPaths) -> None:
+    """data/cache — where PYTHONPYCACHEPREFIX puts every .pyc the app ever compiled.
+
+    Pure derived data: deleting it costs one slightly slower start and nothing else.
+    It is never in the keep-set, and it was never in the plan either.
+    """
+    cache = paths.data_dir / "cache"
+    try:
+        children = sorted(cache.iterdir())
+    except OSError:
+        return
+    if not children:
+        return
+    group = GcGroup(kind="cache", app_id=app_id, root=cache, paths=children,
+                    label=f"{app_id} 的快取(pycache)")
+    total = Measured()
+    for child in children:
+        total.add(plan.measure(child))
+    group.mb, group.partial = total.mb, total.partial
+    plan.delete_caches.append(group)
+
+
+def _measure_store(plan: GcPlan, root: Path, *, forecast: bool = True) -> None:
+    """The whole tree, bucketed — so the operator can SEE where the disk went.
+
+    Reported on every run, including the ones with an empty plan: 「沒有可回收的
+    項目」 answers a question they did not ask. Every measurement here is cached and
+    reused by the delete loop, so this costs one walk, not two.
+
+    forecast=False is the re-measure after --apply: the trees are gone, so nothing
+    here may carry a 「可以回收」 figure. A forecast printed in the past tense is the
+    oldest lie in this module.
+    """
+    doomed_versions = {(app, version) for app, version, _p in plan.delete_versions}
+    doomed_runtimes = {fp for fp, _p in plan.delete_runtimes}
+    doomed_shells = {fp for fp, _p in plan.delete_shells}
+    doomed_staging = {str(path) for _w, path in plan.delete_staging}
+    logs_by_app = {group.app_id: group for group in plan.delete_logs}
+    cache_by_app = {group.app_id: group for group in plan.delete_caches}
+
+    def add(label: str, kind: str, measured: Measured, *, reclaimable: float = 0.0,
+            path: Path | None = None) -> None:
+        if measured.mb <= 0 and not measured.partial:
+            return
+        plan.consumers.append(Consumer(label=label, kind=kind, mb=measured.mb,
+                                       reclaimable_mb=reclaimable if forecast else 0.0,
+                                       partial=measured.partial,
+                                       path=str(path) if path else None))
+
+    for app_id in plan.apps_all:
+        paths = paths_mod.AppPaths(root, app_id)
+        versions, reclaim = Measured(), 0.0
+        for child in _children(paths.versions_dir):
+            measured = plan.measure(child)
+            versions.add(measured)
+            if (app_id, child.name) in doomed_versions or str(child) in doomed_staging:
+                reclaim += measured.mb
+        add(f"{app_id}:版本檔案", "versions", versions, reclaimable=reclaim,
+            path=paths.versions_dir)
+
+        staging, reclaim = Measured(), 0.0
+        for child in _children(paths.staging_dir):
+            measured = plan.measure(child)
+            staging.add(measured)
+            if str(child) in doomed_staging:
+                reclaim += measured.mb
+        add(f"{app_id}:建置/下載殘留", "staging", staging, reclaimable=reclaim,
+            path=paths.staging_dir)
+
+        logs = plan.measure(paths.data_dir / "logs")
+        group = logs_by_app.get(app_id)
+        add(f"{app_id}:記錄檔(logs)", "logs", logs,
+            reclaimable=group.mb if group else 0.0, path=paths.data_dir / "logs")
+
+        cache = plan.measure(paths.data_dir / "cache")
+        group = cache_by_app.get(app_id)
+        add(f"{app_id}:快取(cache)", "cache", cache,
+            reclaimable=group.mb if group else 0.0, path=paths.data_dir / "cache")
+
+        other = Measured()
+        for child in _children(paths.data_dir):
+            if child.name in ("logs", "cache"):
+                continue                        # counted above, on their own
+            other.add(plan.measure(child))
+        for child in _children(paths.app_dir):
+            if child.name in ("versions", "staging", "data"):
+                continue
+            other.add(plan.measure(child))
+        add(f"{app_id}:其他資料(home/tmp/leases/state)", "data", other,
+            path=paths.data_dir)
+
+    runtimes = RuntimeStore(root / "deps").runtimes
+    for child in _children(runtimes):
+        measured = plan.measure(child)
+        reclaim = measured.mb if (child.name in doomed_runtimes
+                                  or str(child) in doomed_staging) else 0.0
+        add(f"runtime {child.name}", "runtime", measured, reclaimable=reclaim,
+            path=child)
+
+    shells = ShellStore(root / "deps").shells
+    for child in _children(shells):
+        measured = plan.measure(child)
+        reclaim = measured.mb if (child.name in doomed_shells
+                                  or str(child) in doomed_staging) else 0.0
+        add(f"shell {child.name}", "shell", measured, reclaimable=reclaim, path=child)
+
+    for child in _children(root / "deps"):
+        if child.name in ("runtimes", "shells"):
+            continue
+        add(f"deps\\{child.name}", "other", plan.measure(child), path=child)
+    for child in _children(root):
+        if child.name in ("apps", "deps"):
+            continue
+        add(f"{child.name}", "other", plan.measure(child), path=child)
+
+
+def _children(path: Path) -> list:
+    try:
+        return sorted(Path(path).iterdir())
+    except OSError:
+        return []
 
 
 def _alternate_python(runtimes: Path, *, exclude: str, keep: set) -> str | None:
@@ -624,6 +1267,10 @@ def collect_plan(root: Path, *, apps: list | None = None) -> GcPlan:
         if scoped_in:
             _collect_staging(plan, f"{app_id}/versions", paths.versions_dir)
             _collect_staging(plan, f"{app_id}/staging", paths.staging_dir, prefixed=False)
+            # The two things that ACTUALLY fill a long-running machine, and the two
+            # things GC never looked at: unrotated logs and the bytecode cache.
+            _collect_logs(plan, app_id, paths)
+            _collect_cache(plan, app_id, paths)
 
     runtimes = RuntimeStore(root / "deps").runtimes
     shells = ShellStore(root / "deps").shells
@@ -656,6 +1303,12 @@ def collect_plan(root: Path, *, apps: list | None = None) -> GcPlan:
 
     _collect_staging(plan, "deps/runtimes", runtimes)
     _collect_staging(plan, "deps/shells", shells)
+
+    # WHERE THE SPACE WENT. Measured last, so it can mark each consumer with how
+    # much of it this run could actually take back — and reported even when the
+    # answer is 「none of it」, because that is still the answer to their question.
+    plan.disk = disk_space(root)
+    _measure_store(plan, root)
     return plan
 
 
@@ -668,6 +1321,16 @@ def _delete_tree(label: str, path: Path) -> list:
     the disk. A GC that cannot delete something must SAY so; the operator can
     close the app and run it again, but only if they are told.
     """
+    path = Path(path)
+    if path.is_file():
+        # A log file, not a tree. There is no sentinel to strip, and rmtree would
+        # raise NotADirectoryError — which we would then report to the operator as
+        # though their App were holding the file open.
+        try:
+            os.remove(path)
+        except OSError as exc:
+            return [GcSurvivor(label, str(path), _why(exc), _in_use(exc))]
+        return []
     try:
         integrity.remove_complete(path)  # first: make it invisible (fail closed)
     except OSError as exc:
@@ -710,10 +1373,45 @@ def run_gc(root: Path, *, apps: list | None = None, apply: bool = False,
             else:
                 # Only a tree that actually went away counts towards reclaimed_mb().
                 plan.deleted.append((label, size))
+        for group in plan.groups():
+            _delete_group(plan, group, log)
+        # The disk, re-measured: this is the one number the operator came for, and
+        # it is the only one that cannot be argued with. The TREE is re-measured
+        # too — the breakdown we scanned describes a tree that no longer exists.
+        plan.disk_after = disk_space(root)
+        plan.refresh_usage(root)
         # Past tense, from what actually happened — not the forecast we printed
         # before touching anything.
         _emit(log, plan.report())
     return plan
+
+
+def _delete_group(plan: GcPlan, group: GcGroup, log) -> None:
+    """Delete a bulk group (old logs, cache) file by file, report it as one thing.
+
+    Per-FILE deletion so a single locked log costs us that log and not the other
+    399; per-GROUP reporting so the console does not scroll 400 lines of
+    「刪除 舊記錄檔 …」 past an operator who wanted one number.
+    """
+    _emit(log, f"刪除 {group.label}({group.count} 個,{group.mb:,.0f} MB)…")
+    freed, failures = 0.0, []
+    for path in group.paths:
+        size = plan._mb(path)            # from the collect-time walk: it existed then
+        survivors = _delete_tree(group.label, path)
+        if survivors:
+            failures.extend(survivors)
+        else:
+            freed += size
+    gone = group.count - len(failures)
+    if gone:
+        plan.deleted.append((f"{group.label}(刪掉 {gone} 個)", freed))
+    if failures:
+        # One survivor for the group, not one per file: 「12 個刪不掉」 is the fact,
+        # and the reason is the same for all twelve.
+        plan.survivors.append(GcSurvivor(
+            group.label, str(group.root),
+            f"{len(failures)} 個檔案刪不掉({failures[0].reason})",
+            any(survivor.in_use for survivor in failures)))
 
 
 def _store_root() -> Path:
@@ -785,6 +1483,14 @@ def main(argv: list | None = None) -> int:
                        "所以這次沒有刪掉任何東西,磁碟空間也沒有變化。")
         else:
             because = "  這不是錯誤:store 裡沒有任何沒被引用的版本或 runtime。"
+        # An empty plan is not the end of the conversation. They came here with a
+        # full disk; the summary above has already printed where the space went.
+        if not plan.store_is_the_problem():
+            because += ("\n  上面的「磁碟空間」那一段是重點:這棵樹不是把"
+                        f"{plan.disk.label}塞滿的元凶,請往別的地方找。")
+        elif plan.disk.nearly_full():
+            because += ("\n  但是磁碟真的快滿了(見上面的「磁碟空間」):"
+                        "上面列出了這棵樹裡最大的幾項,請照著它們去處理。")
         print(f"\n[gc] {plan.headline()}\n{because}")
     elif code == EXIT_OK and plan.applied:
         print(f"\n[gc] {plan.headline()}")

@@ -835,16 +835,38 @@ def test_a_restarted_app_gets_a_fresh_arrival_window(tmp_path):
     supervisor.note_arrival_window()
     assert supervisor._arrival_offset is not None and not supervisor.arriving
 
-    # what _spawn_and_wait does for the new process (same three lines, one place)
+    # what _spawn_and_wait does for the new process (the same lines, in one place).
+    # _log_size/_log_changed_at MUST be reset too: the old log's size compared against
+    # the new log's would fake a "change" (or a false quiet) on the very first tick.
     supervisor._log_path = tmp_path / "streamlit-restart.log"
     supervisor._log_path.write_bytes(b"")
     supervisor._healthy_at = None
     supervisor._session_at = None
     supervisor._arrival_offset = None
+    supervisor._log_size = None
+    supervisor._log_changed_at = None
 
     assert supervisor.arriving
     supervisor.note_arrival_window()
     assert supervisor._arrival_offset is None               # no session yet: stays open
+
+
+def test_the_restart_reset_covers_every_field_the_supervisor_tracks(tmp_path):
+    """The test above hand-rolls what _spawn_and_wait does. If someone adds a sixth
+    piece of per-run state and forgets it there, the next run inherits the last run's
+    accounting — which is exactly how a startup crash gets filed as a 'late' error.
+    So: pin the list."""
+    supervisor = _real_supervisor(tmp_path)
+    per_run = {"_healthy_at", "_session_at", "_arrival_offset", "_log_size",
+               "_log_changed_at"}
+    for field in per_run:
+        assert hasattr(supervisor, field), field
+
+    source = (TEMPLATES / "launch.py").read_text(encoding="utf-8")
+    spawn = source.split("def _spawn_and_wait", 1)[1].split("\n    def ", 1)[0]
+    for field in per_run:
+        assert f"self.{field} = None" in spawn, \
+            f"_spawn_and_wait does not reset {field}: the next run inherits it"
 
 
 def test_the_control_channel_start_is_what_opens_the_arrival_window(tmp_path):
@@ -873,6 +895,101 @@ def test_the_control_channel_start_is_what_opens_the_arrival_window(tmp_path):
         assert supervisor._session_at is not None           # THIS is the starting gun
     finally:
         control.shutdown()
+
+
+# ── the arrival window closes on QUIET, not on a wall clock ──────────────────
+#
+# "20 seconds have passed, therefore the app has rendered" is a guess. It is wrong for
+# exactly the apps that need the safety net most: the ones with a heavy first render (a
+# model loaded at import, a big table read at module scope, a slow machine whose
+# antivirus reads every byte of an 80 MB weight file). Those are still legitimately
+# STARTING at T+20s, so their fatal error at T+30s landed in the "late" half of the log,
+# was downgraded to a warning, the marker was kept, and the broken version was committed
+# as last-known-good.
+
+def test_a_slow_starting_app_that_is_still_writing_keeps_its_arrival_window_open(tmp_path):
+    """The app is talking — a progress line every tick, 40 seconds past the old 20s
+    wall clock. It has not arrived; it is still arriving. The window must stay open,
+    so that the traceback it finally emits is still an ARRIVAL failure."""
+    supervisor = _supervisor(tmp_path, _STARTUP)
+    log_path = tmp_path / "streamlit.log"
+    supervisor.note_session_start()
+    supervisor._session_at = time.monotonic() - 40.0        # 40s in: the old clock is long gone
+
+    body = _STARTUP
+    for step in range(8):                                   # the app keeps logging
+        body += f"loading shard {step}/8…\n"
+        log_path.write_bytes(body.encode("utf-8"))
+        supervisor.note_arrival_window()
+        assert supervisor.arriving, \
+            "the window closed while the app was visibly still working"
+
+    # …and now it dies. Because the window never closed, this is fatal, not a warning.
+    log_path.write_bytes((body + "Traceback (most recent call last):\n"
+                                 "RuntimeError: could not load the model\n").encode("utf-8"))
+    fatal = supervisor.app_error_in_log()
+    assert fatal and "RuntimeError" in fatal
+    assert supervisor.late_app_error_in_log() is None
+    assert launch.finish_session(supervisor, launch.EXIT_OK) == launch.EXIT_APP_BROKEN
+
+
+def test_the_window_closes_once_the_app_stops_writing(tmp_path):
+    """The other half: quiet must actually END the window, or every red box the user
+    ever causes becomes a failed version and an unasked-for downgrade."""
+    supervisor = _supervisor(tmp_path, _STARTUP)
+    supervisor.note_session_start()
+
+    # It wrote something, then went quiet longer than the quiet period.
+    supervisor.note_arrival_window()
+    supervisor._session_at = time.monotonic() - launch.APP_ARRIVAL_SECONDS - 1
+    supervisor._log_changed_at = time.monotonic() - launch.APP_ARRIVAL_QUIET_SECONDS - 1
+
+    supervisor.note_arrival_window()
+    assert supervisor._arrival_offset == len(_STARTUP.encode("utf-8"))
+    assert not supervisor.arriving
+
+    # An error NOW is a red box in a working app: a warning, not a failed version.
+    (tmp_path / "streamlit.log").write_bytes((_STARTUP + _TRACEBACK).encode("utf-8"))
+    assert supervisor.app_error_in_log() is None
+    assert supervisor.late_app_error_in_log() is not None
+
+
+def test_the_arrival_window_always_terminates_even_for_an_app_that_never_shuts_up(tmp_path):
+    """The bound. An app that logs a line every second (a polling loop, a chatty
+    library) would hold the window open forever on the quiet rule alone — and a window
+    that never closes turns every user-caused red box into a rollback. The bound is
+    what makes this terminate; the module comment says what it costs."""
+    assert launch.APP_ARRIVAL_MAX_SECONDS > launch.APP_ARRIVAL_QUIET_SECONDS
+    supervisor = _supervisor(tmp_path, _STARTUP)
+    log_path = tmp_path / "streamlit.log"
+    supervisor.note_session_start()
+    supervisor._session_at = time.monotonic() - launch.APP_ARRIVAL_MAX_SECONDS - 1
+
+    body = _STARTUP + "still chattering\n"                  # it is STILL writing right now
+    log_path.write_bytes(body.encode("utf-8"))
+    supervisor.note_arrival_window()                        # first look: seeds the size
+    body += "and again\n"
+    log_path.write_bytes(body.encode("utf-8"))
+    supervisor.note_arrival_window()                        # changed -> not quiet at all
+
+    assert not supervisor.arriving, \
+        "past the absolute bound the window must close even though the log is moving"
+
+
+def test_a_silent_app_still_gets_the_floor_before_its_errors_are_forgiven(tmp_path):
+    """A Streamlit app that starts cleanly logs NOTHING, so it is 'quiet' from its very
+    first breath. Without a floor, the window would close on the first tick and a crash
+    two seconds later would already be excused as 'late'."""
+    supervisor = _supervisor(tmp_path, _STARTUP)
+    supervisor.note_session_start()
+
+    for _ in range(5):                                      # ticks, all within the floor
+        supervisor.note_arrival_window()
+        assert supervisor.arriving
+
+    supervisor._session_at = time.monotonic() - launch.APP_ARRIVAL_SECONDS - 1
+    supervisor.note_arrival_window()
+    assert not supervisor.arriving                          # past the floor and quiet: closed
 
 
 # ── a dying app must not wait for the user to close the window ───────────────
@@ -950,10 +1067,16 @@ def test_an_app_that_was_never_started_by_the_user_is_not_a_failure(tmp_path):
 # ── the marker contract with bootstrap ───────────────────────────────────────
 
 class LogSupervisor:
-    """Answers only the question finish_session asks: what did the app's log say?"""
+    """Answers only the questions finish_session asks: what did the app's log say,
+    and was the app ever actually asked to run?
 
-    def __init__(self, fatal=None, late=None):
+    `session_started` defaults to True — every test using this class is about a
+    session in which the user DID press Start. The "they never pressed Start" case
+    has its own tests below, against the real supervisor."""
+
+    def __init__(self, fatal=None, late=None, session_started=True):
         self._fatal, self._late = fatal, late
+        self.session_started = session_started
         self.log_path = Path("streamlit.log")
 
     def app_error_in_log(self):
@@ -1000,6 +1123,128 @@ def test_a_dead_window_is_never_blamed_on_the_version(tmp_path, monkeypatch):
     monkeypatch.setenv("CIM_HEALTHY_MARKER", str(marker))
     assert launch.finish_session(LogSupervisor(), launch.EXIT_MACHINE_BROKEN) == \
         launch.EXIT_MACHINE_BROKEN
+    assert not marker.exists()
+
+
+# ── THE BLOCKER: a version that never ran must never be stamped last-known-good ──
+#
+# Streamlit does not execute the app script until a session opens, and a session
+# opens only when the user presses Start in the portal. So the most ordinary thing a
+# user can do — open the app, look at the portal, close the window — used to produce
+# exit 0 + a marker, and bootstrap committed a version that had NEVER EXECUTED A LINE
+# as last-known-good. If that build was broken, the next launch died and the version
+# it "rolled back" to was that same broken build.
+#
+# The marker therefore has two BODIES, and only one of them may promote a version.
+
+def _real_supervisor(tmp_path: Path) -> "launch.StreamlitSupervisor":
+    return launch.StreamlitSupervisor(
+        {"_python": tmp_path / "python.exe", "_entrypoint": tmp_path / "app.py",
+         "host": "127.0.0.1", "preferred_port": 0}, tmp_path)
+
+
+def test_a_window_the_user_closed_without_pressing_start_is_not_last_known_good(
+        tmp_path, monkeypatch):
+    """THE reproduction. The window opens, the user never presses Start, they close
+    it. The app script has not run — not one line — so the marker must NOT claim the
+    version works, and bootstrap must not commit it.
+
+    It must also not FAIL: the user simply did not use the app. Failing a version for
+    that would roll the machine back for nothing."""
+    marker = tmp_path / "healthy"
+    monkeypatch.setenv("CIM_HEALTHY_MARKER", str(marker))
+
+    shell = FakeShell(code=0, alive_polls=None, alive_waits=2)
+    monkeypatch.setattr(launch.subprocess, "Popen", lambda *_a, **_k: shell)
+    monkeypatch.setattr(launch, "_WINDOW_POLL_SECONDS", 0.001)
+    monkeypatch.setattr(launch, "SHELL_ALIVE_SECONDS", 0.01)
+    monkeypatch.setattr(launch, "_SHELL_TICK_SECONDS", 0.01)
+
+    supervisor = _real_supervisor(tmp_path)          # nobody ever calls note_session_start
+    code = launch.run_shell(
+        _shell_manifest(tmp_path), FakeControl(), tmp_path,
+        on_window_ready=lambda: launch._write_marker(launch.MARKER_NO_SESSION),
+        on_tick=lambda: False)
+
+    assert code == launch.EXIT_OK                    # the window was fine; nothing broke
+    assert not supervisor.session_started            # …but the app was never asked to run
+    assert launch.finish_session(supervisor, code) == launch.EXIT_OK
+
+    # The marker exists (a window DID come up) but says so and nothing more.
+    assert marker.read_text(encoding="utf-8") == launch.MARKER_NO_SESSION
+    assert "http" not in marker.read_text(encoding="utf-8"), \
+        "a version whose app never ran must not advertise a URL bootstrap will commit on"
+
+
+def test_pressing_start_is_what_upgrades_the_marker_to_a_url(tmp_path, monkeypatch):
+    """The other side: the user DID press Start. /control/start is the moment the app
+    is asked to run, and that — and only that — turns the marker into a promotable
+    claim. Asserted through the REAL HTTP handler: a supervisor method nobody calls
+    protects nobody."""
+    marker = tmp_path / "healthy"
+    monkeypatch.setenv("CIM_HEALTHY_MARKER", str(marker))
+
+    class ReadySupervisor(launch.StreamlitSupervisor):
+        def start(self):
+            return "http://127.0.0.1:9999"
+
+        @property
+        def url(self):
+            return "http://127.0.0.1:9999"
+
+        @property
+        def port(self):
+            return 9999
+
+    supervisor = ReadySupervisor(
+        {"_python": tmp_path / "python.exe", "_entrypoint": tmp_path / "app.py",
+         "host": "127.0.0.1", "preferred_port": 0}, tmp_path)
+    launch._write_marker(launch.MARKER_NO_SESSION)        # the window came up first
+    assert marker.read_text(encoding="utf-8") == launch.MARKER_NO_SESSION
+
+    control = launch.ControlServer(supervisor)
+    control.start()
+    try:
+        request = urllib.request.Request(f"{control.url}/control/start", method="POST",
+                                         headers={"X-CIM-Token": control.token})
+        with urllib.request.urlopen(request, timeout=5) as resp:
+            assert resp.status == 200
+    finally:
+        control.shutdown()
+
+    assert supervisor.session_started
+    assert marker.read_text(encoding="utf-8") == "http://127.0.0.1:9999"
+    assert launch.finish_session(supervisor, launch.EXIT_OK) == launch.EXIT_OK
+    assert marker.read_text(encoding="utf-8") == "http://127.0.0.1:9999"  # still promotable
+
+
+def test_the_marker_never_downgrades_a_real_session_to_no_session(tmp_path, monkeypatch):
+    """Ordering hazard: on_window_ready fires when the window has survived its
+    creation watch, and a user CAN press Start inside those three seconds (or the
+    shell can exit 0 inside them, which also fires it). If "no-session" could
+    overwrite a URL already in the marker, that user's real session would be thrown
+    away and their good version would never be committed."""
+    marker = tmp_path / "healthy"
+    monkeypatch.setenv("CIM_HEALTHY_MARKER", str(marker))
+
+    launch._write_marker("http://127.0.0.1:8501")         # /control/start won the race
+    launch._write_marker(launch.MARKER_NO_SESSION)        # …on_window_ready lands after
+
+    assert marker.read_text(encoding="utf-8") == "http://127.0.0.1:8501"
+
+
+def test_an_app_that_died_on_arrival_loses_the_marker_entirely(tmp_path, monkeypatch):
+    """Revocation still beats both bodies: the app WAS asked to run and proved it
+    never became usable. Neither "no-session" (a lie — they did press Start) nor the
+    URL (a lie — it never worked) is true, so the marker goes."""
+    marker = tmp_path / "healthy"
+    monkeypatch.setenv("CIM_HEALTHY_MARKER", str(marker))
+    launch._write_marker("http://127.0.0.1:8501")
+
+    code = launch.finish_session(
+        LogSupervisor(fatal="ModuleNotFoundError: No module named 'cv2'"), launch.EXIT_OK)
+
+    assert code == launch.EXIT_APP_BROKEN
     assert not marker.exists()
 
 
@@ -1104,3 +1349,151 @@ def test_a_syntax_error_in_a_page_is_reported_with_the_page_name(tmp_path):
 
     _missing, syntax_error = launch.preflight(entry, app_root)
     assert syntax_error and "2_report.py" in syntax_error
+
+
+# ── "inside a def" is not the same as "lazy" ─────────────────────────────────
+#
+# The preflight used to `continue` on EVERY FunctionDef, so an import inside a
+# function was always called lazy. But a function the MODULE BODY CALLS runs on the
+# first render, exactly like a module-level import: `_setup()` at the bottom of the
+# file, `CONFIG = boot()`, a call inside a module-level `if`, `@register` on a
+# module-level def. A missing package behind one of those sailed through this gate
+# and met the operator as a red box — and the build-side gate (imports.py) now
+# catches precisely that, so a package it rejects would still have reached the floor.
+#
+# REQUIRED = module level, OR the body of a def the module body calls. Same rule,
+# same file, as imports.py — do not grow a second one.
+
+def test_an_import_inside_a_module_called_function_is_required_by_the_preflight(tmp_path):
+    """THE defect. `_setup()` is called at module scope, so `import cv2` in its body
+    runs on the first render. Calling it lazy shipped a package that dies on arrival."""
+    app_root = tmp_path / "application"
+    app_root.mkdir(parents=True)
+    entry = app_root / "app.py"
+    entry.write_text("import streamlit as st\n"
+                     "def _setup():\n"
+                     "    import definitely_not_installed_pkg\n"
+                     "_setup()\n", encoding="utf-8")
+
+    missing, syntax_error = launch.preflight(entry, app_root)
+    assert syntax_error is None
+    assert missing == ["definitely_not_installed_pkg"]
+
+
+@pytest.mark.parametrize("body,label", [
+    ("def boot():\n    import definitely_not_installed_pkg\n    return 1\n"
+     "CONFIG = boot()\n", "a call in a module-level assignment"),
+    ("import os\n"
+     "def boot():\n    import definitely_not_installed_pkg\n"
+     "if os.environ.get('X'):\n    boot()\n", "a call inside a module-level if"),
+    ("def register(fn):\n    import definitely_not_installed_pkg\n    return fn\n"
+     "@register\ndef page():\n    pass\n", "a decorator on a module-level def"),
+])
+def test_every_way_the_module_body_can_run_a_function_makes_its_imports_required(
+        tmp_path, body, label):
+    """All four promotion routes the build gate recognises. Each one really does
+    execute while Streamlit imports the script."""
+    app_root = tmp_path / "application"
+    app_root.mkdir(parents=True)
+    entry = app_root / "app.py"
+    entry.write_text("import streamlit as st\n" + body, encoding="utf-8")
+
+    missing, _ = launch.preflight(entry, app_root)
+    assert missing == ["definitely_not_installed_pkg"], label
+
+
+@pytest.mark.parametrize("body,why", [
+    ("def _setup():\n    import definitely_not_installed_pkg\n"
+     "def main():\n    _setup()\n"
+     "main()\n", "two hops deep: module -> main() -> _setup()"),
+    ("class App:\n    def boot(self):\n        import definitely_not_installed_pkg\n"
+     "App().boot()\n", "a method: App().boot() does not promote boot"),
+    ("def _setup():\n    import definitely_not_installed_pkg\n"
+     "if __name__ == '__main__':\n    _setup()\n",
+     "__main__ guard: promoting it would make every main()-style script's lazy "
+     "imports hard requirements"),
+    ("def _setup():\n"
+     "    try:\n        import definitely_not_installed_pkg\n"
+     "    except ImportError:\n        definitely_not_installed_pkg = None\n"
+     "_setup()\n", "try/except ImportError inside a promoted function still degrades"),
+])
+def test_the_promotion_rule_fails_open_exactly_where_the_build_gate_does(
+        tmp_path, body, why):
+    """The other direction, and it matters more: a WRONG 'required' refuses an app
+    that works. Every case the build gate declines to promote, this must decline too —
+    or the two sides disagree about the same file and the operator gets told to
+    `pip install` something the build was perfectly happy with."""
+    app_root = tmp_path / "application"
+    app_root.mkdir(parents=True)
+    entry = app_root / "app.py"
+    entry.write_text("import streamlit as st\n" + body, encoding="utf-8")
+
+    missing, syntax_error = launch.preflight(entry, app_root)
+    assert syntax_error is None
+    assert missing == [], why
+
+
+def test_a_plain_lazy_import_is_still_not_a_requirement(tmp_path):
+    """The original reason the rule exists: `import anthropic` in a function nobody
+    calls at import time is genuinely lazy. Hard-failing a build over an optional LLM
+    backend nobody enabled is how a good version gets refused."""
+    app_root = tmp_path / "application"
+    app_root.mkdir(parents=True)
+    entry = app_root / "app.py"
+    entry.write_text("import streamlit as st\n"
+                     "def ask_llm():\n"
+                     "    import definitely_not_installed_pkg\n"
+                     "    return definitely_not_installed_pkg\n", encoding="utf-8")
+
+    assert launch.preflight(entry, app_root) == ([], None)
+
+
+def test_both_halves_of_the_gate_name_the_called_scope_the_same_way(tmp_path):
+    """One rule, two files, one operator. If the device side invents its own scope
+    label the two halves start explaining the same import differently — and the next
+    person to change one of them will not know to change the other."""
+    from provision_builder.streamlit_desktop import imports as imports_mod
+
+    assert launch.CALLED_SCOPE == imports_mod.CALLED_SCOPE == "module-called"
+    assert imports_mod._SCOPE_LABEL[imports_mod.CALLED_SCOPE] == \
+        "函式內 import,但這個函式在模組層被呼叫(啟動時就會執行)"
+
+
+# The anti-drift guard that actually bites: run BOTH implementations over the same
+# source and demand the same answer. The build gate and this preflight ask one
+# question — "does this import run when Streamlit loads the script?" — and the whole
+# defect was that they answered it differently. A rule change on either side that
+# forgets the other now fails here instead of in a factory.
+_SAME_ANSWER_SOURCES = [
+    "import cv2\n",
+    "def _setup():\n    import cv2\n_setup()\n",
+    "def boot():\n    import cv2\n    return 1\nCONFIG = boot()\n",
+    "import os\ndef boot():\n    import cv2\nif os.environ.get('X'):\n    boot()\n",
+    "def register(fn):\n    import cv2\n    return fn\n@register\ndef page():\n    pass\n",
+    "def _setup():\n    import cv2\ndef main():\n    _setup()\nmain()\n",
+    "class App:\n    def boot(self):\n        import cv2\nApp().boot()\n",
+    "def _setup():\n    import cv2\nif __name__ == '__main__':\n    _setup()\n",
+    "def _setup():\n    try:\n        import cv2\n    except ImportError:\n        cv2 = None\n_setup()\n",
+    "def lazy():\n    import cv2\n",
+    "try:\n    import cv2\nexcept ImportError:\n    cv2 = None\n",
+    "with open('x') as f:\n    import cv2\n",
+]
+
+
+@pytest.mark.parametrize("source", _SAME_ANSWER_SOURCES)
+def test_the_device_preflight_and_the_build_gate_agree_on_what_runs_at_import(
+        tmp_path, source):
+    """Differential: same file, both rules, one answer."""
+    import ast
+
+    from provision_builder.streamlit_desktop import imports as imports_mod
+
+    path = tmp_path / "app.py"
+    path.write_text(source, encoding="utf-8")
+
+    device = launch._module_level_imports(ast.parse(source))
+    build = {site.module.split(".")[0]
+             for site in imports_mod._parse_import_sites(path)
+             if site.scope in imports_mod._REQUIRED_SCOPES}
+
+    assert device == build, f"the two halves disagree about:\n{source}"

@@ -14,31 +14,44 @@ instance; never scans process names.
 
 WHAT COMMITS A CANDIDATE TO last-known-good
 ===========================================
-The healthy marker APPEARING is not the commit signal. The launcher writes it
-once its window has survived ~12 seconds — but the Streamlit app script only
-runs when the user presses Start, minutes later. A version that then dies takes
-the launcher down with it (_revoke_marker deletes the marker, exit 3), and the
-old code had already latched it as last_known_good the moment the marker showed
-up. The broken build was the machine's idea of "the version to fall back to",
-and the post-exit rollback never fired because commit_candidate() had cleared
-`candidate`. Tomorrow morning it starts, breaks, and is STILL last-known-good.
+The healthy marker APPEARING is not the commit signal, and neither is the marker
+merely EXISTING. What it SAYS is. launch.py gives the marker two bodies:
 
-The commit signal is the process EXITING CLEANLY with the marker still present:
+    "no-session"   a window came up, and the user never pressed Start. Streamlit's
+                   server ran; the app's own script did not — not one line of it.
+    <the app url>  the app was ASKED TO RUN (/control/start) and did not fail on
+                   arrival.
 
-    marker after exit | exit code | what happens to state
-    ------------------+-----------+---------------------------------------------
-    present           | 0         | commit candidate -> last_known_good
-    absent            | 0         | never came up (or the launcher revoked the
-                      |           | marker on its way out) -> treated as 3
-    either            | 3 / 4     | fail_candidate + roll back to the resolved
-                      |           | target, marker or no marker
-    never seen        | other !=0 | it never came up: treated as 3 (fail + roll back)
-    SEEN              | other !=0 | NOTHING. Something outside our launcher ended a
-                      |           | working window (Task Manager, a power event, a
-                      |           | hard crash of the shell). Not committed either —
-                      |           | it was not a clean exit — so the version stays
-                      |           | ON TRIAL and gets to prove itself next launch.
-    either            | 5         | NOTHING. Not the version's fault.
+Reading only `marker.exists()` is what made the most ordinary thing a user can do
+— open the app, look at the portal, close the window without pressing Start —
+produce exit 0 + a marker, and commit a version that had NEVER EXECUTED A LINE as
+last-known-good. If that build was broken, the next launch died and the version we
+"rolled back" to was the same broken build. The whole automatic-rollback promise
+was dead on the commonest daily path.
+
+The commit signal is the process EXITING CLEANLY with a marker that says the app
+actually ran:
+
+    marker body at exit | exit code | what happens to state
+    --------------------+-----------+-------------------------------------------
+    <a url>             | 0         | commit candidate -> last_known_good
+    "no-session"        | 0         | NOTHING. The app never ran, so there is
+                        |           | nothing to promote (it never proved itself)
+                        |           | and nothing to blame (it never got the
+                        |           | chance to fail). The version stays the
+                        |           | candidate and is retried next launch.
+                        |           | Emphatically NOT an EXIT_APP_FAILURE.
+    absent              | 0         | never came up (or the launcher revoked the
+                        |           | marker on its way out) -> treated as 3
+    any                 | 3 / 4     | fail_candidate + roll back to the resolved
+                        |           | target, marker or no marker
+    never seen          | other !=0 | it never came up: treated as 3 (fail + roll back)
+    SEEN                | other !=0 | NOTHING. Something outside our launcher ended a
+                        |           | working window (Task Manager, a power event, a
+                        |           | hard crash of the shell). Not committed either —
+                        |           | it was not a clean exit — so the version stays
+                        |           | ON TRIAL and gets to prove itself next launch.
+    any                 | 5         | NOTHING. Not the version's fault.
 
 A marker seen mid-session is only ever *recorded* (it starts the background
 update check, which is what it is genuinely evidence for: a window that came up).
@@ -114,14 +127,16 @@ from datetime import datetime
 from pathlib import Path
 
 if __package__:
+    from . import gc as gc_mod
     from . import integrity, leases, notifications, paths as paths_mod, state as state_mod, updater
     from .identifiers import IdentifierError
-    from .locks import LockTimeout, app_lock
+    from .locks import AlreadyRunning, LockTimeout, acquire_single_instance, app_lock
     from .provider import FolderUpdateProvider, ProviderError
     from .runtime_store import (
         RuntimeStore, RuntimeStoreError, SharedComponentError, ShellStore)
 else:  # loose files in <ROOT>/bootstrap/
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    _HERE = Path(__file__).resolve().parent
+    sys.path.insert(0, str(_HERE))
     import integrity
     import leases
     import notifications
@@ -129,10 +144,29 @@ else:  # loose files in <ROOT>/bootstrap/
     import state as state_mod
     import updater
     from identifiers import IdentifierError
-    from locks import LockTimeout, app_lock
+    from locks import AlreadyRunning, LockTimeout, acquire_single_instance, app_lock
     from provider import FolderUpdateProvider, ProviderError
     from runtime_store import (
         RuntimeStore, RuntimeStoreError, SharedComponentError, ShellStore)
+
+    # `gc` IS A BUILT-IN MODULE NAME, and BuiltinImporter sits ahead of PathFinder in
+    # sys.meta_path — so a plain `import gc` here hands us Python's garbage collector,
+    # NOT the gc.py lying right next to us, no matter what we put on sys.path. And
+    # this is the branch that actually SHIPS (start.bat runs `python bootstrap\
+    # bootstrap.py`, so __package__ is empty), while every test imports us as a
+    # package and takes the branch above. A naive `import gc` would therefore be green
+    # in CI and silently dead on every machine in the factory. Load it by path.
+    import importlib.util as _importlib_util
+
+    _gc_spec = _importlib_util.spec_from_file_location("cim_device_gc", _HERE / "gc.py")
+    gc_mod = _importlib_util.module_from_spec(_gc_spec)
+    # REGISTER IT BEFORE EXECUTING IT. gc.py declares @dataclass classes, and
+    # dataclasses resolves a class's own module through sys.modules[cls.__module__] —
+    # which is None for a module that was created from a spec but never registered, so
+    # exec_module() dies with a bare AttributeError inside dataclasses.py. Every launch,
+    # on every device, while the package-import branch the tests take is perfectly fine.
+    sys.modules[_gc_spec.name] = gc_mod
+    _gc_spec.loader.exec_module(gc_mod)
 
 log = logging.getLogger("bootstrap")
 
@@ -177,6 +211,26 @@ def is_unknown_failure(code: int) -> bool:
                         EXIT_SHELL_ENVIRONMENT)
 
 
+# The marker's "a window came up, but the app was never asked to run" body. This is
+# the device half of a contract written down in launch.py (MARKER_NO_SESSION); the
+# two files are delivered together and must never disagree about this string.
+MARKER_NO_SESSION = "no-session"
+
+
+def _marker_body(marker: Path) -> str | None:
+    """What the healthy marker SAYS, or None when it is not there.
+
+    Existence is not the signal — the body is. See the module docstring: a marker
+    that says "no-session" is a window the user opened and closed without ever
+    pressing Start, and promoting a version on that is how a build that never ran
+    became the machine's idea of a safe fallback.
+    """
+    try:
+        return marker.read_text("utf-8").strip()
+    except OSError:
+        return None
+
+
 @dataclass(frozen=True)
 class LaunchOutcome:
     """What one launcher session actually did — the exit code AND the evidence.
@@ -187,8 +241,9 @@ class LaunchOutcome:
     marker, so the evidence has to travel back with the code.
     """
     code: int
-    marker_seen: bool = False       # a healthy window came up at some point
-    marker_at_exit: bool = False    # …and was still healthy when the process ended
+    marker_seen: bool = False       # a window came up at some point
+    marker_at_exit: bool = False    # …and the marker was still there when it ended
+    app_ran: bool = False           # …and it said the app was actually ASKED TO RUN
 
 
 _SHELL_ENVIRONMENT_HELP = (
@@ -423,21 +478,39 @@ def run_version(paths: paths_mod.AppPaths, store: state_mod.StateStore,
             time.sleep(0.5)
 
         code = proc.returncode
-        # Re-read the marker AFTER the exit: the launcher deletes it (_revoke_marker)
-        # when the app it was hosting dies, so its presence here — together with a
-        # clean exit — is the only evidence that this version actually worked.
-        marker_now = marker.exists()
-        log.info("launcher 結束 code=%s marker=%s(啟動途中曾經健康=%s)",
-                 code, marker_now, marker_seen)
+        # Re-READ the marker after the exit — its BODY, not just its existence. The
+        # launcher deletes it (_revoke_marker) when the app it was hosting dies, and
+        # writes the app's URL into it only once the app was actually asked to run.
+        # So a URL body + a clean exit is the one thing that proves this version
+        # worked; "no-session" proves only that a window opened.
+        body = _marker_body(marker)
+        marker_now = body is not None
+        app_ran = bool(body) and body != MARKER_NO_SESSION
+        log.info("launcher 結束 code=%s marker=%s(app 真的被啟動過=%s;"
+                 "啟動途中曾經出現視窗=%s)",
+                 code, body if marker_now else "(不存在)", app_ran, marker_seen)
 
-        seen = LaunchOutcome(code, marker_seen=marker_seen, marker_at_exit=marker_now)
-        if code == EXIT_OK and marker_now:
+        seen = LaunchOutcome(code, marker_seen=marker_seen, marker_at_exit=marker_now,
+                             app_ran=app_ran)
+        if code == EXIT_OK and app_ran:
             if is_candidate:
                 commit_if_still_candidate(store, version)
             return seen
+        if code == EXIT_OK and marker_now:
+            # "no-session": the window came up and the user closed it WITHOUT ever
+            # pressing Start. Streamlit's server ran; the app did not. There is
+            # nothing to promote (the version never proved itself) and nothing to
+            # blame (it never got the chance to fail). Touch NO state — and above
+            # all do NOT fall through to EXIT_APP_FAILURE below: failing a version
+            # because the user did not feel like using it would roll the machine
+            # back for nothing. It stays the candidate and is retried next launch.
+            log.info("launcher exit 0,但使用者始終沒有按 Start(marker=%s):"
+                     "%s 這次根本沒跑起來過,既不提交為 last-known-good,也不算失敗;"
+                     "下次啟動再驗證一次", MARKER_NO_SESSION, version)
+            return seen
         if code == EXIT_OK:
-            # Exit 0 with no marker: it never came up, or it came up and then the
-            # app died and the launcher revoked the marker. Either way nothing
+            # Exit 0 with no marker at all: it never came up, or it came up and then
+            # the app died and the launcher revoked the marker. Either way nothing
             # proved healthy, and a 0 here is a lie the caller must not act on.
             log.warning("launcher exit 0 但 marker 不在(曾經出現過=%s):"
                         "視為 app 啟動失敗", marker_seen)
@@ -546,8 +619,83 @@ def _report_abnormal_session(paths: paths_mod.AppPaths, version: str, code: int)
     return code
 
 
+# THE DEAD END: this version will not start, and there is nothing on the machine to
+# fall back to. Now that store_builder ships state.json with candidate=current, a
+# one-version delivery whose FIRST BOOT fails lands here — the single most dangerous
+# moment in the product's life, on a machine with no previous version by definition.
+# "It failed and there is nothing to roll back to" is honest, and it is also a line
+# operator standing in front of a dead machine with no next step. There IS a next
+# step, and it is the only one that gets the line running again: put a working version
+# on with a USB stick.
+_NO_WAY_BACK_HELP = (
+    "  這台機器上沒有任何可以退回的版本(通常表示這是第一次安裝,還沒有「上一版」)。\n"
+    "  請用 tools\\admin.bat → [3] 套用已複製進來的更新包,\n"
+    "  從 USB / 網路芳鄰把一個「可以用的版本」裝上去。\n"
+    "  (命令列:bootstrap\\bootstrap.py --install <更新資料夾>)\n"
+)
+
+
+def _report_broken_non_candidate(paths: paths_mod.AppPaths, store: state_mod.StateStore,
+                                 version: str, code: int) -> int:
+    """A version that is NOT on trial has failed (3/4). Say what to DO about it.
+
+    Automatic rollback only ever fires for a CANDIDATE — a version that has not yet
+    completed a session on this machine. This one is not a candidate, and there are
+    two ways to get here, both real:
+
+      * a version that already proved itself and has now gone bad (a file went
+        missing, antivirus ate a DLL, the disk rotted); or
+      * far more common, a FRESHLY DELIVERED tree. store_builder writes state.json
+        with candidate=None, so the very first boot of a delivery is not on trial at
+        all — and 讀我 promises the operator an automatic rollback that, on that path,
+        was never going to happen.
+
+    Either way nobody is coming to roll it back, and returning the code in silence
+    left the operator staring at a window that will not open, with no next step. So
+    print one: the version is broken and here is the button that fixes it.
+    """
+    target = resolve_rollback_target(paths, store.load())
+    log.error("launcher exit %s:版本 %s 不是 candidate,不會自動退版", code, version)
+    print(f"\n[bootstrap][ERROR] 版本 {version} 啟動失敗(代碼 {code})。\n"
+          f"  這一版壞了。請執行 tools\\admin.bat → [2] 退回上一版。\n"
+          + (f"  會退回到:{target}\n"
+             f"  (命令列:bootstrap\\bootstrap.py --rollback;"
+             f"要指定版本用 --rollback-to <版本>。)\n" if target else _NO_WAY_BACK_HELP)
+          + f"  記錄:{paths.data_dir / 'logs'}\n", file=sys.stderr, flush=True)
+    return code
+
+
 def start_app(paths: paths_mod.AppPaths, launcher_args: list[str], *,
               notify=None, popen=subprocess.Popen) -> int:
+    """ONE app, ONE instance — then run the current version.
+
+    Double-clicking start.bat twice used to start a second EVERYTHING: a second
+    launcher, a second Streamlit on a second port, and two processes writing one
+    state.json. The store lock did not stop it, because locks.acquire() WAITS
+    (timeout=30) and then proceeds anyway — the slowest possible way to do the wrong
+    thing. locks.acquire_single_instance() answers immediately instead, and takes over
+    the lock of an owner that died (pid + process start time, so a recycled pid cannot
+    lock the app out of its own machine).
+
+    EXIT 0 when somebody else already holds it. The user pressed Start twice; nothing
+    is broken and their app IS running. A non-zero code here would be read by the rest
+    of this module as a failed launch — it would blame the version, mark it failed and
+    roll the machine back, all because a user double-clicked. So: say so, and leave.
+    """
+    try:
+        instance = acquire_single_instance(paths.data_dir)
+    except AlreadyRunning as exc:
+        log.info("已經有一個 %s 在執行中,這次不再開一個:%s", paths.app_id, exc.owner)
+        print(f"\n[bootstrap] {exc}\n", flush=True)
+        return EXIT_OK
+    try:
+        return _start_app_locked(paths, launcher_args, notify=notify, popen=popen)
+    finally:
+        instance.release()
+
+
+def _start_app_locked(paths: paths_mod.AppPaths, launcher_args: list[str], *,
+                      notify=None, popen=subprocess.Popen) -> int:
     notify = notify or notifications.notify
     store = state_mod.StateStore(paths.state_dir)
     rstore = RuntimeStore(paths.deps_dir)
@@ -582,8 +730,6 @@ def start_app(paths: paths_mod.AppPaths, launcher_args: list[str], *,
         # SHARED failure. Rolling back would fail the same way and would also
         # cost the user a version they never asked to lose.
         return _report_environment_failure(paths, version, code)
-    if not is_candidate:
-        return code
     if is_unknown_failure(code) and outcome.marker_seen:
         # A working window, ended from outside our launcher (Task Manager, power
         # cut, a hard crash of the shell). failed_versions is a destructive, sticky
@@ -591,7 +737,18 @@ def start_app(paths: paths_mod.AppPaths, launcher_args: list[str], *,
         # --clear-failed takes it back out — so we spend it only on evidence we
         # actually have. This is not it. Nothing is failed, nothing is rolled back,
         # and nothing is committed either: the version is still on trial.
+        #
+        # Checked BEFORE `is_candidate`, because it is true of ANY version: killing a
+        # working window from Task Manager is not evidence against the build, whether
+        # or not that build happens to be on trial. Asking the wrong question first
+        # told an operator who had just used End Task that 「這一版壞了」.
         return _report_abnormal_session(paths, version, code)
+    if not is_candidate:
+        # 3/4 (or an unknown code from a window that never came up) on a version
+        # nobody is going to roll back for them — most often the first boot of a
+        # fresh delivery, whose state.json has candidate=None. Do not return in
+        # silence: tell them which button rolls it back.
+        return _report_broken_non_candidate(paths, store, version, code)
 
     # The candidate died (spec §8.2). "Died" is a version-failure exit (3, 4, or an
     # unknown code from a session that never once came up) — NOT merely "a non-zero
@@ -605,8 +762,12 @@ def start_app(paths: paths_mod.AppPaths, launcher_args: list[str], *,
         return code  # someone else already resolved it
     target = resolve_rollback_target(paths, refreshed)
     if not target:
+        # The first boot of a one-version delivery, failing. There is no "previous"
+        # to go back to — there never was one — so this is not a rollback we can do
+        # for them. Say what CAN be done instead of stopping at the bad news.
         log.error("無可用的回滾目標(LKG/previous/其他完整版本都沒有),維持失敗狀態")
         print(f"\n[bootstrap][ERROR] 版本 {version} 啟動失敗,而且沒有任何可以退回的版本。\n"
+              f"{_NO_WAY_BACK_HELP}"
               f"  記錄:{paths.data_dir / 'logs'}\n", file=sys.stderr, flush=True)
         return code
     store.mutate(lambda s: state_mod.fail_candidate(s, target=target))
@@ -625,8 +786,39 @@ def _store_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def _rotate_logs(paths: paths_mod.AppPaths) -> None:
+    """RETENTION. Three producers write into data\\logs\\ and NOTHING ever deleted
+    them: launcher-*.log and streamlit-*.log (launch.py) and bootstrap-*.log (us).
+    On a factory machine that has been up for months that is a real part of what
+    actually fills the disk — and until gc.py learned to see them, nobody was even
+    counting it.
+
+    This belongs where the logs are CREATED, which is here: every single launch goes
+    through bootstrap. GC can only mop up afterwards; this is what stops the puddle.
+
+    gc.stale_logs() keeps the newest LOG_KEEP_RECENT of each family PLUS anything
+    written in the last hour, so the log of the session that is starting right now —
+    and of one still running — is never a candidate.
+
+    Housekeeping must NEVER cost the user their app: an old deployment whose gc.py
+    predates rotate_logs, a permission error, a locked file — none of that is a reason
+    to refuse to start. Swallow it and get on with the launch.
+    """
+    try:
+        removed = gc_mod.rotate_logs(paths.data_dir / "logs")
+    except Exception as exc:                  # noqa: BLE001 - see the docstring
+        log.debug("log rotation skipped: %s", exc)
+        return
+    if removed:
+        log.info("已清掉 %d 份舊記錄檔(每一種只留最近 %d 份,一小時內的一律保留)",
+                 len(removed), gc_mod.LOG_KEEP_RECENT)
+
+
 def _setup_logging(paths: paths_mod.AppPaths) -> None:
     paths.ensure_data_dirs()
+    # BEFORE the handler opens today's file: rotate first and the new log is not even
+    # a candidate for deletion (it would be spared as "fresh" anyway).
+    _rotate_logs(paths)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s",
