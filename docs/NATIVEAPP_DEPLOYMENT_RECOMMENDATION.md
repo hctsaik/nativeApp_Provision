@@ -218,6 +218,14 @@ Release gate 必須拒絕下列內容：
 ### P1：收斂 `.napp` 與 Store/slot
 
 > **狀態：核心已實作（2026-07-19）**，落點 `native_agent/agent.py` + `tests/test_agent_p1_p2.py`。
+> **第二輪追加（同日）——CIM 平台本身 Store 化 phase 1**：平台就是 Agent 底下的一個 app
+> （`cim-platform`）。`platform_store.build_platform_napp()`（engine 樹進 payload、
+> 17MB 殼以 blob 旅行）→ `release.py pack-platform` + P0 release →
+> `NativeAgent.update("cim-platform", …)`（不可變版本/原子切換/LKG/回滾全部繼承）→
+> `native_agent/platform_launcher.py` 依 start.bat 契約（CIM_ENGINE_EXE/四個 data env/
+> cwd 技巧/project-key 規則）解析啟動；內建專案 data 固定 key，**換版不重置 user data**
+> （有測試）。`tests/test_platform_store.py` 覆蓋全鏈。Phase 1 不含：可攜 runtime 的
+> 版本化、真機 WebView2 spawn 驗證（launcher `--dry-run` 是已測面；真機驗證進 VM 矩陣）。
 
 1. `.napp` 成為唯一 App 對外 artifact。✅（Agent 路徑原本即是；release pipeline 亦以 `.napp` 為唯一單位）
 2. Native Agent 安裝 `.napp` 時，落入 Store 的 `apps/<id>/versions`。✅（形狀一致：`applications/<id>/versions/<ver>` 不可變 + meta sidecar；根目錄名未改以免破壞既有裝置）
@@ -239,7 +247,7 @@ Release gate 必須拒絕下列內容：
 > **狀態：1/4 已實作、2 部分、3 清單就緒未執行（2026-07-19）**。
 
 1. production Ed25519 signer/verifier 與 key rotation。✅（**純 Python RFC 8032**——原「需 cryptography」假設不成立，見 ADR 0001 實作紀錄；trust store 支援多鑰共存/retired/撤銷；`release.py keygen/sign` + RFC 官方向量測試）
-2. 更新通道驗證發行者簽章。**部分**：`.napp` 通道（Native Agent／release pipeline production channel）✅；Streamlit Store desktop 通道（release.json/files.json）**未接**——那是另一個 payload 格式，需自己的簽章欄位設計，勿倉促塞入。
+2. 更新通道驗證發行者簽章。✅ **兩條通道都已接**（2026-07-19 第二輪）：`.napp` 通道（Native Agent／release pipeline production channel）；**Streamlit Store desktop 通道**（`device/update_signing.py`：簽 files.json 的 canonical digest，`release.py sign-version` 簽發、`_stage_version` 與 `--set-pending` 兩條路都驗、`require_signed_updates` + `apps/<app>/trusted_publishers.json` 控管；未配置的既有裝置不受影響，「攻擊者改 payload 後重生 files.json」有測試證明被抓）。
 3. 乾淨 Windows VM 測試矩陣。**清單已定未執行**：[`VM_ACCEPTANCE_MATRIX.md`](VM_ACCEPTANCE_MATRIX.md)（14 情境含降級路徑）；開發機無 VM 基礎設施，執行需另排。
 4. release promotion：internal → pilot → production。✅（`release.py promote`：同一批 bytes 換通道**全程重驗**，晉升 production 強制驗章；manifest 記 `promoted_from`）
 

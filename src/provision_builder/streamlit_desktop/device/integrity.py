@@ -22,9 +22,12 @@ else:
 
 FILES_NAME = "files.json"
 SENTINEL = ".complete"
-# Excluded from manifests: the manifest itself, the sentinel, and runtime.json
-# (runtime metadata is written store-side after the payload manifest is fixed).
-_EXCLUDED = {FILES_NAME, SENTINEL}
+SIGNATURE = "signature.json"
+# Excluded from manifests: the manifest itself, the sentinel, the publisher
+# signature (it signs the manifest, so it cannot be listed by it), and
+# runtime.json (runtime metadata is written store-side after the payload
+# manifest is fixed).
+_EXCLUDED = {FILES_NAME, SENTINEL, SIGNATURE}
 _CHUNK = 1024 * 1024
 
 

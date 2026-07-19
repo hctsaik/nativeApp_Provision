@@ -182,6 +182,34 @@ py -3.11 release.py promote D:\releases\internal-2026-07-19 --to-channel product
 `verify` 抓得出：改一個 byte、多一個檔、少一個檔、`channel.json` 與 manifest 不一致、
 blob 損壞。任一問題 = 非零 exit code = 不可出貨。
 
+### CIM 平台本身也走同一條鏈（`pack-platform`）
+
+平台不再需要「fat XCOPY + 整夾替換」：
+
+```powershell
+py -3.11 release.py pack-platform C:\code\claude\nativeApp --version 1.0.0 `
+    --out cim-platform-1.0.0.napp --blobs .\blobstore     # 殼以 blob 旅行,不進 .napp
+py -3.11 release.py build --out D:\releases --napp cim-platform-1.0.0.napp --blobs .\blobstore
+# 裝置端:NativeAgent.update("cim-platform", <channel>)  ← 不可變版本/原子切換/回滾全繼承
+# 啟動:  py -3.11 -m native_agent.platform_launcher --root <裝置根> [--project X] [--dry-run]
+```
+
+launcher 完全依 `start.bat` 契約（`CIM_ENGINE_EXE`／四個 data env／cwd 技巧／
+project-key 規則）；內建專案的 data 用固定 key，**換版不重置 user data**。
+
+### Store desktop 通道的發行者簽章（P3.2）
+
+`files.json` 證「內容沒壞」，簽章證「內容是誰發的」——能寫入 update source 的
+攻擊者重生一份雜湊自洽的 payload，從此會被擋下：
+
+```powershell
+py -3.11 release.py sign-version <store樹>\apps\<app>\versions\v1.2.0 --key team-a.private.json
+```
+
+裝置端：把 trust store 放到 `apps\<app>\trusted_publishers.json`；`config.json` 設
+`"require_signed_updates": true` 即強制（背景更新與 `--install`、`--set-pending`
+三條路都驗）。未配置的既有裝置行為完全不變。
+
 ## 打包 GUI（建議用法）
 
 在可連網的 Windows 建置機雙擊：

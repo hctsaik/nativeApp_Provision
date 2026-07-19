@@ -52,6 +52,7 @@ from .builder import (_rename_with_retry, _rmtree_with_retry, _write_bat,
                       bat_problems, scan_project)
 from .device import gc as gc_mod
 from .device import integrity, locks as locks_mod
+from .device import update_signing as device_signing
 from .device.identifiers import validate_identifier
 # hardlinks_unsupported(): the FAT/exFAT lesson, learned once in locks.py and reused
 # here rather than re-derived. A USB stick cannot do hard links, and spec §9.3 promises
@@ -1986,6 +1987,36 @@ def _install_bootstrap(root: Path) -> None:
     target.mkdir(parents=True, exist_ok=True)
     for source in DEVICE_DIR.glob("*.py"):
         shutil.copy2(source, target / source.name)
+    # update_signing 需要純 Python Ed25519(napp/ed25519.py,stdlib-only);
+    # 裝置端以散檔形式 import ed25519,所以隨 bootstrap 一起出貨。
+    ed25519_src = DEVICE_DIR.parent.parent / "napp" / "ed25519.py"
+    shutil.copy2(ed25519_src, target / "ed25519.py")
+
+
+def sign_version_dir(version_dir: Path, signer) -> dict:
+    """Attach a publisher signature to a built version slot (P3.2).
+
+    ``signature.json`` commits to the canonical digest of files.json (whose
+    per-file hashes the device verifies byte-for-byte), is integrity-exempt
+    like ``.complete``, and travels with export_update/export_full_tree
+    automatically. Signing is the one write allowed on a completed slot —
+    it adds provenance without touching a single payload byte.
+    """
+    vdir = Path(version_dir)
+    signature_path = vdir / device_signing.SIGNATURE_NAME
+    if signature_path.exists():
+        raise StoreBuildError(
+            f"{vdir.name} 已有發行者簽章;重簽請重建版本(簽章不可覆蓋)")
+    digest = device_signing.version_digest(integrity.load_files_json(vdir))
+    bundle = {
+        "algorithm": signer.algorithm,
+        "key_id": signer.key_id,
+        "canonical_digest": digest,
+        "signature": signer.sign(digest),
+    }
+    signature_path.write_text(
+        json.dumps(bundle, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return bundle
 
 
 def _start_bat_text(root: Path, app_id: str, display_name: str) -> str:

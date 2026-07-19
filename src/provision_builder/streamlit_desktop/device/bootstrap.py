@@ -130,6 +130,7 @@ from pathlib import Path
 if __package__:
     from . import gc as gc_mod
     from . import integrity, leases, notifications, paths as paths_mod, state as state_mod, updater
+    from . import update_signing
     from .identifiers import IdentifierError
     from .locks import AlreadyRunning, LockTimeout, acquire_single_instance, app_lock
     from .provider import FolderUpdateProvider, ProviderError
@@ -143,6 +144,7 @@ else:  # loose files in <ROOT>/bootstrap/
     import notifications
     import paths as paths_mod
     import state as state_mod
+    import update_signing
     import updater
     from identifiers import IdentifierError
     from locks import AlreadyRunning, LockTimeout, acquire_single_instance, app_lock
@@ -1557,6 +1559,14 @@ def main(argv: list[str] | None = None) -> int:
             problems = paths_mod.verify_version(paths, args.set_pending, deep=True)
             if problems:
                 raise BootstrapError("版本驗證失敗:" + "; ".join(problems))
+            # --set-pending 是繞過 updater 的手動路徑;簽章政策在這裡同樣成立,
+            # 否則「把未簽章版本手動拷進 versions\ 再 set-pending」就是一條後門。
+            try:
+                update_signing.check_version_signature(
+                    paths.version_dir(args.set_pending), config=paths.config(),
+                    trust_path=paths.app_dir / update_signing.TRUST_STORE_NAME)
+            except update_signing.SignaturePolicyError as exc:
+                raise BootstrapError(f"發行者簽章檢查未過:{exc}") from exc
             revision = _version_revision(paths, args.set_pending)
             state_mod.StateStore(paths.state_dir).mutate(
                 lambda s: state_mod.set_pending(s, args.set_pending, revision=revision))

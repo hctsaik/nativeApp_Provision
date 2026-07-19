@@ -122,6 +122,25 @@ def _build_parser() -> argparse.ArgumentParser:
     sign = sub.add_parser("sign", help="對已建好的 .napp 補上 detached 簽章（不動 payload）")
     sign.add_argument("napp", type=Path)
     sign.add_argument("--key", required=True, type=Path, help="keygen 產的私鑰檔")
+
+    pack_platform = sub.add_parser(
+        "pack-platform",
+        help="把 CIM 平台專案打包成 cim-platform .napp（B-2；殼以 blob 旅行）")
+    pack_platform.add_argument("platform_root", type=Path, help="nativeApp 專案根")
+    pack_platform.add_argument("--version", required=True, help="平台版本號（如 1.0.0）")
+    pack_platform.add_argument("--out", required=True, type=Path, help=".napp 輸出路徑")
+    pack_platform.add_argument("--blobs", required=True, type=Path,
+                               help="blob store 根（Tauri 殼會內容定址存進去）")
+    pack_platform.add_argument("--shell", type=Path, default=None,
+                               help="覆蓋殼路徑（預設 apps\\host-tauri\\prebuilt\\cim-light.exe）")
+    pack_platform.add_argument("--key", type=Path, default=None, help="順便用私鑰簽章")
+
+    sign_version = sub.add_parser(
+        "sign-version",
+        help="對 Streamlit Store 的版本槽補發行者簽章（P3.2 Store 通道；簽 files.json 的 canonical digest）")
+    sign_version.add_argument("version_dir", type=Path,
+                              help="store 樹裡的 versions/<版本>/ 目錄（須含 files.json）")
+    sign_version.add_argument("--key", required=True, type=Path, help="keygen 產的私鑰檔")
     return parser
 
 
@@ -194,11 +213,47 @@ def _cmd_sign(args) -> int:
     return 0
 
 
+def _cmd_pack_platform(args) -> int:
+    from provision_builder.blob_store import FileBlobStore
+    from provision_builder.platform_store import PlatformPackError, build_platform_napp
+
+    signer = load_private_key(args.key) if args.key else None
+    try:
+        result = build_platform_napp(
+            args.platform_root, args.version, args.out,
+            blob_store=FileBlobStore(args.blobs), shell_exe=args.shell, signer=signer)
+    except PlatformPackError as exc:
+        print(f"[FAIL] {exc}")
+        return 2
+    print(f"OK: {result.path}（{result.package['artifact']['source_files']} 個檔案，"
+          f"殼 blob {result.blob_references[0]['sha256'][:16]}…）")
+    print("    下一步：py -3.11 release.py build --out <DIR> --napp "
+          f"\"{result.path}\" --blobs \"{args.blobs}\"")
+    return 0
+
+
+def _cmd_sign_version(args) -> int:
+    # store_builder 依賴多，僅在用到時載入，保持其它子命令輕量。
+    from provision_builder.streamlit_desktop.store_builder import StoreBuildError, sign_version_dir
+
+    signer = load_private_key(args.key)
+    try:
+        bundle = sign_version_dir(args.version_dir, signer)
+    except StoreBuildError as exc:
+        print(f"[FAIL] {exc}")
+        return 2
+    print(f"OK: {args.version_dir} 已簽發行者簽章（key_id={bundle['key_id']}）")
+    print("    裝置端啟用驗證：把 trust store 放到 apps\\<app>\\trusted_publishers.json；"
+          "config.json 設 \"require_signed_updates\": true 可強制。")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     guard_console_encoding()
     args = _build_parser().parse_args(argv)
     handlers = {"build": _cmd_build, "verify": _cmd_verify, "promote": _cmd_promote,
-                "keygen": _cmd_keygen, "sign": _cmd_sign}
+                "keygen": _cmd_keygen, "sign": _cmd_sign, "sign-version": _cmd_sign_version,
+                "pack-platform": _cmd_pack_platform}
     try:
         return handlers[args.command](args)
     except (ReleaseError, TrustStoreError, SignatureInvalid, InvalidManifest) as exc:

@@ -29,6 +29,8 @@
 | 12 | 中文/空白路徑 + 非 C 槽 | 部署到 `D:\測試 空白\` | 安裝、啟動、更新全部照常 | 未執行 |
 | 13 | exFAT USB 搬運 | Store 樹經 exFAT USB 搬到 NTFS 後啟動 | 深驗通過（USB 上不執行，只搬運）；hardlink 失敗時訊息指引「先複製到本機 NTFS」 | 未執行 |
 | 14 | UNC 中斷重試 | update source 指到網路共享，中途斷線 | 安全失敗、current 不動；恢復後重試成功（`.part` 續傳不重抓整包） | 未執行 |
+| 15 | 平台 Store 化真機啟動 | `pack-platform` → release → Agent update → `platform_launcher`（不帶 --dry-run）| 真 cim-light.exe 開窗、engine 起、portal 載入；換版重啟後新 engine 生效且 `data\engine-default` 內容保留 | 未執行 |
+| 16 | Store 通道簽章現場演練 | 裝 trust store + `require_signed_updates` → 餵一個重生 files.json 的假 payload | 更新被拒且訊息點名簽章不符；合法簽章版照常安裝 | 未執行 |
 
 ## 降級路徑
 

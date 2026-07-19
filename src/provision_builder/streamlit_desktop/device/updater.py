@@ -16,6 +16,7 @@ from pathlib import Path
 
 if __package__:
     from . import integrity, notifications, paths as paths_mod, state as state_mod
+    from . import update_signing
     from .locks import LockTimeout, held, runtime_lock, store_gc_lock
     from .provider import FolderUpdateProvider, ProviderError, ReleaseMetadata, UpdateProvider
     from .runtime_store import RUNTIME_META, RuntimeStore, ShellStore
@@ -24,6 +25,7 @@ else:
     import notifications
     import paths as paths_mod
     import state as state_mod
+    import update_signing
     from locks import LockTimeout, held, runtime_lock, store_gc_lock
     from provider import FolderUpdateProvider, ProviderError, ReleaseMetadata, UpdateProvider
     from runtime_store import RUNTIME_META, RuntimeStore, ShellStore
@@ -194,6 +196,15 @@ def _stage_version(paths: paths_mod.AppPaths, provider: UpdateProvider,
             problems = integrity.verify_tree(staging)
             if problems:
                 raise UpdateError(f"版本驗證失敗({len(problems)} 項):{problems[:5]}")
+            # Publisher signature (P3.2): checked on the STAGED bytes, before
+            # anything becomes visible — files.json proves integrity, this
+            # proves who produced it.
+            try:
+                update_signing.check_version_signature(
+                    staging, config=paths.config(),
+                    trust_path=paths.app_dir / update_signing.TRUST_STORE_NAME)
+            except update_signing.SignaturePolicyError as exc:
+                raise UpdateError(f"發行者簽章檢查未過:{exc}") from exc
             paths.versions_dir.mkdir(parents=True, exist_ok=True)
             if target.exists():  # a previous failed install; it has no sentinel
                 shutil.rmtree(target, ignore_errors=True)
