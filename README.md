@@ -147,6 +147,13 @@ powershell -File ..\nativeApp\scripts\win\fetch-standalone-python.ps1 `
 > [`docs/release-e2e-step-by-step.html`](docs/release-e2e-step-by-step.html)——
 > 2026-07-19 對真實 nativeApp 實跑整條鏈（keygen → pack → sign → build → verify →
 > promote → User 機器安裝 → 真機啟動截圖），所有輸出與時間皆實測，可離線開啟。
+>
+> **不想打指令？** 雙擊 `start-release-gui.bat`（發佈 GUI）：開場自動偵測
+> 「你在哪一步」（金鑰/平台/殼/上次發版），四步驟旅程一鍵到底，每顆按鈕背後
+> 就是同一條 `release.py` 指令（執行輸出區的 `>` 行可直接複製到主控台重跑）。
+> 失敗/取消自動清半成品、同版本可直接重跑；私鑰固定放在工作區之外
+> （`%USERPROFILE%\.cim-keys`），不會跟 releases 一起被複製上 USB。
+> 邏輯在 `src/provision_builder/release_gui_backend.py`（20 項驗收測試）。
 
 **要交給 User 的東西，只能來自 `release.py build` 的輸出。**
 `dist\` 及任何建置／E2E 工作區都是可刪的 workspace，不是交付物——
