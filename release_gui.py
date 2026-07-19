@@ -34,7 +34,6 @@ from provision_builder.release_gui_backend import (  # noqa: E402
     default_keys_dir,
     delivery_instructions,
     detect_state,
-    keygen_command,
     list_releases,
     promotable_releases,
     release_done_note,
@@ -107,21 +106,7 @@ class ReleaseGui(tk.Tk):
         ttk.Button(grid, text="選…", width=5,
                    command=lambda: self._pick_dir(self.var_platform)).grid(row=1, column=2)
 
-        # 步驟 0：一次性金鑰
-        prep = ttk.LabelFrame(top, text="步驟 0｜一次性：發行金鑰")
-        prep.pack(fill="x", pady=(8, 0))
-        row = ttk.Frame(prep)
-        row.pack(fill="x", padx=8, pady=6)
-        ttk.Label(row, text="key id").pack(side="left")
-        self.var_key_id = tk.StringVar(value="fab-team")
-        self.ent_key_id = ttk.Entry(row, textvariable=self.var_key_id, width=18)
-        self.ent_key_id.pack(side="left", padx=6)
-        self.btn_keygen = ttk.Button(row, text="建立發行金鑰", command=self._do_keygen)
-        self.btn_keygen.pack(side="left", padx=6)
-        self.var_key_note = tk.StringVar(value="")
-        ttk.Label(row, textvariable=self.var_key_note, foreground="#555").pack(side="left", padx=8)
-
-        # 步驟 1：發版
+        # 步驟 1：發版（發行金鑰是隱形基礎設施：首次發版自動建立，不佔一個步驟）
         rel = ttk.LabelFrame(top, text="步驟 1｜發一版（打包 → 簽章 → 組 release → 驗證）")
         rel.pack(fill="x", pady=(8, 0))
         row2 = ttk.Frame(rel)
@@ -200,7 +185,9 @@ class ReleaseGui(tk.Tk):
         latest_internal = next((r for r in releases if r.channel == "internal"), None)
         latest_production = next((r for r in releases if r.channel == "production"), None)
 
-        parts = [f"金鑰：{'OK（key_id=' + str(state.key_id) + '，在 ' + str(default_keys_dir()) + '）' if state.keys_ready else '尚未建立 → 先做步驟 0'}"]
+        parts = [("發行金鑰：OK（自動管理，在 " + str(default_keys_dir()) + "）")
+                 if state.keys_ready else
+                 "發行金鑰：尚未建立——首次發版時會自動建立，你不用做任何事"]
         if state.platform_root:
             shell = "殼 OK" if state.shell_exe else \
                 "缺 prebuilt\\cim-light.exe → 非 WDAC 機器跑 scripts\\win\\build-shell.bat 後複製就位"
@@ -214,18 +201,11 @@ class ReleaseGui(tk.Tk):
                      + " / "
                      + (latest_production.release_id if latest_production else "（無 production）")
                      + f"　建議下一版 {state.suggested_version}")
-        next_step = "步驟 0（建立金鑰）" if not state.keys_ready else \
-            ("步驟 2（晉升）" if promotable_releases(releases) else "步驟 1（發一版）")
+        next_step = "步驟 2（晉升）" if promotable_releases(releases) else "步驟 1（發一版）"
         parts.append(f">> 下一步：{next_step}")
         self.var_status.set("\n".join(parts))
 
         self.var_version.set(state.suggested_version)
-        self.var_key_note.set(
-            f"沿用 {state.key_file.name}（在 {default_keys_dir()}）" if state.key_file else
-            f"將建立於 {default_keys_dir()}（工作區之外，不會跟 releases 一起被複製）")
-        keygen_state = "disabled" if state.keys_ready else "normal"
-        self.btn_keygen.configure(state=keygen_state)
-        self.ent_key_id.configure(state=keygen_state)
 
         names = [r.release_id for r in promotable_releases(releases)]
         self.cmb_promote.configure(values=names)
@@ -243,31 +223,20 @@ class ReleaseGui(tk.Tk):
 
     # ── 動作 ─────────────────────────────────────────────────────────────
 
-    def _do_keygen(self) -> None:
-        key_id = self.var_key_id.get().strip()
-        if not key_id:
-            messagebox.showerror("缺 key id", "先填 key id（例：fab-team）")
-            return
-        keys = default_keys_dir()
-        self._run_steps(
-            [("建立發行金鑰", keygen_command(key_id))],
-            done_note=(f"私鑰：{keys / (key_id + '.private.json')}\n"
-                       f"信任清單：{keys / 'trusted_publishers.json'}\n"
-                       "私鑰只留發佈機（勿進 repo/交付包/裝置）；"
-                       "trusted_publishers.json 之後隨部署放到 User 機器。"))
-
     def _do_release(self) -> None:
         state = self._state
         if state is None or not self.var_platform.get():
             messagebox.showerror("還不能發版", "先在上方選到正確的平台專案，再按「重新偵測」。")
             return
+        keys = default_keys_dir()
         plan = ReleasePlan(
             workspace=Path(self.var_workspace.get()),
             platform_root=Path(self.var_platform.get()),
             version=self.var_version.get().strip(),
-            key_file=state.key_file or Path("missing"),
-            trust_store=state.trust_store or Path("missing"),
+            key_file=state.key_file or keys / "fab-team.private.json",
+            trust_store=state.trust_store or keys / "trusted_publishers.json",
             shell_exe=state.shell_exe,
+            auto_keygen=True,   # 首次發版自動建鑰——金鑰是基礎設施，不是使用者的步驟
         )
         problems = plan.problems()
         if problems:
@@ -380,11 +349,11 @@ class ReleaseGui(tk.Tk):
         if not busy:
             self.var_elapsed.set("")
         state = "disabled" if busy else "normal"
-        for button in (self.btn_release, self.btn_promote, self.btn_keygen, self.btn_reverify):
+        for button in (self.btn_release, self.btn_promote, self.btn_reverify):
             button.configure(state=state)
         self.btn_cancel.configure(state="normal" if busy else "disabled")
         if not busy:
-            self._refresh_state()  # keygen 鈕等狀態由事實決定
+            self._refresh_state()  # 一切按鈕狀態由磁碟事實決定
 
     def _append(self, line: str) -> None:
         self.txt.configure(state="normal")

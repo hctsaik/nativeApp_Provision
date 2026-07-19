@@ -150,12 +150,16 @@ powershell -File ..\nativeApp\scripts\win\fetch-standalone-python.ps1 `
 >
 > **不想打指令？** 雙擊 `start-release-gui.bat`（發佈 GUI），
 > 圖解操作教學（實測截圖、對話框逐字）：
-> [`docs/release-gui-step-by-step.html`](docs/release-gui-step-by-step.html)。開場自動偵測
-> 「你在哪一步」（金鑰/平台/殼/上次發版），四步驟旅程一鍵到底，每顆按鈕背後
-> 就是同一條 `release.py` 指令（執行輸出區的 `>` 行可直接複製到主控台重跑）。
-> 失敗/取消自動清半成品、同版本可直接重跑；私鑰固定放在工作區之外
-> （`%USERPROFILE%\.cim-keys`），不會跟 releases 一起被複製上 USB。
-> 邏輯在 `src/provision_builder/release_gui_backend.py`（20 項驗收測試）。
+> [`docs/release-gui-step-by-step.html`](docs/release-gui-step-by-step.html)。
+> 開場自動偵測「你在哪一步」，三步旅程：發一版 → 晉升 production → 交付。
+> **金鑰全自動**（首次發版自動建立、信任清單自動隨 release 帶到目標機並釘住——
+> 你全程不用碰）；每顆按鈕背後就是同一條 `release.py` 指令（輸出區的 `>` 行可
+> 複製重跑）；失敗/取消自動清半成品、同版本直接重跑。
+>
+> **目標機（User 電腦）**：release 資料夾自帶安裝器——**雙擊 `install.bat`**
+> 首次＝安裝、拿新 release 再雙擊＝更新（資料不動）；啟動用安裝根目錄的
+> `bin\start-platform.bat`。TOFU 驗章：更新永遠驗「首次安裝釘住」的發行者清單，
+> 掉包的更新資料夾會被拒絕（`tests/test_device_install.py`）。
 
 **要交給 User 的東西，只能來自 `release.py build` 的輸出。**
 `dist\` 及任何建置／E2E 工作區都是可刪的 workspace，不是交付物——

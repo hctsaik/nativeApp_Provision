@@ -142,6 +142,13 @@ user	0m0.015s
 sys	0m0.031s</pre>
 
 <h2>3. 搬到 User 機器：驗證 → 安裝 → 啟動</h2>
+<div class="callout"><b>2026-07-19 更新：現在有更簡單的路。</b>
+平台 release 已<b>自帶安裝器</b>——目標機雙擊資料夾裡的 <code>install.bat</code>
+即安裝（首次會自動釘住發行者信任清單），之後拿新 release 再雙擊同一顆＝更新；
+啟動用安裝根目錄的 <code>bin\start-platform.bat</code>。
+本節以下內容是這條路背後的原理（Agent/launcher 手動操作），照做仍然有效。
+金鑰流程也已隱形化：GUI 首次發版自動建鑰，見
+<code>docs/release-gui-step-by-step.html</code>。</div>
 <ol class="steps">
 <li><b>搬運</b>：整個 <code>production-20260719\</code> 複製到目標機（USB 可；別放 OneDrive 同步夾）。</li>
 <li><b>先驗再裝</b>：<code>release.py verify &lt;資料夾&gt;</code>——半份複製、被改過都在這裡被抓（見 §5）。</li>

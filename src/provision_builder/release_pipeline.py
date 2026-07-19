@@ -44,6 +44,7 @@ from typing import Sequence
 
 from provision_builder._util import human_size, sha256_file
 from provision_builder.blob_store import FileBlobStore
+from provision_builder.device_payload import TRUST_STORE_NAME, write_device_tools
 from provision_builder.napp.errors import SignatureInvalid
 from provision_builder.napp.reader import NappContents, verify_napp
 from provision_builder.napp.signing import Verifier
@@ -261,6 +262,7 @@ def build_release(
     extras: dict[str, Path | str] | None = None,
     verifier: Verifier | None = None,
     promoted_from: str | None = None,
+    trust_store_file: Path | str | None = None,
 ) -> ReleaseResult:
     """Assemble a fresh ``<out_parent>/<release-id>/`` from explicit inputs.
 
@@ -356,6 +358,11 @@ def build_release(
         for name, path in extras.items():
             shutil.copytree(path, staging / EXTRAS_DIR / name)
 
+        # 平台 release 自帶裝置端安裝器（install.bat + tools/）與發行者信任清單：
+        # 目標機雙擊即安裝，首次安裝時把清單釘住（TOFU），之後更新驗釘住的那份。
+        if any(a.app_id == "cim-platform" for a in artifacts):
+            write_device_tools(staging, trust_store_file)
+
         # Payload totals（解壓後磁碟需求）：此刻樹上只有 payload，
         # manifest/SBOM/報告/checksums 尚未寫入，統計因此穩定且不自我引用。
         payload_files = 0
@@ -450,6 +457,18 @@ def _write_checksums_and_report(
         f"- 安裝檔：`{setup_info['file']}`（{human_size(setup_info['size'])}）"
         if setup_info else "- 安裝檔：本次未附（純離線通道更新包）"
     )
+    if (root / "install.bat").is_file():
+        usage = (f"1. 整個 `{manifest['release_id']}\\` 資料夾複製到目標機（USB 可）。\n"
+                 "2. 目標機**雙擊 `install.bat`**——首次＝安裝（會釘住發行者信任清單），\n"
+                 "   之後拿新的 release 資料夾再雙擊同一顆＝更新（使用者資料不動）。\n"
+                 "3. 啟動：安裝根目錄的 `bin\\start-platform.bat`"
+                 "（預設 `%LOCALAPPDATA%\\CIM-Platform`）。")
+    else:
+        usage = (f"1. 整個 `{manifest['release_id']}\\` 資料夾複製到目標機（USB 可）。\n"
+                 "2. 先驗證完整性：`py -3.11 release.py verify <此資料夾>`。\n"
+                 "3. 把 `offline-channel\\` 設為 App 的 update source（`config.json` 的\n"
+                 "   `update_source`），或用 Native Agent 直接指向它——`channel.json`\n"
+                 "   即為通道索引，Agent 只下載缺少的內容。")
     report = f"""# Release 報告 — {manifest['release_id']}
 
 - 產生時間：{manifest['created_at']}
@@ -472,11 +491,7 @@ def _write_checksums_and_report(
 
 ## 離線機使用方式
 
-1. 整個 `{manifest['release_id']}\\` 資料夾複製到目標機（USB 可）。
-2. 先驗證完整性：`py -3.11 release.py verify <此資料夾>`。
-3. 把 `offline-channel\\` 設為 App 的 update source（`config.json` 的
-   `update_source`），或用 Native Agent 直接指向它——`channel.json`
-   即為通道索引，Agent 只下載缺少的內容。
+{usage}
 
 ## 注意
 
@@ -530,6 +545,7 @@ def promote_release(
     setup = manifest.get("setup")
     setup_path = source / setup["file"] if setup else None
 
+    shipped_trust = source / TRUST_STORE_NAME
     return build_release(
         out_parent,
         napp_paths,
@@ -540,6 +556,7 @@ def promote_release(
         extras=extras,
         verifier=verifier,
         promoted_from=manifest.get("release_id"),
+        trust_store_file=shipped_trust if shipped_trust.is_file() else None,
     )
 
 

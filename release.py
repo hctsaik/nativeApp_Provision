@@ -154,6 +154,8 @@ def _cmd_build(args) -> int:
         setup_exe=args.setup,
         extras=dict(args.extra),
         verifier=_build_verifier(args),
+        # 平台 release 會把這份公鑰清單隨包帶走，目標機首次安裝時釘住（TOFU）
+        trust_store_file=getattr(args, "trust_store", None),
     )
     totals = result.manifest["totals"]
     print(f"OK: release 已建立 {result.path}")

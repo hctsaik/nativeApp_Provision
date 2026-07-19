@@ -159,6 +159,7 @@ class ReleasePlan:
     trust_store: Path
     channel: str = "internal"
     shell_exe: Path | None = None
+    auto_keygen: bool = False   # 金鑰不存在時由第一步自動建立（金鑰對使用者隱形）
 
     @property
     def napp_path(self) -> Path:
@@ -188,12 +189,11 @@ class ReleasePlan:
         if not (Path(self.platform_root) / "sidecar" / "python-engine" / "engine.py").is_file() \
                 and not (Path(self.platform_root) / "engine" / "engine.py").is_file():
             issues.append(f"平台專案沒有 engine.py：{self.platform_root}")
-        if not Path(self.key_file).is_file():
-            issues.append("找不到私鑰檔——先到「一次性準備」按「產生發行金鑰」")
-        if not Path(self.trust_store).is_file():
-            issues.append("找不到 trusted_publishers.json——先產生發行金鑰")
+        keys_exist = Path(self.key_file).is_file() and Path(self.trust_store).is_file()
+        if not keys_exist and not self.auto_keygen:
+            issues.append("發行金鑰尚未建立——用 GUI 發版會自動建立；CLI 先跑 release.py keygen")
         # 簽章相關的錯誤要在這裡（0 秒）就爆，不要等 pack 跑完 62 秒才爆
-        if not issues:
+        if keys_exist and not issues:
             issues += _key_matches_trust(self.key_file, self.trust_store)
         shell = self.shell_exe or (Path(self.platform_root) / "apps" / "host-tauri"
                                    / "prebuilt" / "cim-light.exe")
@@ -211,12 +211,17 @@ class ReleasePlan:
         return (self.napp_path, self.release_dir)
 
     def steps(self) -> list[tuple[str, list[str]]]:
+        prelude: list[tuple[str, list[str]]] = []
+        if self.auto_keygen and not Path(self.key_file).is_file():
+            key_id = Path(self.key_file).name.removesuffix(".private.json")
+            prelude.append(("首次使用：自動建立發行金鑰（之後不會再看到這步）",
+                            keygen_command(key_id, keys_dir=Path(self.key_file).parent)))
         pack = _py() + ["pack-platform", str(self.platform_root),
                         "--version", self.version,
                         "--out", str(self.napp_path), "--blobs", str(self.blobstore)]
         if self.shell_exe is not None:
             pack += ["--shell", str(self.shell_exe)]
-        return [
+        return prelude + [
             ("打包平台（約 1 分鐘）", pack),
             ("發行者簽章", _py() + ["sign", str(self.napp_path), "--key", str(self.key_file)]),
             ("組 release 資料夾", _py() + ["build", "--out", str(self.releases_dir),
@@ -284,15 +289,15 @@ def release_done_note(plan: "ReleasePlan") -> str:
 
 
 def delivery_instructions(production: ReleaseInfo) -> str:
-    """步驟 3「複製交付指示」的剪貼簿全文——與畫面同源，避免兩處漂移。"""
+    """「複製交付指示」的剪貼簿全文——與畫面同源，避免兩處漂移。"""
     return (
         f"CIM 平台交付指示（{production.release_id}）\n"
         f"1. 把整個資料夾複製到目標機（USB 可；不要經 OneDrive 同步夾）：\n"
         f"   {production.path}\n"
-        f"2. 目標機上先驗證再使用：\n"
-        f"   py -3.11 release.py verify \"{production.path.name}\"\n"
-        f"3. 依資料夾內 RELEASE-REPORT.md 的「離線機使用方式」三步驟安裝。\n"
-        f"注意：發佈機的 keys 目錄（私鑰）絕不複製出去。\n"
+        f"2. 目標機雙擊資料夾裡的 install.bat——首次＝安裝，之後拿新的\n"
+        f"   release 資料夾再雙擊同一顆＝更新（使用者資料不會動）。\n"
+        f"3. 啟動：安裝根目錄的 bin\\start-platform.bat（預設 %LOCALAPPDATA%\\CIM-Platform）。\n"
+        f"注意：發佈機的金鑰目錄（{default_keys_dir()}）絕不複製出去。\n"
     )
 
 

@@ -192,13 +192,34 @@ def test_release_done_note_says_not_deliverable(tmp_path: Path) -> None:
     assert "尚不可交付" in note and "晉升" in note and "可交付現場" not in note.split("尚不")[0]
 
 
-def test_delivery_instructions_contain_verify_and_keys_warning(tmp_path: Path) -> None:
+def test_delivery_instructions_install_flow_and_keys_warning(tmp_path: Path) -> None:
     from provision_builder.release_gui_backend import ReleaseInfo
 
     info = ReleaseInfo("production-1.0.0", tmp_path / "production-1.0.0",
                        "production", "1.0.0", "internal-1.0.0")
     text = delivery_instructions(info)
-    assert "verify" in text and "keys" in text and "OneDrive" in text
+    assert "install.bat" in text                      # 目標機一顆鍵：安裝=更新
+    assert "start-platform.bat" in text
+    assert "金鑰目錄" in text and "絕不複製" in text   # 私鑰警語
+    assert "OneDrive" in text
+
+
+def test_auto_keygen_prepends_step_and_passes_preflight(tmp_path: Path) -> None:
+    """金鑰隱形化：金鑰不存在時不擋發版，改由第一步自動建立。"""
+    keys = tmp_path / "fresh-keys"
+    plan = _plan(tmp_path, key_file=keys / "fab-team.private.json",
+                 trust_store=keys / "trusted_publishers.json", auto_keygen=True)
+    assert plan.problems() == []
+    steps = plan.steps()
+    assert len(steps) == 5 and "自動建立發行金鑰" in steps[0][0]
+    # 真的跑：五步全綠（keygen → pack → sign → build → verify）
+    result = run_steps(steps, partials=plan.partials())
+    assert result.ok
+    # 第二次發版：金鑰已在 → 回到四步
+    plan2 = _plan(tmp_path, key_file=keys / "fab-team.private.json",
+                  trust_store=keys / "trusted_publishers.json",
+                  auto_keygen=True, version="1.0.1")
+    assert len(plan2.steps()) == 4
 
 
 def test_summary_tells_facts_for_each_outcome() -> None:
