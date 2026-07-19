@@ -9,11 +9,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from provision_builder import winfs
 from provision_builder.blob_store import FileBlobStore
 from provision_builder.napp import install_source, verify_napp
 from provision_builder.napp.signing import Verifier
@@ -116,9 +118,24 @@ class NativeAgent:
     def _active_json(self, app_id: str) -> Path:
         return self._app_dir(app_id) / "active.json"
 
+    def _runtimes_dir(self) -> Path:
+        """Global runtime store: one venv per dependency fingerprint, shared by
+        every app on the device (P1 convergence — the Store's deps/runtimes
+        model). Legacy per-app ``venvs/`` are still honoured read-only."""
+        return self.root / "deps" / "runtimes"
+
+    def runtime_dir(self, fingerprint: str) -> Path:
+        """Where the runtime for ``fingerprint`` lives (global store, with a
+        fallback to a pre-convergence per-app venv if one is still complete)."""
+        return self._runtimes_dir() / fingerprint
+
+    def _legacy_venv_dir(self, app_id: str, fingerprint: str) -> Path:
+        return self._app_dir(app_id) / "venvs" / fingerprint
+
     def _ensure_layout(self, app_id: str) -> None:
-        for sub in ("versions", "venvs", "staging", "data"):
+        for sub in ("versions", "staging", "data"):
             (self._app_dir(app_id) / sub).mkdir(parents=True, exist_ok=True)
+        self._runtimes_dir().mkdir(parents=True, exist_ok=True)
 
     def read_active(self, app_id: str) -> dict | None:
         path = self._active_json(app_id)
@@ -277,19 +294,53 @@ class NativeAgent:
     # ── steps ───────────────────────────────────────────────────────────────
 
     def _download(self, app_id: str, release: Release) -> Path:
+        """Fetch the artifact with interruption resume (P2).
+
+        Partial bytes persist in ``<version>.napp.part``; a retry continues from
+        that offset (seek when the source supports it, skip-read otherwise)
+        instead of re-transferring the whole package. The reassembled file must
+        match the registry SHA-256 — a stale/corrupt ``.part`` triggers exactly
+        one clean re-download before giving up.
+        """
         staging = self._app_dir(app_id) / "staging"
         staging.mkdir(parents=True, exist_ok=True)
         dest = staging / f"{release.version}.napp"
-        fd, temp_name = tempfile.mkstemp(prefix=".napp-", dir=staging)
+        part = staging / f"{release.version}.napp.part"
+        for attempt in (1, 2):
+            offset = part.stat().st_size if part.is_file() else 0
+            if offset > release.size_bytes:
+                part.unlink()  # bigger than the artifact: definitely stale
+                offset = 0
+            with self.remote.open_artifact(release) as source:
+                if offset:
+                    self._skip_to(source, offset)
+                with part.open("ab") as target:
+                    while chunk := source.read(_CHUNK):
+                        target.write(chunk)
+            if _sha256_file(part) == release.sha256:
+                os.replace(part, dest)
+                return dest
+            part.unlink(missing_ok=True)  # stale resume data — retry once from zero
+            if attempt == 2:
+                raise HashMismatch(
+                    f"downloaded artifact sha256 != registry for {release.app_id}@{release.version}"
+                )
+        raise AssertionError("unreachable")
+
+    @staticmethod
+    def _skip_to(source, offset: int) -> None:
+        """Position ``source`` at ``offset``: seek when possible, else skip-read."""
         try:
-            with self.remote.open_artifact(release) as source, os.fdopen(fd, "wb") as target:
-                while chunk := source.read(_CHUNK):
-                    target.write(chunk)
-            os.replace(temp_name, dest)
-        except BaseException:
-            Path(temp_name).unlink(missing_ok=True)
-            raise
-        return dest
+            source.seek(offset)
+            return
+        except (AttributeError, OSError, ValueError):
+            pass  # not seekable (e.g. a network stream) — fall back to skipping
+        remaining = offset
+        while remaining > 0:
+            chunk = source.read(min(_CHUNK, remaining))
+            if not chunk:
+                raise ArtifactMissing("remote stream ended before the resume offset")
+            remaining -= len(chunk)
 
     def _pull_blobs(self, references: list[dict]) -> tuple[int, int]:
         pulled = reused = 0
@@ -310,21 +361,56 @@ class NativeAgent:
         return pulled, reused
 
     def _prepare_venv(self, app_id: str, fingerprint: str, application_dir: Path | None = None) -> bool:
-        venv_dir = self._app_dir(app_id) / "venvs" / fingerprint
-        complete = venv_dir / _VENV_COMPLETE
-        if complete.is_file():
-            return True  # reuse: dependency set unchanged
-        if venv_dir.exists():
-            shutil.rmtree(venv_dir)
-        venv_dir.mkdir(parents=True)
-        if self._ensure_venv is not None:
-            self._ensure_venv(fingerprint, venv_dir)
-        elif application_dir is not None:
-            self._install_embedded_wheels(application_dir, venv_dir)
-        if self._warmup is not None:
-            self._warmup(venv_dir)
-        complete.write_text(json.dumps({"fingerprint": fingerprint, "completed_at": _utc_now()}), encoding="utf-8")
+        """Make the runtime for ``fingerprint`` available; True = reused.
+
+        Runtimes live in the GLOBAL store (``deps/runtimes/<fingerprint>``) so
+        two apps with the same dependency lock share one venv (P1). Creation is
+        race-safe without cross-process locks: build in a unique staging dir,
+        rename into place; losing the rename race means someone else built the
+        same fingerprint — adopt theirs once its ``.complete`` shows up.
+        """
+        global_dir = self.runtime_dir(fingerprint)
+        if (global_dir / _VENV_COMPLETE).is_file():
+            return True  # shared runtime already on this device
+        if (self._legacy_venv_dir(app_id, fingerprint) / _VENV_COMPLETE).is_file():
+            return True  # pre-convergence per-app venv, still valid — keep using it
+
+        staging = self._runtimes_dir() / f".staging-{fingerprint}-{os.getpid()}"
+        if staging.exists():
+            shutil.rmtree(staging)
+        staging.mkdir(parents=True)
+        try:
+            if self._ensure_venv is not None:
+                self._ensure_venv(fingerprint, staging)
+            elif application_dir is not None:
+                self._install_embedded_wheels(application_dir, staging)
+            if self._warmup is not None:
+                self._warmup(staging)
+            (staging / _VENV_COMPLETE).write_text(
+                json.dumps({"fingerprint": fingerprint, "completed_at": _utc_now()}), encoding="utf-8"
+            )
+            try:
+                winfs.robust_rename(staging, global_dir)
+            except FileExistsError:
+                # Lost the race to a concurrent update installing the same
+                # fingerprint. Theirs is as good as ours once complete.
+                self._await_complete(global_dir)
+                winfs.robust_rmtree(staging)
+        except BaseException:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
         return False
+
+    def _await_complete(self, runtime_dir: Path, timeout: float = 60.0) -> None:
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if (runtime_dir / _VENV_COMPLETE).is_file():
+                return
+            time.sleep(0.2)
+        raise ArtifactMissing(
+            f"concurrent runtime install never completed: {runtime_dir.name} "
+            "(刪掉該目錄後重試)"
+        )
 
     @staticmethod
     def _install_embedded_wheels(application_dir: Path, venv_dir: Path) -> None:
@@ -363,9 +449,11 @@ class NativeAgent:
 
     def _activate(self, app_id: str, version: str, fingerprint: str, staging_dir: Path) -> Path:
         final_dir = self._versions_dir(app_id) / version
-        if final_dir.exists():
-            shutil.rmtree(final_dir)
-        os.replace(staging_dir, final_dir)  # atomic same-filesystem rename
+        if final_dir.exists() and not winfs.robust_rmtree(final_dir):
+            raise winfs.StillLocked(
+                f"舊版本目錄被鎖住無法替換：{final_dir}", waited=0.0, last=None)
+        # Same-filesystem rename, retried through transient Defender locks (P2).
+        winfs.robust_rename(staging_dir, final_dir)
         # Sidecar meta records which venv this version needs, so GC can keep the
         # right venvs without re-reading the package.
         (self._versions_dir(app_id) / f"{version}{_META_SUFFIX}").write_text(
@@ -390,12 +478,19 @@ class NativeAgent:
             return None
 
     def gc(self, app_id: str) -> dict:
-        """Reclaim old version dirs and unreferenced venvs; keep active + LKG.
+        """Reclaim old version dirs and unreferenced runtimes; keep active + LKG.
 
-        Blobs are content-addressed and shared, so they are left in place (a
-        source-only update must still find them); version dirs and venvs are the
-        space that actually accumulates per release.
+        Blobs are content-addressed and shared, so they are left in place.
+        Global runtimes (P1) are removed only when NO app on the device still
+        references their fingerprint — the keep-set is computed across every
+        app's remaining versions, not just this one's. Deletion failures are
+        never swallowed (P2): what could not be removed is recorded in
+        ``agent/deferred-gc.json``, reported in the result, and retried at the
+        start of the next gc run.
         """
+        deferred_cleared = self._retry_deferred()
+        deferred: list[str] = []
+
         keep_versions = {v for v in (self.state.active_version(app_id),
                                      self.state.last_known_good(app_id)) if v}
         keep_fingerprints = {fp for v in keep_versions if (fp := self._version_fingerprint(app_id, v))}
@@ -406,20 +501,113 @@ class NativeAgent:
             if child.name.endswith(_META_SUFFIX) or child.name.endswith(".staging"):
                 continue
             if child.is_dir() and child.name not in keep_versions:
-                shutil.rmtree(child, ignore_errors=True)
-                (versions_dir / f"{child.name}{_META_SUFFIX}").unlink(missing_ok=True)
-                removed_versions.append(child.name)
+                if winfs.robust_rmtree(child, attempts=3):
+                    (versions_dir / f"{child.name}{_META_SUFFIX}").unlink(missing_ok=True)
+                    removed_versions.append(child.name)
+                else:
+                    deferred.append(str(child))
 
+        # Legacy per-app venvs: pre-convergence layout, same keep rule as before.
         removed_venvs: list[str] = []
         venvs_dir = self._app_dir(app_id) / "venvs"
         for child in venvs_dir.iterdir() if venvs_dir.is_dir() else []:
             if child.is_dir() and child.name not in keep_fingerprints:
-                shutil.rmtree(child, ignore_errors=True)
-                removed_venvs.append(child.name)
+                if winfs.robust_rmtree(child, attempts=3):
+                    removed_venvs.append(child.name)
+                else:
+                    deferred.append(str(child))
 
+        # Global runtime store: keep any fingerprint still referenced by ANY
+        # app's remaining versions or active state (cross-app keep-set).
+        removed_runtimes: list[str] = []
+        device_keep = self._device_keep_fingerprints()
+        runtimes_dir = self._runtimes_dir()
+        for child in runtimes_dir.iterdir() if runtimes_dir.is_dir() else []:
+            if not child.is_dir() or child.name.startswith(".staging-"):
+                continue
+            if child.name not in device_keep:
+                if winfs.robust_rmtree(child, attempts=3):
+                    removed_runtimes.append(child.name)
+                else:
+                    deferred.append(str(child))
+
+        if deferred:
+            self._record_deferred(deferred)
         return {"kept_versions": sorted(keep_versions),
                 "removed_versions": sorted(removed_versions),
-                "removed_venvs": sorted(removed_venvs)}
+                "removed_venvs": sorted(removed_venvs),
+                "removed_runtimes": sorted(removed_runtimes),
+                "deferred": sorted(deferred),
+                "deferred_cleared": sorted(deferred_cleared)}
+
+    def _device_keep_fingerprints(self) -> set[str]:
+        """Fingerprints referenced by any remaining version of any app.
+
+        Conservative on purpose: a version dir that survives (even if not
+        active) keeps its runtime — wrongly keeping a venv wastes disk, wrongly
+        deleting one breaks another app.
+        """
+        keep: set[str] = set()
+        apps_root = self.root / "applications"
+        for app_dir in apps_root.iterdir() if apps_root.is_dir() else []:
+            versions_dir = app_dir / "versions"
+            for meta in versions_dir.glob(f"*{_META_SUFFIX}") if versions_dir.is_dir() else []:
+                version = meta.name[: -len(_META_SUFFIX)]
+                if (versions_dir / version).is_dir():
+                    try:
+                        fp = json.loads(meta.read_text(encoding="utf-8")).get("dependency_fingerprint")
+                    except ValueError:
+                        fp = None
+                    if fp:
+                        keep.add(fp)
+        return keep
+
+    # ── deferred cleanup (P2: GC failures are reported and retried, not lied about) ──
+
+    def _deferred_path(self) -> Path:
+        return self.root / "agent" / "deferred-gc.json"
+
+    def _read_deferred(self) -> list[str]:
+        path = self._deferred_path()
+        if not path.is_file():
+            return []
+        try:
+            return list(json.loads(path.read_text(encoding="utf-8")).get("paths", []))
+        except ValueError:
+            return []
+
+    def _record_deferred(self, paths: list[str]) -> None:
+        merged = sorted(set(self._read_deferred()) | set(paths))
+        target = self._deferred_path()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps({"schema": 1, "paths": merged, "updated_at": _utc_now()},
+                       ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _retry_deferred(self) -> list[str]:
+        pending = self._read_deferred()
+        if not pending:
+            return []
+        cleared: list[str] = []
+        still: list[str] = []
+        for entry in pending:
+            path = Path(entry)
+            if not path.exists() or winfs.robust_rmtree(path, attempts=2):
+                cleared.append(entry)
+            else:
+                still.append(entry)
+        target = self._deferred_path()
+        if still:
+            target.write_text(
+                json.dumps({"schema": 1, "paths": sorted(still), "updated_at": _utc_now()},
+                           ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        else:
+            target.unlink(missing_ok=True)
+        return cleared
 
     def _write_active(self, app_id: str, doc: dict) -> None:
         path = self._active_json(app_id)

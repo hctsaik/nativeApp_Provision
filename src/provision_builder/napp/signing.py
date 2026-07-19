@@ -106,6 +106,55 @@ class MultiKeyVerifier:
         verifier.verify(digest_hex, bundle)
 
 
+ED25519_ALGORITHM = "ed25519"
+
+
+class Ed25519Signer:
+    """Production publisher signer (ADR 0001), pure-Python RFC 8032.
+
+    ``seed`` is the 32-byte private seed. Keep it in a secret store — never in
+    a repo, a package, or a device trust-store.
+    """
+
+    algorithm = ED25519_ALGORITHM
+
+    def __init__(self, seed: bytes, key_id: str):
+        from provision_builder.napp import ed25519
+
+        self._seed = seed
+        self.key_id = key_id
+        self.public_key = ed25519.secret_to_public(seed)
+
+    def sign(self, digest_hex: str) -> str:
+        from provision_builder.napp import ed25519
+
+        return ed25519.sign(self._seed, digest_hex.encode("ascii")).hex()
+
+    def verify(self, digest_hex: str, bundle: SignatureBundle) -> None:
+        Ed25519Verifier(self.public_key).verify(digest_hex, bundle)
+
+
+class Ed25519Verifier:
+    """Verify against one trusted Ed25519 public key (device side: no secret)."""
+
+    def __init__(self, public_key: bytes):
+        self._public = public_key
+
+    def verify(self, digest_hex: str, bundle: SignatureBundle) -> None:
+        from provision_builder.napp import ed25519
+
+        if bundle.algorithm != ED25519_ALGORITHM:
+            raise SignatureInvalid(f"unexpected algorithm: {bundle.algorithm}")
+        if bundle.canonical_digest != digest_hex:
+            raise SignatureInvalid("signature commits to a different digest")
+        try:
+            raw = bytes.fromhex(bundle.signature)
+        except ValueError as exc:
+            raise SignatureInvalid("signature is not valid hex") from exc
+        if not ed25519.verify(self._public, digest_hex.encode("ascii"), raw):
+            raise SignatureInvalid("signature does not verify")
+
+
 def sign_digest(signer: Signer, digest_hex: str) -> SignatureBundle:
     return SignatureBundle(
         algorithm=signer.algorithm,

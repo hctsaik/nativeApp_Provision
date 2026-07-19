@@ -69,7 +69,8 @@ def test_gc_prunes_old_versions_but_keeps_active(remote, tmp_path: Path) -> None
     assert result["removed_venvs"] == []  # shared fingerprint venv is still in use
 
 
-def test_gc_prunes_unreferenced_venv(remote, tmp_path: Path) -> None:
+def test_gc_prunes_unreferenced_runtime(remote, tmp_path: Path) -> None:
+    """P1 之後 runtime 在全域 store：舊指紋沒有任何版本引用時才回收。"""
     agent = _agent(tmp_path, remote)
     publish(remote, tmp_path, "1.0.0", requires=("numpy==1.26.0",))
     agent.update("cv-reviewer", "production")
@@ -80,6 +81,20 @@ def test_gc_prunes_unreferenced_venv(remote, tmp_path: Path) -> None:
     assert fp_old != fp_new
 
     result = agent.gc("cv-reviewer")
-    assert fp_old in result["removed_venvs"] and fp_new not in result["removed_venvs"]
-    assert (agent._app_dir("cv-reviewer") / "venvs" / fp_new).is_dir()
-    assert not (agent._app_dir("cv-reviewer") / "venvs" / fp_old).exists()
+    assert fp_old in result["removed_runtimes"] and fp_new not in result["removed_runtimes"]
+    assert agent.runtime_dir(fp_new).is_dir()
+    assert not agent.runtime_dir(fp_old).exists()
+
+
+def test_gc_prunes_legacy_per_app_venv(remote, tmp_path: Path) -> None:
+    """收斂前的 per-app venv：不再被引用時照舊回收（removed_venvs）。"""
+    agent = _agent(tmp_path, remote)
+    publish(remote, tmp_path, "1.0.0", requires=("numpy==1.26.0",))
+    agent.update("cv-reviewer", "production")
+    legacy = agent._legacy_venv_dir("cv-reviewer", "stale-fingerprint")
+    legacy.mkdir(parents=True)
+    (legacy / ".complete").write_text("{}", encoding="utf-8")
+
+    result = agent.gc("cv-reviewer")
+    assert "stale-fingerprint" in result["removed_venvs"]
+    assert not legacy.exists()

@@ -141,6 +141,47 @@ powershell -File ..\nativeApp\scripts\win\fetch-standalone-python.ps1 `
   -DestRoot .runtime-cache\python311 -Flatten
 ```
 
+## 正式交付：`release.py`（唯一交付來源，P0 Release Pipeline）
+
+**要交給 User 的東西，只能來自 `release.py build` 的輸出。**
+`dist\` 及任何建置／E2E 工作區都是可刪的 workspace，不是交付物——
+這條界線現在是機器可驗的，不再靠人記得。
+
+```powershell
+# 連網建置機：從明確指定的輸入組一份全新 release（輸出目錄必須不存在）
+py -3.11 release.py build --out D:\releases --napp cv-viewer-1.2.0.napp `
+    --blobs .\blobstore --channel internal --release-id internal-2026-07-19
+
+# 搬運後 / 交付前：機器回答「這個資料夾可以出貨嗎」
+py -3.11 release.py verify D:\releases\internal-2026-07-19
+
+# 簽章（production 必要）：一次性產鑰 → 對 .napp 補簽 → 晉升通道
+py -3.11 release.py keygen --key-id team-a --out team-a.private.json --trust-store trusted_publishers.json
+py -3.11 release.py sign cv-viewer-1.2.0.napp --key team-a.private.json
+py -3.11 release.py promote D:\releases\internal-2026-07-19 --to-channel production `
+    --out D:\releases --trust-store trusted_publishers.json
+```
+
+產出 `release/<release-id>/`：`offline-channel/`（`channel.json` + `artifacts/*.napp` +
+`blobs/sha256/`，**可直接被 Native Agent 當 update source**，不是第三種格式）、
+`release-manifest.json`、`SBOM.json`、`RELEASE-REPORT.md`（繁中、含離線機三步驟）、
+`checksums.sha256`（覆蓋除自身外的每一個檔案）。
+
+三條硬規則：
+
+1. **全新目錄**：`--release-id` 已存在就拒絕——release 不可就地增補，要出新版就產新目錄。
+2. **防誤包 gate**：`--extra` 的 payload 樹裡出現 `_run`、`__pycache__`、`wv2`、
+   `node_modules`、根層 `logs/`/`dist/`/`data/` 等開發殘留 → **build 直接失敗並列出路徑**
+   （fail loud，不做靜默排除——被靜默瘦身的包在建置機上看起來是完整的）。
+3. **production channel 強制驗章**：未簽章或驗不過章的 `.napp` 拒收；`verify` 沒帶信任
+   金鑰時也不會對 production release 宣稱通過。簽章是 **Ed25519**（純 Python RFC 8032，
+   無原生碼、WDAC 友善；`docs/adr/0001-package-signing.md`）——`--trust-store` 給裝置信任
+   的公鑰清單（支援多鑰共存與 retired 輪替）；`--trust key_id:secret` 是 dev HMAC，僅測試用。
+   通道晉升走 `promote`：同一批 bytes 換通道**全程重驗**，manifest 記 `promoted_from`。
+
+`verify` 抓得出：改一個 byte、多一個檔、少一個檔、`channel.json` 與 manifest 不一致、
+blob 損壞。任一問題 = 非零 exit code = 不可出貨。
+
 ## 打包 GUI（建議用法）
 
 在可連網的 Windows 建置機雙擊：

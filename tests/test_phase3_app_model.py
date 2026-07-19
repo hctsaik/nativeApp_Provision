@@ -40,14 +40,17 @@ def test_production_healthcheck_gate(tmp_path: Path) -> None:
 
 
 def test_incomplete_venv_is_rebuilt_and_marked_complete(tmp_path: Path) -> None:
+    """沒有 .complete 的 venv 一律視為半套：忽略並重建（P1 之後建到全域 store）。"""
     service, blobs = stores(tmp_path)
     calls = []
     agent = NativeAgent(tmp_path / "device", service, blobs,
                         ensure_venv=lambda fp, path: calls.append((fp, path)))
-    poisoned = agent._app_dir("app-demo") / "venvs" / "fingerprint"
-    poisoned.mkdir(parents=True)
+    poisoned = agent._legacy_venv_dir("app-demo", "fingerprint")
+    poisoned.mkdir(parents=True)  # 半套 legacy venv（無 .complete）→ 不得被採用
     assert agent._prepare_venv("app-demo", "fingerprint") is False
-    assert len(calls) == 1 and (poisoned / ".complete").is_file()
+    assert len(calls) == 1
+    assert (agent.runtime_dir("fingerprint") / ".complete").is_file()  # 重建在全域 store
+    assert not (poisoned / ".complete").exists()                       # 半套不會被蓋章
     assert agent._prepare_venv("app-demo", "fingerprint") is True
 
 
