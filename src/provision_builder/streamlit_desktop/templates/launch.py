@@ -686,6 +686,24 @@ class StreamlitExited(Exception):
     """Streamlit died before it became healthy — never open an empty shell."""
 
 
+class StreamlitTimedOut(StreamlitExited):
+    """The Streamlit process is STILL ALIVE but the health endpoint has not
+    answered in time. This is NOT the same failure as the process dying, and
+    conflating the two is how a good version gets blamed for a slow machine.
+
+    A process that is up and simply not answering /_stcore/health yet is what a
+    first boot under antivirus looks like: Defender is reading every byte of a
+    600 MB runtime, the disk is cold, and the server needs 65s where a warm
+    machine needs 3. Nothing about the VERSION is wrong — its imports already
+    resolved (preflight), its files already verified. The runtime is SHARED by
+    every version in the store, so 'the runtime is slow to come up' is a fact
+    about THIS MACHINE, identical for every version we could roll back onto.
+
+    So this maps to EXIT_MACHINE_BROKEN (5), not EXIT_APP_BROKEN (3): retry,
+    advise the operator to check antivirus, but never fail the version and never
+    roll a working build back onto one that will be exactly as slow."""
+
+
 # THE ARRIVAL WINDOW — how long after THE APP IS ASKED TO RUN an error still counts
 # as "the app failed on arrival" rather than "the app broke while it was being used".
 #
@@ -821,8 +839,15 @@ class StreamlitSupervisor:
                     log.warning("start attempt %d/%d on port %d failed: %s",
                                 attempt, BIND_RACE_RETRIES, port, exc)
                     self._reap()
-            raise StreamlitExited(f"Streamlit did not become healthy after "
-                                  f"{BIND_RACE_RETRIES} attempts: {last_error}")
+            # Preserve the DISTINCTION the retries kept blurring: if the last
+            # attempt timed out with the process still alive (a slow machine),
+            # this is StreamlitTimedOut -> machine, not the version. Only if the
+            # process actually died do we hand back a plain StreamlitExited.
+            summary = (f"Streamlit did not become healthy after "
+                       f"{BIND_RACE_RETRIES} attempts: {last_error}")
+            if isinstance(last_error, StreamlitTimedOut):
+                raise StreamlitTimedOut(summary)
+            raise StreamlitExited(summary)
 
     def _spawn_and_wait(self, port: int) -> str:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -888,8 +913,15 @@ class StreamlitSupervisor:
                 self._healthy_at = time.monotonic()
                 return self.url
             time.sleep(0.25)
+        # The process is STILL ALIVE (the poll() above never fired) — it just did
+        # not answer /_stcore/health in time. That is a slow machine, not a broken
+        # version: StreamlitTimedOut so main() can send the operator to check
+        # antivirus instead of failing the build. We still terminate it: a shell
+        # onto a half-started server is worse than an honest "the machine is busy".
         self._terminate_tree()
-        raise StreamlitExited(f"Streamlit was not healthy within {self.timeout:.0f}s. See {log_path}")
+        raise StreamlitTimedOut(f"Streamlit was not healthy within {self.timeout:.0f}s "
+                                f"(the process was still running — a slow first boot, "
+                                f"not a broken version). See {log_path}")
 
     # Errors Streamlit prints to its own log when the app script blows up. The
     # health endpoint knows nothing about any of them.
@@ -1577,8 +1609,27 @@ def main(argv: list[str] | None = None) -> int:
     try:
         try:
             url = supervisor.start()
+        except StreamlitTimedOut as exc:
+            # The server was still coming up when we ran out of patience — a slow
+            # machine (antivirus scanning a 600 MB runtime on first boot, a cold
+            # disk), NOT a broken version. Blaming the version here would fail a
+            # good build and, if there is a previous version, roll back onto one
+            # that is exactly as slow. So: exit 5 (the machine), touch no state,
+            # and point the operator at the thing they can actually change.
+            log.error("Streamlit did not become healthy in time (still running): %s", exc)
+            print(f"\n[start][ERROR] App 起不來,但這比較像「這台電腦現在很忙」而不是版本的問題。\n"
+                  f"  Streamlit 有啟動,只是沒能在時限內回應 —— 第一次開機時,防毒軟體正在\n"
+                  f"  掃描剛裝好的執行環境(數百 MB),這會讓啟動變得很慢。\n"
+                  f"  系統不會退版,也不會把這個版本標記為失敗。可以做的事:\n"
+                  f"    1. 過一下再開一次 start.bat(掃描完就會快很多)。\n"
+                  f"    2. 請 IT 把這個交付資料夾加進防毒的排除清單。\n"
+                  + _ADMIN_SECTION + "\n"
+                  f"  {exc}\n  log: {log_path}", file=sys.stderr, flush=True)
+            return EXIT_MACHINE_BROKEN
         except StreamlitExited as exc:
-            # Fail loudly instead of opening a shell onto nothing.
+            # The process actually DIED before becoming healthy — that is this
+            # version's runtime failing to run at all. Fail loudly instead of
+            # opening a shell onto nothing.
             log.error("Streamlit failed to start: %s", exc)
             print(f"\n[start][ERROR] 這個版本的 App 起不來(Streamlit 沒有正常啟動)。\n"
                   + _USER_ROLLBACK_LEAD + "\n"

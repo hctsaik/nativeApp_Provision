@@ -37,3 +37,4 @@ __pycache__/
 /e2e/out/
 /e2e/validation-work/
 /e2e/streamlit-desktop-store-gui/
+/e2e/streamlit-desktop-store-current/

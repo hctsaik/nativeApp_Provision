@@ -940,12 +940,34 @@ def describe_operation(op: dict) -> str | None:
     return f"{label},{when}" if when else label
 
 
+def _slot_health(paths: paths_mod.AppPaths, version: str | None) -> str:
+    """Does the version this field NAMES actually still exist on disk?
+
+    state.json is just a set of names. A user who deletes a version folder in
+    Explorer leaves those names pointing at nothing — and a status screen that
+    reads only state.json will cheerfully report 「目前版本 v1.0.0」 for a version
+    whose files are gone, the exact 'the report says fine, the disk says
+    otherwise' lie this whole project exists to kill. So before we print a name,
+    look for its bytes."""
+    if not version:
+        return ""
+    vdir = paths.version_dir(version)
+    if not vdir.is_dir():
+        return "  ← ⚠ 版本資料夾不見了(可能被手動刪除),請重新安裝或退到其他版本"
+    if not (vdir / ".complete").is_file():
+        return "  ← ⚠ 版本檔案不完整(缺 .complete),這個版本不能用"
+    return ""
+
+
 def print_status(paths: paths_mod.AppPaths) -> int:
     """One screen an operator can read down the phone."""
     state = state_mod.StateStore(paths.state_dir).load()
     print(f"\n應用      : {paths.app_id}")
-    print(f"目前版本  : {state.current}" + ("  ← 尚未通過首次啟動驗證"
-                                            if state.candidate == state.current else ""))
+    # The slot health warning WINS over the candidate note: a folder that is gone
+    # is a bigger fact than a folder that has not passed first-launch yet.
+    current_note = _slot_health(paths, state.current) or (
+        "  ← 尚未通過首次啟動驗證" if state.candidate == state.current else "")
+    print(f"目前版本  : {state.current}{current_note}")
     # NEVER the same version in two fields. fail_candidate() now moves `previous`, so
     # a rollback leaves the two describing two different things — but a machine that
     # rolled back under an OLDER build still has previous == current sitting in its
@@ -955,8 +977,10 @@ def print_status(paths: paths_mod.AppPaths) -> int:
     previous = state.previous if state.previous != state.current else None
     note = ("  ← 啟動失敗過,已退回目前版本"
             if previous and state.is_failed(previous) else "")
-    print(f"上一版    : {previous or '(無)'}{note}")
-    print(f"最後可用  : {state.last_known_good or '(尚未有)'}")
+    print(f"上一版    : {previous or '(無)'}{note or _slot_health(paths, previous)}")
+    lkg = state.last_known_good
+    print(f"最後可用  : {lkg or '(尚未有)'}"
+          + (_slot_health(paths, lkg) if lkg and lkg != state.current else ""))
     print(f"待套用    : {state.pending or '(無)'}")
     source = paths.config().get("update_source")
     print(f"更新來源  : {source or '(未設定;用 --set-update-source 指定)'}")
