@@ -69,12 +69,14 @@ def _verifier_for(trust_store: Path):
     return load_trust_store(trust_store)
 
 
-def run_install(release_dir: Path, root: Path) -> subprocess.CompletedProcess:
+def run_install(release_dir: Path, root: Path,
+                desktop: Path | None = None) -> subprocess.CompletedProcess:
     import os
 
     # 剔除 PYTHONPATH：安裝器必須只靠 release 內的 tools\lib 自足
     env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
     env["PYTHONIOENCODING"] = "utf-8"
+    env["CIM_DESKTOP_DIR"] = str(desktop) if desktop else str(release_dir / "no-desktop")
     return subprocess.run(
         [sys.executable, str(release_dir / "tools" / "device_install.py"),
          "--root", str(root)],
@@ -120,10 +122,16 @@ def test_install_update_and_tofu_pinning(tmp_path: Path) -> None:
     root = tmp_path / "target-machine"
 
     # ── 首次安裝：釘住發行者 ──
+    desktop = tmp_path / "fake-desktop"
+    desktop.mkdir()
     release1 = make_release(tmp_path, "v1", "1.0.0", "r1", signer, trust)
-    result = run_install(release1, root)
+    result = run_install(release1, root, desktop=desktop)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "首次安裝" in result.stdout and "釘住" in result.stdout
+    # 桌面捷徑（小白救星）：單行 bat 指向安裝根的啟動器
+    shortcut = desktop / "啟動 CIM 平台.bat"
+    assert shortcut.is_file()
+    assert str(root / "bin" / "start-platform.bat") in shortcut.read_text(encoding="utf-8")
     pinned = root / "trusted_publishers.json"
     assert pinned.is_file()
     active = json.loads((root / "applications" / "cim-platform" / "active.json")

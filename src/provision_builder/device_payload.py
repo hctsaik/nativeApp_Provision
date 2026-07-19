@@ -39,7 +39,10 @@ if exist "%LOCALAPPDATA%\\CIM-Platform\\runtime\\python311\\python.exe" set "PY=
 if not defined PY where py >nul 2>nul && set "PY=py -3.11"
 if not defined PY set "PY=python"
 %PY% "tools\\device_install.py" %*
-if errorlevel 1 pause
+rem Always pause: the operator must be able to READ the result line
+rem ("UPDATED" or a failure) before the window disappears.
+echo.
+pause
 endlocal
 """
 
@@ -133,7 +136,27 @@ def main() -> int:
                     bin_dir / "launch_platform.py")
     shutil.copyfile(RELEASE_ROOT / "tools" / "start-platform.bat",
                     bin_dir / "start-platform.bat")
+
+    # 桌面啟動捷徑(小白驗證的 B2:%LOCALAPPDATA% 一般人找不到)。
+    # 用一支單行 .bat 代替 .lnk(stdlib 就能建);best-effort,失敗不影響安裝。
+    desktop = Path(os.environ.get("CIM_DESKTOP_DIR", "") or
+                   Path(os.environ.get("USERPROFILE", Path.home())) / "Desktop")
+    if not desktop.is_dir():
+        onedrive = os.environ.get("OneDrive")
+        if onedrive and (Path(onedrive) / "Desktop").is_dir():
+            desktop = Path(onedrive) / "Desktop"
+    shortcut = None
+    if desktop.is_dir():
+        try:
+            shortcut = desktop / "啟動 CIM 平台.bat"
+            shortcut.write_text(
+                "@echo off\\r\\nstart \\"\\" \\"" + str(bin_dir / "start-platform.bat")
+                + "\\"\\r\\n", encoding="utf-8")
+        except OSError:
+            shortcut = None
     print(f"[install] 完成。啟動:{bin_dir / 'start-platform.bat'}")
+    if shortcut is not None:
+        print(f"[install] 桌面已放好捷徑:「{shortcut.name}」(以後雙擊它啟動)")
     print("[install] 之後更新:拿新的 release 資料夾,雙擊裡面的 install.bat 即可(資料不動)。")
     return 0
 
