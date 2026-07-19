@@ -143,6 +143,11 @@ powershell -File ..\nativeApp\scripts\win\fetch-standalone-python.ps1 `
 
 ## 正式交付：`release.py`（唯一交付來源，P0 Release Pipeline）
 
+> **第一次做版本發佈？** 看圖文教學
+> [`docs/release-e2e-step-by-step.html`](docs/release-e2e-step-by-step.html)——
+> 2026-07-19 對真實 nativeApp 實跑整條鏈（keygen → pack → sign → build → verify →
+> promote → User 機器安裝 → 真機啟動截圖），所有輸出與時間皆實測，可離線開啟。
+
 **要交給 User 的東西，只能來自 `release.py build` 的輸出。**
 `dist\` 及任何建置／E2E 工作區都是可刪的 workspace，不是交付物——
 這條界線現在是機器可驗的，不再靠人記得。
