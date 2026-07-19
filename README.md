@@ -148,7 +148,9 @@ powershell -File ..\nativeApp\scripts\win\fetch-standalone-python.ps1 `
 > 2026-07-19 對真實 nativeApp 實跑整條鏈（keygen → pack → sign → build → verify →
 > promote → User 機器安裝 → 真機啟動截圖），所有輸出與時間皆實測，可離線開啟。
 >
-> **不想打指令？** 雙擊 `start-release-gui.bat`（發佈 GUI）：開場自動偵測
+> **不想打指令？** 雙擊 `start-release-gui.bat`（發佈 GUI），
+> 圖解操作教學（實測截圖、對話框逐字）：
+> [`docs/release-gui-step-by-step.html`](docs/release-gui-step-by-step.html)。開場自動偵測
 > 「你在哪一步」（金鑰/平台/殼/上次發版），四步驟旅程一鍵到底，每顆按鈕背後
 > 就是同一條 `release.py` 指令（執行輸出區的 `>` 行可直接複製到主控台重跑）。
 > 失敗/取消自動清半成品、同版本可直接重跑；私鑰固定放在工作區之外
